@@ -74,7 +74,7 @@ A per-project scratch folder `.g023/` is created for the SQLite cache.
 
 ---
 
-## Design Principles (from the DeepCode Spec)
+## Design Principles
 
 1. Context is Currency — never pollute the orchestrator with raw files or search dumps.
 2. Subagents are the Treasury — all heavy I/O happens in isolated, minimal contexts.
