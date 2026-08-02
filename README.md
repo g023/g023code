@@ -7,6 +7,10 @@ Version 1.0 — August 2026
 
 ---
 
+<div align=center><img src="screenshot.png" alt="Example run of g023 Code" width="800"></div>
+
+---
+
 ## Quick Start
 
 1. **Put your DeepSeek API key** into `K.dat` (single line, no quotes):
