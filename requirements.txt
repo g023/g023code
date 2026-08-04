@@ -1,5 +1,20 @@
-openai>=1.40.0
-rich>=13.7.0
-httpx>=0.27.0
-tiktoken>=0.7.0
-pygments>=2.17.0
+# Required — g023 will not start without these.
+openai>=1.40.0        # AsyncOpenAI client, pointed at api.deepseek.com
+rich>=13.7.0          # every pixel of the UI
+httpx>=0.27.0         # Ollama transport, and the FetchUrl fallback
+tiktoken>=0.7.0       # token accounting for the context gauge
+pygments>=2.17.0      # syntax highlighting inside rich
+
+# Strongly recommended — the input line degrades to a plain prompt without it.
+prompt_toolkit>=3.0.0 # tab completion, history, and the live status toolbar
+
+# Optional — vision. Pillow downscales images before they are sent to Ollama,
+# which is the difference between a fast pass and an out-of-VRAM error.
+pillow>=10.0.0
+
+# FetchUrl — optional, but each one makes a fetch look more like a real browser.
+# Without them the tool still works and /fetch status reports what is missing.
+curl_cffi>=0.7.0      # matching Chrome TLS/JA3 fingerprint — the important one
+h2>=4.1.0             # HTTP/2 for the httpx fallback
+brotli>=1.1.0         # decode br, so we can honestly advertise it
+zstandard>=0.22.0     # decode zstd, likewise

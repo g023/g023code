@@ -10,8 +10,20 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from ..config import load_api_key, settings
+from ..usage import get_usage
 from .file_reader import run_file_reader
 from .searcher import run_searcher
+from .vision import run_vision
+
+
+def _as_int(value: Any) -> Optional[int]:
+    """Models sometimes send line numbers as strings — take either, or nothing."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class SubagentRouter:
@@ -33,6 +45,8 @@ class SubagentRouter:
                 path=arguments.get("path", ""),
                 focus=arguments.get("focus"),
                 raw=bool(arguments.get("raw", False)),
+                start_line=_as_int(arguments.get("start_line")),
+                end_line=_as_int(arguments.get("end_line")),
                 client=self._get_client(),
             )
 
@@ -58,27 +72,7 @@ class SubagentRouter:
         return json.dumps({"error": f"Unknown subagent tool: {tool_name}"})
 
     async def _run_vision(self, path_or_url: str, question: str) -> str:
-        # Vision is external. For now return a clear message; user can extend.
-        backend = settings.vision_backend
-        if backend == "none":
-            return json.dumps(
-                {
-                    "error": "Vision backend not configured.",
-                    "hint": "Set vision_backend in settings or use /vision backend <name>. "
-                            "DeepSeek V4 is text-only; an external VLM (GLM-4V, GPT-4V, local LLaVA) is required.",
-                    "path_or_url": path_or_url,
-                    "question": question,
-                }
-            )
-        # Placeholder for real integration
-        return json.dumps(
-            {
-                "backend": backend,
-                "path_or_url": path_or_url,
-                "question": question,
-                "summary": "(Vision backend stub — integrate your preferred VLM here)",
-            }
-        )
+        return await run_vision(path_or_url=path_or_url, question=question)
 
     async def _run_agent(self, kind: str, objective: str) -> str:
         """Lightweight Explore / Plan subagent using Flash with thinking."""
@@ -113,6 +107,7 @@ class SubagentRouter:
                 reasoning_effort=effort,
                 extra_body={"thinking": {"type": "enabled"}},
             )
+            get_usage().record(settings.subagent_model, resp.usage, scope="subagent")
             content = resp.choices[0].message.content or ""
             reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
             return json.dumps(

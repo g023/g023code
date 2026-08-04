@@ -1,0 +1,18 @@
+{
+  "verbose": "low",
+  "auto_compact": true,
+  "vision_backend": "none",
+  "vision_model": null,
+  "vision_host": null,
+  "vision_max_image_dim": 1024,
+  "vision_timeout": 180,
+  "orchestrator_model": "deepseek-v4-flash",
+  "subagent_model": "deepseek-v4-flash",
+  "reasoning_effort": "high",
+  "thinking_enabled": true,
+  "show_tool_timing": true,
+  "show_context_bar": true,
+  "permission_default": "ask",
+  "vision_num_ctx": 4096,
+  "vision_keep_alive": "5m"
+}

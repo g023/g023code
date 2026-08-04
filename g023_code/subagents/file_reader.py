@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from ..config import get_project_root, load_api_key, settings
 from ..cache import get_cache
+from ..usage import get_usage
 
 
 FILE_READER_SYSTEM = """You are a FileReader Subagent. Your ONLY job is to produce a compact, high-signal summary of a source file.
@@ -98,10 +99,21 @@ def _local_python_metadata(content: str) -> dict:
     return meta
 
 
+def _slice_lines(content: str, start_line: Optional[int], end_line: Optional[int]) -> tuple[str, int, int]:
+    """Return the requested 1-based inclusive line range, clamped to the file."""
+    lines = content.splitlines()
+    total = max(len(lines), 1)
+    start = min(max(1, start_line or 1), total)
+    end = min(max(end_line or total, start), total)
+    return "\n".join(lines[start - 1 : end]), start, end
+
+
 async def run_file_reader(
     path: str,
     focus: Optional[str] = None,
     raw: bool = False,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
     client: Optional[AsyncOpenAI] = None,
 ) -> str:
     """
@@ -125,8 +137,33 @@ async def run_file_reader(
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     cache = get_cache()
 
-    # Cache hit
-    cached = cache.get_file_summary(str(p), content_hash=content_hash)
+    # An explicit line range is a request for exact text, not for a summary:
+    # answer it verbatim and never from the summary cache.
+    if start_line is not None or end_line is not None:
+        excerpt, start, end = _slice_lines(content, start_line, end_line)
+        total = content.count("\n") + 1
+        if len(excerpt) > 20_000:
+            excerpt = excerpt[:20_000] + "\n…[range truncated at 20,000 chars]"
+        return json.dumps(
+            {
+                "path": str(p),
+                "hash": content_hash,
+                "language": _detect_language(p),
+                "start_line": start,
+                "end_line": end,
+                "total_lines": total,
+                "content": excerpt,
+            },
+            ensure_ascii=False,
+        )
+
+    # Cache hit. A focused read is a different question about the same bytes, so
+    # a generic cached summary would silently answer the wrong one — the key has
+    # to carry the focus.
+    cache_key = content_hash if not focus else hashlib.sha256(
+        f"{content_hash}\x00{focus}".encode("utf-8")
+    ).hexdigest()
+    cached = cache.get_file_summary(str(p), content_hash=cache_key)
     if cached and not raw:
         return json.dumps(
             {
@@ -186,6 +223,7 @@ async def run_file_reader(
             temperature=0.1,
             extra_body={"thinking": {"type": "disabled"}},  # no need for thinking on extraction
         )
+        get_usage().record(settings.subagent_model, resp.usage, scope="subagent")
         text = resp.choices[0].message.content or ""
         # Try to extract JSON
         m = re.search(r"\{[\s\S]*\}", text)
@@ -215,6 +253,6 @@ async def run_file_reader(
         result["summary"],
         result["metadata"],
         content if len(content) < 200_000 else None,
-        content_hash,
+        cache_key,
     )
     return json.dumps(result, ensure_ascii=False)

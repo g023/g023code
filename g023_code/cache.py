@@ -61,6 +61,20 @@ class Cache:
                     PRIMARY KEY (image_hash, question_hash, backend)
                 );
 
+                CREATE TABLE IF NOT EXISTS web_cache (
+                    url_hash    TEXT PRIMARY KEY,
+                    url         TEXT NOT NULL,
+                    final_url   TEXT,
+                    status      INTEGER,
+                    headers     TEXT,
+                    body        TEXT NOT NULL,
+                    engine      TEXT,
+                    profile     TEXT,
+                    fetched_at  REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    hit_count   INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS session_facts (
                     key         TEXT PRIMARY KEY,
                     value       TEXT NOT NULL,
@@ -69,6 +83,8 @@ class Cache:
 
                 CREATE INDEX IF NOT EXISTS idx_file_path ON file_cache(file_path);
                 CREATE INDEX IF NOT EXISTS idx_file_accessed ON file_cache(accessed_at);
+                CREATE INDEX IF NOT EXISTS idx_web_url ON web_cache(url);
+                CREATE INDEX IF NOT EXISTS idx_web_fetched ON web_cache(fetched_at);
                 """
             )
 
@@ -134,6 +150,13 @@ class Cache:
             )
         return content_hash
 
+    def invalidate_file(self, file_path: str | Path) -> int:
+        """Drop every cached summary for one path. Returns the rows removed."""
+        path = str(Path(file_path).resolve())
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM file_cache WHERE file_path = ?", (path,))
+            return cur.rowcount or 0
+
     def purge_old_files(self, max_age_days: int = 7):
         cutoff = time.time() - (max_age_days * 86400)
         with self._conn() as conn:
@@ -165,6 +188,105 @@ class Cache:
             )
 
     # ------------------------------------------------------------------
+    # Web cache (URL fetches)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def web_key(url: str) -> str:
+        return _sha256(url.strip())
+
+    def get_web(self, url: str, touch: bool = True) -> Optional[dict]:
+        """Return the cached response for a URL, regardless of age.
+
+        Age is deliberately the caller's business — freshness policy belongs
+        with the user's choice, not with storage.
+        """
+        key = self.web_key(url)
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM web_cache WHERE url_hash = ?", (key,)).fetchone()
+            if not row:
+                return None
+            if touch:
+                conn.execute(
+                    "UPDATE web_cache SET accessed_at = ?, hit_count = hit_count + 1 WHERE url_hash = ?",
+                    (time.time(), key),
+                )
+            return {
+                "url": row["url"],
+                "final_url": row["final_url"],
+                "status": row["status"],
+                "headers": json.loads(row["headers"] or "{}"),
+                "body": row["body"],
+                "engine": row["engine"],
+                "profile": row["profile"],
+                "fetched_at": row["fetched_at"],
+                "age_seconds": time.time() - row["fetched_at"],
+                "hit_count": row["hit_count"],
+            }
+
+    def touch_web(self, url: str):
+        """Record that a cached copy was actually served."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE web_cache SET accessed_at = ?, hit_count = hit_count + 1 WHERE url_hash = ?",
+                (time.time(), self.web_key(url)),
+            )
+
+    def put_web(
+        self,
+        url: str,
+        body: str,
+        status: int,
+        headers: Optional[dict] = None,
+        final_url: Optional[str] = None,
+        engine: Optional[str] = None,
+        profile: Optional[str] = None,
+    ) -> str:
+        key = self.web_key(url)
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO web_cache
+                (url_hash, url, final_url, status, headers, body, engine, profile,
+                 fetched_at, accessed_at, hit_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT hit_count FROM web_cache WHERE url_hash = ?), 0))
+                """,
+                (
+                    key,
+                    url,
+                    final_url or url,
+                    status,
+                    json.dumps(headers or {}, ensure_ascii=False),
+                    body,
+                    engine,
+                    profile,
+                    now,
+                    now,
+                    key,
+                ),
+            )
+        return key
+
+    def list_web(self, limit: int = 30) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT url, status, engine, fetched_at, hit_count, LENGTH(body) AS size "
+                "FROM web_cache ORDER BY fetched_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def clear_web(self, url: Optional[str] = None) -> int:
+        with self._conn() as conn:
+            if url:
+                cur = conn.execute("DELETE FROM web_cache WHERE url_hash = ?", (self.web_key(url),))
+            else:
+                cur = conn.execute("DELETE FROM web_cache")
+            return cur.rowcount
+
+    # ------------------------------------------------------------------
     # Session facts (lightweight memory)
     # ------------------------------------------------------------------
 
@@ -187,10 +309,21 @@ class Cache:
             except Exception:
                 return row["value"]
 
+    def stats(self) -> dict[str, int]:
+        """Row counts per cache, for /cache."""
+        tables = {"files": "file_cache", "vision": "vision_cache", "web": "web_cache"}
+        out: dict[str, int] = {}
+        with self._conn() as conn:
+            for label, table in tables.items():
+                row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+                out[label] = int(row["n"]) if row else 0
+        return out
+
     def clear_all(self):
         with self._conn() as conn:
             conn.execute("DELETE FROM file_cache")
             conn.execute("DELETE FROM vision_cache")
+            conn.execute("DELETE FROM web_cache")
             conn.execute("DELETE FROM session_facts")
 
 

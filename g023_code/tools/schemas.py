@@ -13,6 +13,8 @@ TOOL_SCHEMAS = [
             "description": (
                 "Read a file and return a compact structural summary + metadata. "
                 "NEVER returns raw full content unless raw=true is explicitly requested. "
+                "Pass start_line/end_line to get the exact source of a known range "
+                "verbatim instead of a summary — use that rather than shelling out to sed. "
                 "Prefer this over dumping entire files into context."
             ),
             "parameters": {
@@ -30,6 +32,17 @@ TOOL_SCHEMAS = [
                     "focus": {
                         "type": "string",
                         "description": "Optional focus hint (e.g. 'auth logic', 'class User')",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": (
+                            "First line of an exact range to return verbatim (1-based, inclusive). "
+                            "When set, the file is returned as source, not as a summary."
+                        ),
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line of the range (1-based, inclusive). Defaults to end of file.",
                     },
                 },
                 "required": ["path"],
@@ -184,6 +197,57 @@ TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["kind", "objective"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "FetchUrl",
+            "description": (
+                "Fetch a web page and return its readable text (not raw HTML). "
+                "Always asks the user for permission first, and when a cached copy "
+                "exists the user chooses between the cache and a fresh fetch. "
+                "Requests are made with a real browser's headers, protocol and cookies. "
+                "No JavaScript is executed, so app-shell pages may return little text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The http(s) URL to fetch",
+                    },
+                    "cache_mode": {
+                        "type": "string",
+                        "enum": ["auto", "fresh", "cache"],
+                        "description": (
+                            "auto = use a cached copy younger than max_age, else fetch; "
+                            "fresh = always hit the network; "
+                            "cache = only use the cache, never the network. "
+                            "The user can override this at the permission prompt."
+                        ),
+                        "default": "auto",
+                    },
+                    "max_age": {
+                        "type": "integer",
+                        "description": "In auto mode, the oldest acceptable cached copy, in seconds (default 3600)",
+                        "default": 3600,
+                    },
+                    "extract": {
+                        "type": "string",
+                        "enum": ["text", "markdown", "links", "raw"],
+                        "description": "How to render the page. Use 'raw' only when the exact markup matters.",
+                        "default": "text",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Truncate the returned content to this many characters (default 20000)",
+                        "default": 20000,
+                    },
+                },
+                "required": ["url"],
                 "additionalProperties": False,
             },
         },
