@@ -7,9 +7,15 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from openai import AsyncOpenAI
-
-from ..config import load_api_key, settings
+from ..api import (
+    ResponsesClient,
+    get_client,
+    incomplete_reason,
+    output_text,
+    reasoning_param,
+    reasoning_text,
+)
+from ..config import settings
 from ..usage import get_usage
 from .file_reader import run_file_reader
 from .searcher import run_searcher
@@ -27,12 +33,12 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 class SubagentRouter:
-    def __init__(self, client: Optional[AsyncOpenAI] = None):
+    def __init__(self, client: Optional[ResponsesClient] = None):
         self.client = client
 
-    def _get_client(self) -> AsyncOpenAI:
+    def _get_client(self) -> ResponsesClient:
         if self.client is None:
-            self.client = AsyncOpenAI(api_key=load_api_key(), base_url=settings.base_url)
+            self.client = get_client()
         return self.client
 
     async def delegate(self, tool_name: str, arguments: dict) -> str:
@@ -93,32 +99,44 @@ class SubagentRouter:
             )
             effort = "high"
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Objective: {objective}\n\nProject root context is available to the orchestrator; focus on high-level strategy."},
-        ]
+        user_prompt = (
+            f"Objective: {objective}\n\nProject root context is available to the "
+            "orchestrator; focus on high-level strategy."
+        )
 
         try:
-            resp = await client.chat.completions.create(
+            resp = await client.create(
                 model=settings.subagent_model,
-                messages=messages,
-                max_tokens=2048,
+                instructions=system,
+                input=[{"role": "user", "content": user_prompt}],
+                # Reasoning is billed out of this same budget, and at these effort
+                # levels it can consume all of it before a single word of the
+                # answer is emitted. 2048 was not enough to survive that.
+                max_output_tokens=8192,
                 temperature=0.3,
-                reasoning_effort=effort,
-                extra_body={"thinking": {"type": "enabled"}},
+                reasoning=reasoning_param(enabled=True, effort=effort),
             )
-            get_usage().record(settings.subagent_model, resp.usage, scope="subagent")
-            content = resp.choices[0].message.content or ""
-            reasoning = getattr(resp.choices[0].message, "reasoning_content", None)
-            return json.dumps(
-                {
-                    "kind": kind,
-                    "objective": objective,
-                    "plan_or_exploration": content,
-                    "reasoning_excerpt": (reasoning[:800] + "…") if reasoning else None,
-                },
-                ensure_ascii=False,
-            )
+            get_usage().record(settings.subagent_model, resp.get("usage"), scope="subagent")
+            content = output_text(resp)
+            reasoning = reasoning_text(resp)
+            cut = incomplete_reason(resp)
+            payload = {
+                "kind": kind,
+                "objective": objective,
+                "plan_or_exploration": content,
+                "reasoning_excerpt": (reasoning[:800] + "…") if reasoning else None,
+            }
+            if cut:
+                # An empty answer and a truncated one look identical downstream
+                # unless the cut is named, and the orchestrator will otherwise
+                # treat silence as a considered result.
+                payload["truncated"] = cut
+                if not content:
+                    payload["error"] = (
+                        f"Subagent produced no answer: output stopped early ({cut}), "
+                        "with the whole budget spent on reasoning."
+                    )
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e), "kind": kind})
 

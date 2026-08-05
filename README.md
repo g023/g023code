@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-![Version](https://img.shields.io/badge/version-1.1.0-informational)
+[![Version](https://img.shields.io/badge/version-1.2.0-informational)](RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -15,12 +15,16 @@
 
 ---
 
-g023 Code reads your project, searches it, runs commands, fetches pages, and
-looks at images — while telling you exactly what it is doing and what it just
-cost. The orchestrator never sees a raw file: every data-heavy operation is
-delegated to a subagent with an isolated, minimal context, and the answer that
-comes back is a summary. That is the whole design, and it is why a real session
-costs fractions of a cent.
+g023 Code reads your project, searches it, searches the web, runs commands,
+fetches pages, and looks at images — while telling you exactly what it is doing
+and what it just cost. The orchestrator never sees a raw file: every data-heavy
+operation is delegated to a subagent with an isolated, minimal context, and the
+answer that comes back is a summary. That is the whole design, and it is why a
+real session costs fractions of a cent.
+
+It talks to DeepSeek exclusively through the **Responses API**, which is what
+makes DeepSeek's own **native web search** a first-class tool of the loop rather
+than a search provider bolted on the side.
 
 <p align="center">
   <img src="docs/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
@@ -36,6 +40,7 @@ costs fractions of a cent.
 - [Architecture](#architecture)
 - [Slash commands](#slash-commands)
 - [Verbosity, context & cost](#verbosity-context--cost)
+- [Web search (native)](#web-search-native)
 - [Vision (via Ollama)](#vision-via-ollama)
 - [Fetching web pages](#fetching-web-pages)
 - [Design principles](#design-principles)
@@ -46,28 +51,54 @@ costs fractions of a cent.
 
 **Requirements:** Python 3.11 or newer, and a [DeepSeek API key](https://platform.deepseek.com/).
 
+Drop the folder anywhere you like and run the installer inside it:
+
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Put your API key in K.dat (single line, no quotes)
-cp K.dat.example K.dat && $EDITOR K.dat
-
-# 3. Launch from any project folder
-/path/to/g023-code/g023.sh
+cd /path/to/g023-code
+./installer.sh
 ```
 
 <details>
 <summary><b>Windows</b></summary>
 
 ```bat
-C:\path\to\g023-code\g023.bat
+cd C:\path\to\g023-code
+installer.bat
 ```
 
 </details>
 
-Add the folder to your `PATH`, or alias it to `g023`, and it is available
-everywhere. The launchers set two environment variables for you:
+It finds a Python 3.11+, builds a `.venv` in the folder, installs only the
+dependencies you are actually missing, asks once for your API key, writes a
+default `config.json`, and puts `g023` on your `PATH`. Every step checks what is
+already true first, so running it again is safe — it is also how you repair a
+half-finished setup or add the optional extras later.
+
+<details>
+<summary><b>Installer options</b></summary>
+
+| Linux / macOS | Windows | Effect |
+|---|---|---|
+| `--yes` | `/y` | Non-interactive; take the recommended default everywhere |
+| `--key sk-…` | `/key sk-…` | Write the key into `K.dat` instead of prompting (`$DEEPSEEK_API_KEY` is used if set) |
+| `--with-optional` / `--no-optional` | `/optional` / `/nooptional` | Decide the extras (vision preprocessing, browser-grade fetching) up front |
+| `--no-venv` | — | Install into the current interpreter instead of a venv |
+| `--no-path` | `/nopath` | Do not touch `~/.local/bin`, your shell rc, or the user `PATH` |
+| `--uninstall` | `/uninstall` | Remove the launcher shim and `PATH` entry (the folder, `.venv`, `K.dat` and `config.json` stay) |
+
+</details>
+
+Then launch from whatever project you want it to work on:
+
+```bash
+cd ~/some/project
+g023
+```
+
+Doing it by hand instead is four commands — `pip install -r requirements.txt`,
+your key on the first line of `K.dat`, then `/path/to/g023-code/g023.sh` (or
+`g023.bat`) from a project folder. The launchers prefer `.venv/` in the install
+folder when one exists, and set two environment variables for you:
 
 | Variable | Meaning |
 |---|---|
@@ -115,16 +146,45 @@ writes, runs, or leaves your machine happens without a prompt.
 
 ## Architecture
 
-- **Orchestrator** (`deepseek-v4-flash` by default) keeps only high-level
-  reasoning, tool schemas, and compact summaries.
+Everything — orchestrator, subagents, compaction — goes to a single endpoint:
+`POST /responses`. That is a deliberate choice, not an implementation detail. It
+is the only DeepSeek endpoint that exposes the server-side `web_search` tool, so
+using it everywhere is what lets web search be part of the loop.
+
+The Responses API does not take a list of chat messages. It takes **items** —
+and the model's own output items go back into the next request *verbatim*:
+
+- `message` items (your input; the model's narration and its final answer)
+- `reasoning` items — echoed back unmodified so the model keeps its own chain
+- `web_search_call` items — the server's record of a search it ran
+- `function_call` / `function_call_output` pairs, one per tool call
+
+Two rules fall out of that, and every part of the program respects them. A
+`function_call` with no matching output is a hard 400 in either direction, so
+compaction, truncation and error recovery all repair pairing before the next
+request. And items are echoed byte-identical, because rewriting them both breaks
+the prefix cache and desyncs the model's reasoning.
+
+- **Orchestrator** (`deepseek-v4-flash`) keeps only high-level reasoning, tool
+  schemas, and compact summaries.
 - **Subagents** handle all data-heavy work in isolated contexts:
   - `FileReader` → structural metadata + a 2–4 sentence summary, cached by content hash
-  - `Searcher` → metadata-first grep results
+  - `Searcher` → metadata-first grep results, **pure local Python — no API call**
   - `Explore` / `Plan` → isolated reasoning with thinking mode
-  - `Vision` → an Ollama daemon, local or remote (DeepSeek V4 is text-only)
+  - `Vision` → an Ollama daemon, local or remote (DeepSeek V4 Flash is text-only)
+- **Native `web_search`** runs server-side inside the model's turn — no client
+  executor, no provider chain
 - **Aggressive SQLite cache** → repeated file reads cost $0.00
-- **Prefix-cache-friendly** system prompt and tool definitions stay static
-- **Thinking mode** with a controllable `reasoning_effort` dial (low / high / max)
+- **Prefix-cache-friendly**: instructions and tool definitions stay static
+- **Thinking mode** with a `reasoning_effort` dial (low / high / max, or off —
+  which maps to `reasoning: {"effort": "none"}`, the only thing `/responses`
+  actually honours)
+
+**One model.** `deepseek-v4-flash` is the only model sent to the API, in every
+role. `deepseek-v4-pro` is not available on `/responses` yet — DeepSeek reports
+it from early August 2026 — so `/model` refuses it and quotes that reason rather
+than handing you a model every call fails on. Vision is the only exception, and
+it does not use the API at all.
 
 The presentation and command layers are deliberately separate from the agent:
 
@@ -140,7 +200,7 @@ See [`SPEC.md`](SPEC.md) for the full specification.
 ## Slash commands
 
 Commands that take a fixed set of options **open a picker when typed bare**, so
-`/model` is as usable as `/model pro` — there is nothing to memorise.
+`/vision` is as usable as `/vision qwen3.5:2b` — there is nothing to memorise.
 `/help <command>` explains any one of them in full.
 
 <details open>
@@ -160,7 +220,7 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/model [flash\|pro]` | Choose the orchestrator model — the picker shows both prices |
+| `/model [flash]` | Show or set the orchestrator model — `flash` is the only one the Responses API serves |
 | `/thinking [low\|high\|max\|off]` | Set reasoning effort, or turn thinking off |
 | `/verbose [low\|mid\|high]` | How much detail to print while working |
 
@@ -237,9 +297,53 @@ Every API call — orchestrator *and* subagents — reports its token usage to a
 single tracker, so `/cost` and `/settings` show the cache-hit / cache-miss /
 output split per model and price it from the SPEC §3.2 table.
 
+## Web search (native)
+
+Web search is **DeepSeek's own**, not a search API wired in behind it. There is
+no provider chain, no key to supply, no rate limit to nurse, and no
+`/websearch` command — because there is nothing on this side to configure.
+
+The entire integration is one line in `tools/schemas.py`:
+
+```python
+WEB_SEARCH_TOOL = {"type": "web_search"}
+```
+
+That marker is appended to the tool list. No name, no parameters, no executor.
+The server takes it from there.
+
+**The search happens inside the model's turn**, on DeepSeek's infrastructure,
+before the response comes back. g023 never sees a tool call for it and never
+returns a result for it. What arrives instead is a record of what the server
+did, which shows up in the trace like any other tool:
+
+```
+  ● searching the web…
+  ✓ web_search  deepseek responses api web_search tool, deepseek v4 pricing
+  ✓ web_search  read platform.deepseek.com/docs/…
+```
+
+A few consequences are worth stating plainly:
+
+- **It never asks permission.** There is no moment at which g023 could
+  interpose a prompt — the search is over by the time the response exists. So
+  `web_search` has no entry in `/tools`. Giving the model the tool is the
+  decision; each individual search is not. Everything that *does* leave your
+  machine under g023's own control — `FetchUrl` — still asks every time.
+- **It can search several times per turn**, following up on what it finds.
+- **Findings persist.** The server's `web_search_call` items are carried in
+  history like everything else, so what it learned survives across tool
+  round-trips, across turns, and across `/compact`.
+- **Slow searches are visible.** The server can be out on the web for a while
+  without emitting anything, so g023 draws a live `searching the web…` line
+  rather than letting it read as a hang.
+
+Just ask — `what changed in the DeepSeek Responses API this month?` — and it
+searches when it decides it needs to.
+
 ## Vision (via Ollama)
 
-DeepSeek V4 is text-only, so image analysis is delegated to an
+DeepSeek V4 Flash is text-only, so image analysis is delegated to an
 [Ollama](https://ollama.com) vision model. **Vision is disabled by default** —
 enable it once and the choice persists.
 
@@ -300,6 +404,10 @@ Three commands make a remote setup diagnosable rather than a guessing game:
 
 ## Fetching web pages
 
+Distinct from [web search](#web-search-native): that runs on DeepSeek's side and
+you never see the request. `FetchUrl` is g023 reaching out from *your* machine,
+to a URL you or the model named — so it is held to a different standard.
+
 `FetchUrl` reads a page and hands back readable text rather than raw HTML, in
 keeping with the context budget. Two things make it different from a plain
 `requests.get`.
@@ -356,7 +464,8 @@ rather than a challenge.
 1. **Context is currency** — never pollute the orchestrator with raw files or search dumps.
 2. **Subagents are the treasury** — all heavy I/O happens in isolated, minimal contexts.
 3. **Cache everything cacheable** — file hashes, vision Q&A, fetched pages.
-4. **Prefer Flash for cost**; use Pro only when quality clearly demands it.
+4. **Do it off-API where it is free** — search the filesystem locally, see with
+   a local GPU, and spend tokens only on reasoning.
 5. **Thinking mode is a dial**, not always-on max.
 6. **Say what happened, not what was sent** — and always say what it cost.
 

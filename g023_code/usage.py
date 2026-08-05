@@ -80,6 +80,15 @@ class ModelUsage:
         )
 
 
+def _details(obj: Any, name: str) -> Any:
+    """A nested token-details bag, whether the usage came back as an object or a dict."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
 def _get(obj: Any, name: str) -> Optional[int]:
     """Pull a token field off an SDK usage object, dict, or model_extra bag."""
     val = getattr(obj, name, None)
@@ -114,13 +123,25 @@ class UsageTracker:
     turn_cost: float = 0.0
 
     def record(self, model: str, usage: Any, scope: str = "orchestrator") -> ModelUsage:
-        """Fold one API response's usage into the totals. Returns the delta."""
+        """Fold one API response's usage into the totals. Returns the delta.
+
+        The Responses API names these fields differently from chat completions —
+        ``input_tokens`` with a nested ``input_tokens_details.cached_tokens``
+        rather than ``prompt_tokens`` with a flat hit/miss split — and reports
+        only the cached count, leaving the miss to be derived. Both spellings are
+        accepted so the tracker stays honest whichever endpoint a caller used.
+        """
         if usage is None:
             return ModelUsage()
 
-        prompt = _get(usage, "prompt_tokens") or 0
+        prompt = _get(usage, "input_tokens")
+        if prompt is None:
+            prompt = _get(usage, "prompt_tokens") or 0
+
         hit = _get(usage, "prompt_cache_hit_tokens")
         miss = _get(usage, "prompt_cache_miss_tokens")
+        if hit is None:
+            hit = _get(_details(usage, "input_tokens_details"), "cached_tokens")
         if hit is None and miss is None:
             # Provider didn't report the split — assume worst case (all miss).
             hit, miss = 0, prompt
@@ -129,11 +150,14 @@ class UsageTracker:
         elif miss is None:
             miss = max(prompt - hit, 0)
 
-        output = _get(usage, "completion_tokens") or 0
-        reasoning = 0
-        details = getattr(usage, "completion_tokens_details", None)
-        if details is not None:
-            reasoning = _get(details, "reasoning_tokens") or 0
+        output = _get(usage, "output_tokens")
+        if output is None:
+            output = _get(usage, "completion_tokens") or 0
+        reasoning = (
+            _get(_details(usage, "output_tokens_details"), "reasoning_tokens")
+            or _get(_details(usage, "completion_tokens_details"), "reasoning_tokens")
+            or 0
+        )
 
         delta = ModelUsage(
             calls=1,

@@ -13,9 +13,15 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from openai import AsyncOpenAI
+from ..api import (
+    ResponsesClient,
+    get_client,
+    incomplete_reason,
+    output_text,
+    reasoning_param,
+)
 
-from ..config import get_project_root, load_api_key, settings
+from ..config import get_project_root, settings
 from ..cache import get_cache
 from ..usage import get_usage
 
@@ -114,7 +120,7 @@ async def run_file_reader(
     raw: bool = False,
     start_line: Optional[int] = None,
     end_line: Optional[int] = None,
-    client: Optional[AsyncOpenAI] = None,
+    client: Optional[ResponsesClient] = None,
 ) -> str:
     """
     Main entry for FileReader subagent.
@@ -203,34 +209,44 @@ async def run_file_reader(
 
     # LLM compaction for complex / focused cases
     if client is None:
-        client = AsyncOpenAI(api_key=load_api_key(), base_url=settings.base_url)
+        client = get_client()
 
     user_msg = f"File path: {p}\nLanguage: {language}\n"
     if focus:
         user_msg += f"Focus: {focus}\n"
     user_msg += f"\n--- FILE CONTENT (truncated if huge) ---\n{content[:18000]}"
 
-    messages = [
-        {"role": "system", "content": FILE_READER_SYSTEM},
-        {"role": "user", "content": user_msg},
-    ]
-
     try:
-        resp = await client.chat.completions.create(
+        resp = await client.create(
             model=settings.subagent_model,
-            messages=messages,
-            max_tokens=800,
+            instructions=FILE_READER_SYSTEM,
+            input=[{"role": "user", "content": user_msg}],
+            max_output_tokens=800,
             temperature=0.1,
-            extra_body={"thinking": {"type": "disabled"}},  # no need for thinking on extraction
+            # Structural extraction needs no deliberation, and "effort: none" is
+            # what actually switches thinking off on this endpoint — the old
+            # chat-completions "thinking" toggle is accepted and ignored here.
+            reasoning=reasoning_param(enabled=False),
         )
-        get_usage().record(settings.subagent_model, resp.usage, scope="subagent")
-        text = resp.choices[0].message.content or ""
+        get_usage().record(settings.subagent_model, resp.get("usage"), scope="subagent")
+        text = output_text(resp)
+        cut = incomplete_reason(resp)
         # Try to extract JSON
         m = re.search(r"\{[\s\S]*\}", text)
         if m:
             data = json.loads(m.group(0))
         else:
+            # A summary cut off at the token limit arrives as unparseable text
+            # (or nothing at all); the locally-derived metadata is still sound,
+            # so keep it and say what happened rather than reporting an empty
+            # summary as the file's contents.
             data = {"summary": text[:600], "metadata": metadata}
+            if cut:
+                data["summary"] = (
+                    f"(summary truncated: {cut}) {text[:600]}".strip()
+                    if text
+                    else f"(no summary: model output stopped early — {cut})"
+                )
     except Exception as e:
         data = {
             "summary": f"(LLM summary failed: {e}) Local fallback: {language} file, {content.count(chr(10))+1} lines.",

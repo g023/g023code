@@ -10,13 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export G023_HOME="${SCRIPT_DIR}"
 export G023_PROJECT_ROOT="$(pwd)"
 
-# Prefer python3, fall back to python
-if command -v python3 >/dev/null 2>&1; then
+# A venv created by installer.sh wins over whatever python is on PATH: it is the
+# one interpreter we know has the dependencies.
+if [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+    PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
     PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
     PYTHON=python
 else
-    echo "Error: Python 3 is required but not found." >&2
+    echo "Error: Python 3 is required but not found. Run ./installer.sh first." >&2
     exit 1
 fi
 

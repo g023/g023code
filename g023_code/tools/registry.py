@@ -7,14 +7,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import shutil
 import subprocess
 import time
-from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import parse_qs, urlparse
 
 from rich.prompt import Confirm, Prompt
 
@@ -22,34 +19,7 @@ from ..config import get_project_root, settings
 from ..cache import get_cache
 from ..subagents.searcher import IGNORE_DIRS
 from ..ui import console
-from .schemas import TOOL_SCHEMAS
-
-
-
-# DuckDuckGo's HTML endpoint wraps every hit in a /l/?uddg=<escaped-url>
-# redirector, so the raw href never starts with "http" and has to be unwrapped.
-_DDG_RESULT = re.compile(
-    r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL
-)
-_DDG_SNIPPET = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
-_TAG = re.compile(r"<[^>]+>")
-
-
-def _strip_tags(html_fragment: str) -> str:
-    return unescape(_TAG.sub("", html_fragment)).strip()
-
-
-def _ddg_target(href: str) -> str:
-    """Unwrap a DuckDuckGo redirect into the destination URL."""
-    href = unescape(href)
-    if href.startswith("//"):
-        href = "https:" + href
-    parsed = urlparse(href)
-    if parsed.path.startswith("/l/"):
-        target = parse_qs(parsed.query).get("uddg", [""])[0]
-        if target:
-            return target
-    return href if href.startswith("http") else ""
+from .schemas import TOOL_SCHEMAS, WEB_SEARCH_TOOL
 
 
 def _describe_age(seconds: float) -> str:
@@ -69,7 +39,10 @@ ASK = "ask"
 BLOCK = "block"
 
 # Read-only, local, and cheap: these stay allowed whatever the default is.
-SAFE_TOOLS = ("ReadFile", "SearchContent", "ListDir", "WebSearch")
+# Web search is absent because it is no longer a tool we execute: DeepSeek
+# runs it server-side inside the model call, so there is no point at which we
+# could interpose a prompt.
+SAFE_TOOLS = ("ReadFile", "SearchContent", "ListDir")
 
 # Everything else follows settings.permission_default, except FetchUrl: network
 # fetches leave the machine and touch a third party, so they always surface to
@@ -99,7 +72,6 @@ class ToolRegistry:
             "Bash": self._exec_bash,
             "WriteFile": self._exec_write_file,
             "ListDir": self._exec_list_dir,
-            "WebSearch": self._exec_web_search,
             "FetchUrl": self._exec_fetch_url,
             # Heavy tools are routed to subagents by the orchestrator
             "ReadFile": None,
@@ -115,12 +87,14 @@ class ToolRegistry:
         proposes a call it cannot fulfil (and the static prefix stays stable
         for as long as the config does).
         """
-        if settings.vision_enabled:
-            return TOOL_SCHEMAS
-        return [
+        tools = [
             s for s in TOOL_SCHEMAS
-            if s.get("function", {}).get("name") != "AnalyzeImage"
+            if settings.vision_enabled or s.get("name") != "AnalyzeImage"
         ]
+        # DeepSeek's own search tool rides along with ours. It has no schema and
+        # no executor: the model calls it, the server runs the search loop, and
+        # the results come back inside the same response.
+        return tools + [WEB_SEARCH_TOOL]
 
     def set_permission(self, tool_name: str, level: str):
         if level not in (ALLOW, ASK, BLOCK):
@@ -441,54 +415,6 @@ class ToolRegistry:
             profile=result.profile,
         )
         return _render(result)
-
-    async def _exec_web_search(self, query: str, num_results: int = 5) -> str:
-        # Lightweight free search via DuckDuckGo HTML (no key required)
-        # For production one could swap to Serper / Brave / Tavily
-        try:
-            import httpx
-            from urllib.parse import quote_plus
-
-            url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                r = await client.get(
-                    url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-                        ),
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                )
-                text = r.text
-
-            results = []
-            for m in _DDG_RESULT.finditer(text):
-                href = _ddg_target(m.group(1))
-                title = _strip_tags(m.group(2))
-                if not href or not title:
-                    continue
-                results.append({"title": title, "url": href})
-                if len(results) >= num_results:
-                    break
-
-            # Snippets are rendered in document order, so they line up with the
-            # titles above; a result without one is still worth returning.
-            snippets = [_strip_tags(s) for s in _DDG_SNIPPET.findall(text)]
-            for i, item in enumerate(results):
-                if i < len(snippets) and snippets[i]:
-                    item["snippet"] = snippets[i][:300]
-
-            payload = {"query": query, "results": results}
-            if not results:
-                payload["note"] = (
-                    f"No results parsed from DuckDuckGo (HTTP {r.status_code}). "
-                    "The endpoint may be rate-limiting; try FetchUrl on a known URL."
-                )
-            return json.dumps(payload, ensure_ascii=False)
-        except Exception as e:
-            return json.dumps({"error": f"Web search failed: {e}"})
 
 
 _registry: Optional[ToolRegistry] = None

@@ -63,7 +63,9 @@ def load_api_key() -> str:
             "Create K.dat in the g023-code folder and put your DeepSeek API key on the first line."
         )
     key = key_file.read_text(encoding="utf-8").strip()
-    if not key or key == "YOUR_DEEPSEEK_API_KEY_HERE":
+    # The installers leave a placeholder behind when the user skips the key
+    # prompt; recognising it turns a confusing 401 into a clear instruction.
+    if not key or key in ("YOUR_DEEPSEEK_API_KEY_HERE", "sk-REPLACE-WITH-YOUR-DEEPSEEK-API-KEY"):
         raise ValueError(
             f"Please put a valid DeepSeek API key into {key_file}\n"
             "Get one at https://platform.deepseek.com/"
@@ -77,6 +79,20 @@ def load_api_key() -> str:
 
 ModelId = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 ReasoningEffort = Literal["low", "high", "max"]
+
+# Models the Responses API will actually serve. Everything here runs on
+# ``/responses`` — that is the only endpoint exposing DeepSeek's server-side
+# web_search — and as of 2026-08 it answers a v4-pro request with "Codex
+# integration with deepseek-v4-pro will be available starting early August 2026.
+# Please use deepseek-v4-flash instead for now." Offering pro would just hand the
+# user a model every call fails on, so the choice is withheld until it works.
+AVAILABLE_MODELS: tuple[str, ...] = ("deepseek-v4-flash",)
+UNAVAILABLE_MODELS: dict[str, str] = {
+    "deepseek-v4-pro": (
+        "DeepSeek has not enabled deepseek-v4-pro on the Responses API yet "
+        "(it reports availability from early August 2026)."
+    ),
+}
 
 # low  — final answer only (default)
 # mid  — answer + per-turn token/cost line + tool result previews
@@ -95,9 +111,14 @@ class Settings:
 
     # API
     base_url: str = "https://api.deepseek.com"
-    beta_base_url: str = "https://api.deepseek.com/beta"
     max_tokens: int = 8192
     temperature: float = 0.2
+
+    # Web search is DeepSeek's server-side ``web_search`` tool, offered to the
+    # model as a peer of our own tools on every orchestrator call — there is no
+    # separate search request to configure. The server may run a long agentic
+    # loop (5-20 searches plus page opens) inside a single turn, which is why the
+    # client timeout in api.py is generous.
 
     # Context
     max_context_tokens: int = 900_000  # leave headroom under 1M
@@ -179,8 +200,10 @@ PERSISTED_KEYS = (
 # Values a saved config is allowed to take. A key missing from here accepts
 # anything of the right Python type; a key present is rejected unless it matches.
 _ALLOWED: dict[str, tuple[str, ...]] = {
-    "orchestrator_model": ("deepseek-v4-flash", "deepseek-v4-pro"),
-    "subagent_model": ("deepseek-v4-flash", "deepseek-v4-pro"),
+    # A config naming a model the API won't serve is dropped rather than obeyed,
+    # so an old file that still says deepseek-v4-pro falls back to the default.
+    "orchestrator_model": AVAILABLE_MODELS,
+    "subagent_model": AVAILABLE_MODELS,
     "reasoning_effort": ("low", "high", "max"),
     "verbose": VERBOSE_LEVELS,
     "vision_backend": ("none", "ollama", "glm", "openai", "local"),

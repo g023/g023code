@@ -12,17 +12,26 @@ set "G023_PROJECT_ROOT=%CD%"
 
 set "PYTHONPATH=%SCRIPT_DIR%;%PYTHONPATH%"
 
+REM A venv created by installer.bat wins over whatever python is on PATH: it is
+REM the one interpreter we know has the dependencies.
+if exist "%SCRIPT_DIR%.venv\Scripts\python.exe" (
+    "%SCRIPT_DIR%.venv\Scripts\python.exe" -m g023_code %*
+    goto :done
+)
+
 where python >nul 2>&1
 if %ERRORLEVEL% equ 0 (
     python -m g023_code %*
-) else (
-    where py >nul 2>&1
-    if %ERRORLEVEL% equ 0 (
-        py -3 -m g023_code %*
-    ) else (
-        echo Error: Python 3 is required but not found.
-        exit /b 1
-    )
+    goto :done
 )
+where py >nul 2>&1
+if %ERRORLEVEL% equ 0 (
+    py -3 -m g023_code %*
+    goto :done
+)
+echo Error: Python 3 is required but not found. Run installer.bat first.
+exit /b 1
+
+:done
 
 endlocal

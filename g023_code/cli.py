@@ -23,8 +23,10 @@ from . import ollama_client
 from . import ui
 from .commands import Command
 from .config import (
+    AVAILABLE_MODELS,
     PERSISTED_KEYS,
     Settings,
+    UNAVAILABLE_MODELS,
     get_config_file,
     get_home,
     get_project_root,
@@ -204,7 +206,7 @@ class CLI:
                 (
                     "session",
                     f"{self.orch.state.turn} turn(s) {Glyph.DOT} "
-                    f"{len(self.orch.state.messages)} message(s) {Glyph.DOT} "
+                    f"{len(self.orch.state.items)} item(s) {Glyph.DOT} "
                     f"{self.orch.state.compactions} compaction(s) {Glyph.DOT} "
                     f"auto-compact {'on' if settings.auto_compact else 'off'}",
                 ),
@@ -257,20 +259,26 @@ class CLI:
     # ------------------------------------------------------------------
 
     def cmd_model(self, arg: str = "") -> None:
-        aliases = {
-            "flash": "deepseek-v4-flash",
-            "pro": "deepseek-v4-pro",
-            "deepseek-v4-flash": "deepseek-v4-flash",
-            "deepseek-v4-pro": "deepseek-v4-pro",
-        }
-        target = aliases.get(arg.strip().lower())
+        aliases = {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"}
+        raw = arg.strip().lower()
+        target = aliases.get(raw, raw) if raw else None
+
+        # Asking for a model the Responses API won't serve gets a reason, not a
+        # silent "unknown model" — the name is right, the endpoint just isn't
+        # ready for it, and that distinction is worth saying out loud.
+        if target in UNAVAILABLE_MODELS:
+            console.print(f"[warn]{target} is not available yet.[/warn]")
+            console.print(f"[muted]{UNAVAILABLE_MODELS[target]}[/muted]")
+            return
+
+        if target is not None and target not in AVAILABLE_MODELS:
+            choices = " | ".join(AVAILABLE_MODELS)
+            console.print(f"[warn]Unknown model:[/warn] {arg}  [muted]({choices})[/muted]")
+            return
 
         if target is None:
-            if arg:
-                console.print(f"[warn]Unknown model:[/warn] {arg}  [muted](flash | pro)[/muted]")
-                return
             options = []
-            for key, model in (("flash", "deepseek-v4-flash"), ("pro", "deepseek-v4-pro")):
+            for model in AVAILABLE_MODELS:
                 p = PRICING[model]
                 current = f"  [ok]{Glyph.CHECK} current[/ok]" if settings.orchestrator_model == model else ""
                 options.append(
@@ -279,11 +287,22 @@ class CLI:
                         f"${p.cache_miss}/1M in {Glyph.DOT} ${p.output}/1M out",
                     )
                 )
-            default = 1 if settings.orchestrator_model == "deepseek-v4-flash" else 2
+            if len(options) == 1:
+                console.print(
+                    f"[muted]{AVAILABLE_MODELS[0]} is the only model the Responses API serves "
+                    f"today, so there is nothing to switch to.[/muted]"
+                )
+                for model, why in UNAVAILABLE_MODELS.items():
+                    console.print(f"[muted]{model}: {why}[/muted]")
+                return
+            try:
+                default = AVAILABLE_MODELS.index(settings.orchestrator_model) + 1
+            except ValueError:
+                default = 1
             picked = choose("Orchestrator model", options, default=default)
             if picked is None:
                 return
-            target = ("deepseek-v4-flash", "deepseek-v4-pro")[picked - 1]
+            target = AVAILABLE_MODELS[picked - 1]
 
         settings.orchestrator_model = target  # type: ignore[assignment]
         save_config()
@@ -402,8 +421,8 @@ class CLI:
 
         total_chars = sum(chars for _, chars in breakdown.values()) or 1
         table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
-        table.add_column("Role", style="key")
-        table.add_column("Messages", justify="right")
+        table.add_column("Kind", style="key")
+        table.add_column("Items", justify="right")
         table.add_column("Characters", justify="right")
         table.add_column("Share", justify="right")
         table.add_column("")
@@ -553,10 +572,13 @@ class CLI:
         return table
 
     def pricing_note(self) -> str:
+        # Only price what the Responses API will actually serve. Listing a model
+        # /model refuses to select reads as a menu, not a footnote.
         parts = [
             f"{model}: ${p.cache_hit}/1M hit {Glyph.DOT} ${p.cache_miss}/1M miss "
             f"{Glyph.DOT} ${p.output}/1M out"
             for model, p in PRICING.items()
+            if model in AVAILABLE_MODELS
         ]
         return "[muted]" + "\n".join(parts) + "\nEstimates only — actual billing is DeepSeek's.[/muted]"
 

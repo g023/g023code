@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -97,7 +98,7 @@ TOOL_STYLES: dict[str, ToolStyle] = {
     "WriteFile": ToolStyle("✎" if UNICODE else "W", "warn", "write"),
     "ListDir": ToolStyle("📁" if UNICODE else "L", "tool", "list"),
     "FetchUrl": ToolStyle("🌐" if UNICODE else "F", "tool", "fetch"),
-    "WebSearch": ToolStyle("🔍" if UNICODE else "?", "tool", "web search"),
+    "web_search": ToolStyle("🔍" if UNICODE else "?", "tool", "web search"),
 }
 
 _FALLBACK_STYLE = ToolStyle(Glyph.BULLET, "tool", "call")
@@ -147,6 +148,17 @@ def shorten_path(path: str, root: Optional[str] = None) -> str:
         except (ValueError, OSError):
             pass
     return path
+
+
+def short_url(url: str) -> str:
+    """Host plus a hint of the path — enough to recognise a page in one line."""
+    if not url:
+        return ""
+    stripped = re.sub(r"^https?://(www\.)?", "", url).rstrip("/")
+    host, _, path = stripped.partition("/")
+    if not path:
+        return host
+    return f"{host}/{path}" if len(path) <= 28 else f"{host}/{Glyph.ELLIPSIS}{path[-24:]}"
 
 
 def gauge(fraction: float, width: int = 24, warn: float = 0.6, danger: float = 0.85) -> Text:
@@ -230,8 +242,16 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
         return shorten_path(s("path") or ".", root) + (" [muted](recursive)[/muted]" if args.get("recursive") else "")
     if name == "FetchUrl":
         return truncate(s("url"), 60)
-    if name == "WebSearch":
-        return f'"{truncate(s("query"), 50)}"'
+    if name == "web_search":
+        # A server-side search action: either the queries it ran, or the page it
+        # went to (optionally with the pattern it looked for there).
+        queries = args.get("queries") or []
+        if queries:
+            return truncate(", ".join(f'"{q}"' for q in queries), 60)
+        detail = short_url(s("url"))
+        if args.get("pattern"):
+            detail += f" [muted]/{truncate(s('pattern'), 24)}/[/muted]"
+        return detail
     if name == "Agent":
         return f"{s('kind') or 'explore'} [muted]{truncate(s('objective'), 50)}[/muted]"
     return truncate(json.dumps(args, ensure_ascii=False), 70)
@@ -307,8 +327,9 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         src = data.get("source", "")
         return f"HTTP {data.get('status', '?')} {Glyph.DOT} {len(content):,} chars {Glyph.DOT} {src}", True
 
-    if name == "WebSearch":
-        return f"{len(data.get('results') or [])} results", True
+    # web_search has no branch here: it is DeepSeek's own server-side tool, so it
+    # never produces a tool result for us to summarise. The orchestrator builds
+    # its trace events straight from the web_search_call items instead.
 
     if name == "Agent":
         return f"{len(data.get('plan_or_exploration') or '')} chars", True

@@ -59,7 +59,7 @@ class Command:
 
 LEVEL_CHOICES = ("low", "mid", "high")
 EFFORT_CHOICES = ("low", "high", "max", "off")
-MODEL_CHOICES = ("flash", "pro")
+MODEL_CHOICES = ("flash",)
 PERMISSION_CHOICES = ("allow", "ask", "block")
 BACKEND_CHOICES = ("none", "ollama", "glm", "openai", "local")
 
@@ -112,14 +112,15 @@ COMMANDS: tuple[Command, ...] = (
         handler="cmd_model",
         group="Model",
         interactive=True,
-        args=(Argument("model", MODEL_CHOICES, "flash is the default; pro costs ~3x"),),
+        args=(Argument("model", MODEL_CHOICES, "flash is the only model available today"),),
         detail=(
-            "flash — deepseek-v4-flash. The default, and the right answer most of the time.\n"
-            "pro   — deepseek-v4-pro. Roughly three times the price; reach for it when\n"
-            "        a task is genuinely hard, not merely long.\n\n"
-            "Called with no argument, this opens a picker showing both prices."
+            "flash — deepseek-v4-flash. The default, and currently the only choice.\n\n"
+            "Everything runs on DeepSeek's Responses API, which is where the built-in\n"
+            "web_search tool lives. deepseek-v4-pro is not enabled on that endpoint yet\n"
+            "(DeepSeek reports availability from early August 2026), so it is withheld\n"
+            "rather than offered as a model every call would fail on."
         ),
-        examples=("/model", "/model pro"),
+        examples=("/model", "/model flash"),
     ),
     Command(
         name="/thinking",

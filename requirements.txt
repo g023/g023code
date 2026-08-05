@@ -1,7 +1,6 @@
 # Required — g023 will not start without these.
-openai>=1.40.0        # AsyncOpenAI client, pointed at api.deepseek.com
 rich>=13.7.0          # every pixel of the UI
-httpx>=0.27.0         # Ollama transport, and the FetchUrl fallback
+httpx>=0.27.0         # DeepSeek Responses API client, Ollama, FetchUrl fallback
 tiktoken>=0.7.0       # token accounting for the context gauge
 pygments>=2.17.0      # syntax highlighting inside rich
 

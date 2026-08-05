@@ -1,6 +1,17 @@
 """
 Orchestrator — the high-level reasoning loop.
 
+Runs on DeepSeek's Responses API. That choice is what lets ``web_search`` be a
+real tool of this loop: DeepSeek only exposes its server-side search on
+``/responses``, so the model can search the web mid-turn and keep going, in the
+same call, without anything here brokering it.
+
+The conversation is stored as Responses *items* rather than chat messages —
+``function_call`` / ``function_call_output`` pairs, plus the model's own
+``reasoning``, ``message`` and ``web_search_call`` items echoed back verbatim.
+Echoing them unchanged is both the highest-fidelity way to carry history and the
+most prefix-cache friendly, since the prefix stays byte-identical between turns.
+
 Keeps context clean by delegating all heavy data work to subagents, and narrates
 what it is doing while it does it. Every tool call is timed, summarised, and
 folded into a :class:`~g023_code.ui.TurnTrace` so the CLI can close each turn
@@ -11,17 +22,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from openai import AsyncOpenAI
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
 from . import ui
-from .config import get_project_root, load_api_key, settings
+from .api import DeepSeekError, get_client, reasoning_param
+from .config import get_project_root, settings
 from .tools.registry import get_registry
 from .subagents.router import get_router
 from .ui import ActivityPrinter, Glyph, ToolEvent, TurnTrace, console
@@ -36,9 +48,13 @@ Instead you always use the provided tools:
 - ReadFile → returns a compact structural summary + metadata (use this instead of asking for full files)
 - SearchContent → returns metadata-first match list
 - Agent → spawn Explore or Plan subagents for complex work
-- FetchUrl → read a web page as readable text (asks the user first; the user
-  decides between a cached copy and a fresh fetch, so never assume either)
-- Bash / WriteFile / ListDir / WebSearch for direct actions
+- web_search → your own built-in web search. Use it whenever the answer depends on
+  current facts, or on a library or API you are not certain about. It runs during
+  your turn: you search, read what you find, and carry straight on.
+- FetchUrl → read a specific web page as readable text, in full (asks the user
+  first; the user decides between a cached copy and a fresh fetch, so never
+  assume either). Use web_search to find a page, FetchUrl to study one.
+- Bash / WriteFile / ListDir for direct actions
 
 When you need information, call the appropriate tool. After receiving the compact result, reason and continue.
 Prefer multiple precise tool calls over one giant request.
@@ -78,6 +94,37 @@ CLEARED_TOOL_RESULT = "[Old tool result content cleared]"
 # Tools whose work belongs in an isolated subagent context, never in ours.
 SUBAGENT_TOOLS = ("ReadFile", "SearchContent", "AnalyzeImage", "Agent")
 
+# DeepSeek tags every search action with the id of the call that produced it,
+# appended to the URL as a fragment ("…/downloads/#ws_call_id=call_01_ab…") and
+# pushed in as a trailing pseudo-query. It is bookkeeping, not part of either.
+_WS_CALL_ID = re.compile(r"[#&?]?ws_call_id=[A-Za-z0-9_]+")
+
+
+def _strip_call_id(value: str) -> str:
+    return _WS_CALL_ID.sub("", value or "").rstrip("#&?").strip()
+
+
+def describe_search(item: dict) -> tuple[dict, str]:
+    """Turn a ``web_search_call`` item into (args, one-line summary) for the trace.
+
+    The server reports what it did as an ``action``: a ``search`` carries the
+    queries it ran, while ``open_page`` and ``find_in_page`` carry the URL it
+    went to. Opening a page can fail — the server meets timeouts and blocks like
+    any other client — so the status is worth surfacing rather than assuming.
+    """
+    action = item.get("action") or {}
+    kind = action.get("type") or "search"
+    url = _strip_call_id(action.get("url") or "")
+    queries = [q for q in (_strip_call_id(q) for q in action.get("queries") or []) if q]
+
+    if kind == "search":
+        return {"queries": queries}, ", ".join(queries) or "search"
+    args: dict[str, Any] = {"url": url}
+    if action.get("pattern"):
+        args["pattern"] = action["pattern"]
+        return args, f"find {action['pattern']!r} in {ui.short_url(url)}"
+    return args, f"read {ui.short_url(url)}"
+
 
 # ---------------------------------------------------------------------------
 # One normalised model reply, whether it arrived streamed or in one piece
@@ -85,7 +132,9 @@ SUBAGENT_TOOLS = ("ReadFile", "SearchContent", "AnalyzeImage", "Agent")
 
 @dataclass
 class ToolCall:
-    id: str
+    """A ``function_call`` item the model produced."""
+
+    id: str  # call_id — what a function_call_output must quote back
     name: str
     arguments: str = ""
 
@@ -99,8 +148,8 @@ class ToolCall:
     def argument_error(self) -> Optional[str]:
         """Why the arguments could not be used, if they could not.
 
-        A long WriteFile that runs into max_tokens arrives as truncated JSON.
-        Executing that as an empty argument dict produces a baffling
+        A long WriteFile that runs into max_output_tokens arrives as truncated
+        JSON. Executing that as an empty argument dict produces a baffling
         "missing positional argument" — the model needs to be told what actually
         happened so it can re-send a smaller call.
         """
@@ -109,7 +158,7 @@ class ToolCall:
             value = json.loads(raw)
         except json.JSONDecodeError as e:
             return (
-                f"Malformed tool arguments ({e.msg} at char {e.pos} of {len(raw)}). "
+                f"Malformed tool arguments — {e.msg} (char {e.pos} of {len(raw)}). "
                 "They were most likely cut off mid-generation — re-send this call "
                 "with a smaller payload (for a large file, write it in parts)."
             )
@@ -117,27 +166,86 @@ class ToolCall:
             return f"Tool arguments must be a JSON object, got {type(value).__name__}."
         return None
 
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "type": "function",
-            "function": {"name": self.name, "arguments": self.arguments},
-        }
-
 
 @dataclass
 class Reply:
+    """A parsed ``/responses`` result."""
+
+    output: List[Dict[str, Any]] = field(default_factory=list)
     content: str = ""
+    # Mid-flight narration ("let me check the docs page"). Not the answer, but
+    # the only thing said when a turn ends without one — see run_turn.
+    commentary: str = ""
     reasoning: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
+    searches: List[Dict[str, Any]] = field(default_factory=list)
     usage: Any = None
+    status: str = "completed"
+    incomplete_reason: str = ""
     streamed: bool = False
 
-    def to_message(self) -> dict:
-        msg: dict[str, Any] = {"role": "assistant", "content": self.content or None}
-        if self.tool_calls:
-            msg["tool_calls"] = [tc.to_dict() for tc in self.tool_calls]
-        return msg
+
+def parse_reply(response: Dict[str, Any], rendered_ids: Optional[set] = None) -> Reply:
+    """Split a response's ``output`` list into the parts the loop acts on."""
+    reply = Reply(
+        output=list(response.get("output") or []),
+        usage=response.get("usage"),
+        status=response.get("status") or "completed",
+        incomplete_reason=((response.get("incomplete_details") or {}).get("reason") or ""),
+    )
+    answer: List[str] = []
+    commentary: List[str] = []
+    reasoning: List[str] = []
+    # Message ids that were rendered live, split by which bucket they landed in,
+    # so "was it already on screen?" can be answered for whichever one we end up
+    # presenting as the turn's result.
+    streamed_answer = False
+    streamed_commentary = False
+
+    for item in reply.output:
+        kind = item.get("type")
+        if kind == "function_call":
+            reply.tool_calls.append(
+                ToolCall(
+                    id=item.get("call_id") or "",
+                    name=item.get("name") or "",
+                    arguments=item.get("arguments") or "",
+                )
+            )
+        elif kind == "web_search_call":
+            reply.searches.append(item)
+        elif kind == "reasoning":
+            for part in item.get("content") or []:
+                if part.get("type") == "reasoning_text" and part.get("text"):
+                    reasoning.append(part["text"])
+        elif kind == "message" and item.get("role") == "assistant":
+            # 'commentary' is the model narrating mid-flight ("let me check the
+            # docs page"); only 'final_answer' is the answer itself.
+            is_answer = item.get("phase") in (None, "final_answer")
+            bucket = answer if is_answer else commentary
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text" and part.get("text"):
+                    bucket.append(part["text"])
+            if rendered_ids is not None and item.get("id") in rendered_ids:
+                if is_answer:
+                    streamed_answer = True
+                else:
+                    streamed_commentary = True
+
+    reply.content = "".join(answer)
+    reply.commentary = "".join(commentary)
+    reply.reasoning = "\n".join(reasoning)
+    # A turn can legitimately end with narration and no final answer. Whichever
+    # of the two the caller ends up showing is what "already streamed" has to
+    # refer to, or the CLI reprints it — or, worse, prints "(no answer)" over
+    # text the user just watched arrive.
+    if reply.content:
+        reply.streamed = streamed_answer
+    elif reply.commentary:
+        reply.streamed = streamed_commentary
+    else:
+        reply.streamed = False
+    return reply
 
 
 @dataclass
@@ -154,44 +262,59 @@ class TurnRecord:
 
 @dataclass
 class OrchestratorState:
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    # Responses input items, in order. Not chat messages: see the module docstring.
+    items: List[Dict[str, Any]] = field(default_factory=list)
     turn: int = 0
     compactions: int = 0
     history: List[TurnRecord] = field(default_factory=list)
 
     def add_user(self, content: str):
-        self.messages.append({"role": "user", "content": content})
+        self.items.append({"role": "user", "content": content})
 
-    def add_assistant(self, msg: Any):
-        if isinstance(msg, dict):
-            self.messages.append(msg)
-        elif hasattr(msg, "model_dump"):
-            self.messages.append(msg.model_dump(exclude_none=True))
-        else:
-            self.messages.append(dict(msg))
+    def add_output(self, output: List[Dict[str, Any]]):
+        """Echo the model's own output items back into the history verbatim."""
+        self.items.extend(output)
 
-    def add_tool_result(self, tool_call_id: str, content: str):
-        self.messages.append(
-            {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+    def add_tool_result(self, call_id: str, content: str):
+        self.items.append(
+            {"type": "function_call_output", "call_id": call_id, "output": content}
         )
 
     def role_breakdown(self) -> dict[str, tuple[int, int]]:
-        """role -> (message count, characters) — what /context reports."""
+        """bucket -> (item count, characters) — what /context reports."""
         out: dict[str, tuple[int, int]] = {}
-        for m in self.messages:
-            role = m.get("role", "?")
-            size = len(m.get("content") or "")
-            for call in m.get("tool_calls") or []:
-                if isinstance(call, dict):
-                    size += len((call.get("function") or {}).get("arguments") or "")
-            count, chars = out.get(role, (0, 0))
-            out[role] = (count + 1, chars + size)
+
+        def add(bucket: str, size: int) -> None:
+            count, chars = out.get(bucket, (0, 0))
+            out[bucket] = (count + 1, chars + size)
+
+        for item in self.items:
+            kind = item.get("type")
+            if kind == "function_call_output":
+                add("tool", len(item.get("output") or ""))
+            elif kind == "function_call":
+                add("assistant", len(item.get("arguments") or "") + len(item.get("name") or ""))
+            elif kind == "web_search_call":
+                add("web search", len(json.dumps(item.get("action") or {})))
+            elif kind == "reasoning":
+                add(
+                    "reasoning",
+                    sum(len(p.get("text") or "") for p in item.get("content") or []),
+                )
+            else:
+                role = item.get("role") or "assistant"
+                content = item.get("content")
+                if isinstance(content, str):
+                    size = len(content)
+                else:
+                    size = sum(len(p.get("text") or "") for p in content or [])
+                add(role, size)
         return out
 
 
 class Orchestrator:
     def __init__(self, printer: Optional[ActivityPrinter] = None):
-        self.client = AsyncOpenAI(api_key=load_api_key(), base_url=settings.base_url)
+        self.client = get_client()
         self.registry = get_registry()
         self.router = get_router()
         self.state = OrchestratorState()
@@ -209,8 +332,9 @@ class Orchestrator:
     @property
     def _system(self) -> str:
         """
-        System prompt. Static except for the vision clause, which only changes
-        when the user reconfigures vision — so the prefix stays cache-friendly.
+        System prompt, sent as the request's ``instructions``. Static except for
+        the vision clause, which only changes when the user reconfigures vision —
+        so the prefix stays cache-friendly.
         """
         if settings.vision_enabled:
             return ORCHESTRATOR_SYSTEM + VISION_SYSTEM_ADDENDUM.format(
@@ -218,31 +342,25 @@ class Orchestrator:
             )
         return ORCHESTRATOR_SYSTEM + VISION_DISABLED_ADDENDUM
 
-    def _build_messages(self) -> list:
-        """System prompt is always first (static → high cache hit rate)."""
-        return [{"role": "system", "content": self._system}] + self.state.messages
-
     # ------------------------------------------------------------------
     # Model calls
     # ------------------------------------------------------------------
 
-    def _request_kwargs(self) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {
+    def _request_body(self) -> Dict[str, Any]:
+        return {
             "model": settings.orchestrator_model,
-            "messages": self._build_messages(),
+            "instructions": self._system,
+            "input": list(self.state.items),
             "tools": self.registry.get_schemas(),
-            "max_tokens": settings.max_tokens,
+            "max_output_tokens": settings.max_tokens,
             "temperature": settings.temperature,
+            "reasoning": reasoning_param(),
         }
-        if settings.thinking_enabled:
-            kwargs["reasoning_effort"] = settings.reasoning_effort
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        return kwargs
 
-    async def _call_blocking(self, kwargs: Dict[str, Any], label: str) -> Reply:
+    async def _call_blocking(self, body: Dict[str, Any], label: str) -> Reply:
         """Non-streaming call, with a spinner that counts the seconds."""
         started = time.perf_counter()
-        task = asyncio.create_task(self.client.chat.completions.create(**kwargs))
+        task = asyncio.create_task(self.client.create(**body))
         with console.status(f"[accent]{label}[/accent]", spinner="dots") as status:
             while not task.done():
                 await asyncio.sleep(0.25)
@@ -250,39 +368,29 @@ class Orchestrator:
                     f"[accent]{label}[/accent] "
                     f"[muted]{Glyph.DOT} {time.perf_counter() - started:.1f}s[/muted]"
                 )
-        response = await task
+        return parse_reply(await task)
 
-        msg = response.choices[0].message
-        calls = [
-            ToolCall(id=tc.id, name=tc.function.name, arguments=tc.function.arguments or "")
-            for tc in (msg.tool_calls or [])
-        ]
-        return Reply(
-            content=msg.content or "",
-            reasoning=getattr(msg, "reasoning_content", None) or "",
-            tool_calls=calls,
-            usage=response.usage,
-        )
-
-    async def _call_streaming(self, kwargs: Dict[str, Any], label: str) -> Reply:
+    async def _call_streaming(self, body: Dict[str, Any], label: str) -> Reply:
         """
         Streaming call — the answer appears as it is written.
 
-        Reasoning deltas drive the spinner text (so a long think looks like
-        progress rather than a hang) and the answer renders into a live panel.
+        Reasoning deltas drive the thinking counter (so a long think looks like
+        progress rather than a hang) and each assistant message renders into its
+        own live panel. Searches are announced twice — once when the server
+        starts one, so a slow search is visibly a search rather than a hang, and
+        again with the queries it actually ran once it finishes.
+
+        The deltas are for the eye only: the authoritative result is taken from
+        the response object embedded in the terminal event, which makes stream
+        reassembly bugs impossible.
         """
-        kwargs = dict(kwargs)
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
+        final: Optional[Dict[str, Any]] = None
+        rendered_ids: set = set()
 
-        stream = await self.client.chat.completions.create(**kwargs)
-
-        content: List[str] = []
-        reasoning: List[str] = []
-        partial: Dict[int, Dict[str, str]] = {}
-        usage = None
-        started = time.perf_counter()
+        text_by_item: Dict[str, List[str]] = {}
+        current_item: Optional[str] = None
         live: Optional[Live] = None
+        started = time.perf_counter()
         reasoning_chars = 0
         counter_shown = False
         last_tick = 0.0
@@ -291,83 +399,130 @@ class Orchestrator:
             """Wipe the in-place thinking line so nothing prints on top of it."""
             nonlocal counter_shown
             if counter_shown:
-                console.print(" " * 64, end="\r")
+                console.print(" " * 72, end="\r")
                 counter_shown = False
 
-        try:
-            async for chunk in stream:
-                if getattr(chunk, "usage", None):
-                    usage = chunk.usage
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
+        def show_counter(text: str) -> None:
+            """Draw an in-place progress line, on a terminal only."""
+            nonlocal counter_shown
+            if live is not None or not console.is_terminal:
+                return
+            counter_shown = True
+            console.print(f"  [muted]{Glyph.DOT} {text}[/muted]", end="\r")
 
-                piece = getattr(delta, "reasoning_content", None)
-                if piece:
-                    reasoning.append(piece)
+        def render_panel(item_id: str, title: str = "g023") -> None:
+            if live is not None:
+                live.update(ui.panel(Markdown("".join(text_by_item.get(item_id, []))), title))
+
+        def close_panel(title: Optional[str] = None) -> None:
+            """Stop the live panel, optionally re-titling it on the way out.
+
+            ``Live.stop`` leaves the last frame on screen, so a final update
+            here is what the user is left looking at.
+            """
+            nonlocal live, current_item
+            if live is not None:
+                if title is not None and current_item is not None:
+                    render_panel(current_item, title)
+                live.stop()
+                live = None
+            current_item = None
+
+        try:
+            async for event in self.client.stream(**body):
+                kind = event.get("type") or ""
+
+                if kind == "response.reasoning_text.delta":
+                    piece = event.get("delta") or ""
                     reasoning_chars += len(piece)
                     now = time.perf_counter()
-                    # Redraw ~10x a second: often enough to look live, rare enough
-                    # that a fast stream does not spend its time on the terminal.
-                    # The counter redraws in place with \r, which only means
-                    # anything on a terminal — piped or redirected output would
-                    # collect every tick as literal noise.
-                    if live is None and console.is_terminal and now - last_tick >= 0.1:
+                    # Redraw ~10x a second: often enough to look live, rare
+                    # enough that a fast stream does not spend its time on the
+                    # terminal. The counter redraws in place with \r, which only
+                    # means anything on a terminal — piped or redirected output
+                    # would collect every tick as literal noise.
+                    if now - last_tick >= 0.1:
                         last_tick = now
-                        counter_shown = True
-                        console.print(
-                            f"  [muted]{Glyph.DOT} thinking {reasoning_chars:,} chars"
-                            f" {Glyph.DOT} {now - started:.1f}s[/muted]",
-                            end="\r",
+                        show_counter(
+                            f"thinking {reasoning_chars:,} chars "
+                            f"{Glyph.DOT} {now - started:.1f}s"
                         )
 
-                for tc in getattr(delta, "tool_calls", None) or []:
-                    slot = partial.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
-                    if tc.id:
-                        slot["id"] = tc.id
-                    if tc.function is not None:
-                        if tc.function.name:
-                            slot["name"] = tc.function.name
-                        if tc.function.arguments:
-                            slot["arguments"] += tc.function.arguments
-
-                if delta.content:
-                    content.append(delta.content)
-                    if live is None:
+                elif kind == "response.output_text.delta":
+                    item_id = event.get("item_id") or ""
+                    if item_id != current_item:
+                        close_panel()
                         clear_counter()
-                        live = Live(console=console, refresh_per_second=8, vertical_overflow="visible")
+                        current_item = item_id
+                        rendered_ids.add(item_id)
+                        live = Live(
+                            console=console,
+                            refresh_per_second=8,
+                            vertical_overflow="visible",
+                        )
                         live.start()
-                    live.update(ui.panel(Markdown("".join(content)), "g023"))
+                    text_by_item.setdefault(item_id, []).append(event.get("delta") or "")
+                    render_panel(item_id)
+
+                elif kind == "response.output_item.added":
+                    item = event.get("item") or {}
+                    if item.get("type") == "web_search_call":
+                        # The server can spend a while out on the web without
+                        # emitting anything else. Say so, or it reads as a hang.
+                        show_counter("searching the web…")
+
+                elif kind == "response.output_item.done":
+                    item = event.get("item") or {}
+                    if item.get("type") == "message":
+                        # The phase is only settled here — an item announces
+                        # itself as a final answer and may still turn out to be
+                        # narration — so this is where the panel gets its title.
+                        close_panel(
+                            "g023"
+                            if item.get("phase") in (None, "final_answer")
+                            else f"g023 {Glyph.DOT} thinking aloud"
+                        )
+                    elif item.get("type") == "web_search_call":
+                        # Announce it now; the trace event is recorded once the
+                        # whole reply is parsed, so both stay in step.
+                        clear_counter()
+                        _, summary = describe_search(item)
+                        style = ui.tool_style("web_search")
+                        console.print(
+                            f"  [{style.color}]{style.icon} {style.verb}[/{style.color}] "
+                            f"[muted]{ui.truncate(summary, 88)}[/muted]"
+                        )
+
+                elif kind in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                ):
+                    final = event.get("response") or {}
         finally:
-            if live is not None:
-                live.stop()
+            close_panel()
             clear_counter()
 
-        calls = [
-            ToolCall(id=slot["id"], name=slot["name"], arguments=slot["arguments"])
-            for _, slot in sorted(partial.items())
-            if slot["name"]
-        ]
-
-        return Reply(
-            content="".join(content),
-            reasoning="".join(reasoning),
-            tool_calls=calls,
-            usage=usage,
-            streamed=bool(content),
-        )
+        if final is None:
+            raise DeepSeekError(0, "the stream ended before the response completed")
+        if final.get("status") == "failed":
+            error = final.get("error") or {}
+            raise DeepSeekError(0, error.get("message") or "the model reported a failure")
+        return parse_reply(final, rendered_ids=rendered_ids)
 
     async def _call_model(self, iteration: int) -> Reply:
-        kwargs = self._request_kwargs()
+        body = self._request_body()
         label = f"Thinking{Glyph.ELLIPSIS} (turn {self.state.turn}, step {iteration})"
         if settings.stream:
             try:
-                return await self._call_streaming(kwargs, label)
+                return await self._call_streaming(body, label)
+            except DeepSeekError:
+                raise
             except Exception as e:
-                # Some proxies reject stream_options; one quiet retry unstreamed
-                # is better than failing a turn over a transport detail.
+                # A transport-level streaming failure should not cost the turn;
+                # one quiet retry unstreamed is the cheaper answer.
                 console.print(f"[muted]streaming unavailable ({e}); falling back[/muted]")
-        return await self._call_blocking(kwargs, label)
+        return await self._call_blocking(body, label)
 
     # ------------------------------------------------------------------
     # The turn
@@ -399,13 +554,24 @@ class Orchestrator:
                 reply = await self._call_model(iteration)
             except Exception as e:
                 console.print(f"[bad]API error:[/bad] {e}")
-                # Drop the dangling user message so the next turn starts clean.
+                # Drop the dangling exchange so the next turn starts clean.
                 self._rollback_to_last_complete()
                 return f"API error: {e}"
             self.trace.thinking_ms += (time.perf_counter() - think_started) * 1000
 
-            self.state.add_assistant(reply.to_message())
+            self.state.add_output(reply.output)
             delta = self.usage.record(settings.orchestrator_model, reply.usage, scope="orchestrator")
+
+            for item in reply.searches:
+                args, summary = describe_search(item)
+                self.trace.events.append(
+                    ToolEvent(
+                        name="web_search",
+                        args=args,
+                        ok=item.get("status") == "completed",
+                        summary=summary,
+                    )
+                )
 
             if reply.reasoning and settings.show_thinking:
                 console.print(
@@ -428,7 +594,17 @@ class Orchestrator:
                 await self._run_tool_calls(reply.tool_calls)
                 continue
 
-            final_content = reply.content
+            if reply.incomplete_reason == "max_output_tokens":
+                # Say so rather than presenting a sentence that stops mid-word
+                # as if it were the whole answer.
+                console.print(
+                    f"[warn]The reply hit the {settings.max_tokens:,}-token output "
+                    "limit and was cut off.[/warn]"
+                )
+
+            # The model can finish a turn having only narrated. That narration is
+            # all it said, so present it rather than an empty panel.
+            final_content = reply.content or reply.commentary
             self._streamed_answer = reply.streamed
             break
         else:
@@ -517,18 +693,38 @@ class Orchestrator:
         """
         Drop a half-finished exchange after an API failure.
 
-        An assistant message with tool_calls and no matching tool results is a
-        400 on the *next* request, so a failed turn must not leave one behind.
+        The API enforces the tool-call pairing in both directions: a
+        ``function_call`` with no matching ``function_call_output`` is a 400, and
+        so is an output whose call was never made. A failed turn must not leave
+        either behind, or every later turn fails too.
         """
-        while self.state.messages:
-            last = self.state.messages[-1]
+        while self.state.items:
+            last = self.state.items[-1]
             if last.get("role") == "user":
-                self.state.messages.pop()
+                self.state.items.pop()
                 break
-            if last.get("role") == "assistant" and last.get("tool_calls"):
-                self.state.messages.pop()
-                continue
-            break
+            self.state.items.pop()
+        self._repair_pairing()
+
+    def _repair_pairing(self) -> None:
+        """Drop any ``function_call`` / ``function_call_output`` left unpaired."""
+        called = {
+            i.get("call_id") for i in self.state.items if i.get("type") == "function_call"
+        }
+        answered = {
+            i.get("call_id")
+            for i in self.state.items
+            if i.get("type") == "function_call_output"
+        }
+        orphans = called.symmetric_difference(answered)
+        if not orphans:
+            return
+        self.state.items = [
+            i
+            for i in self.state.items
+            if i.get("type") not in ("function_call", "function_call_output")
+            or i.get("call_id") not in orphans
+        ]
 
     # ------------------------------------------------------------------
     # Context accounting
@@ -591,34 +787,49 @@ class Orchestrator:
         """
         Layer 1: locally blank out old tool results. Free — no API call.
         Returns the number of characters reclaimed.
+
+        Only the ``output`` text goes; the items themselves stay, because
+        removing one would orphan its ``function_call`` and make the next
+        request a 400.
         """
-        tool_indices = [i for i, m in enumerate(self.state.messages) if m.get("role") == "tool"]
+        indices = [
+            i
+            for i, item in enumerate(self.state.items)
+            if item.get("type") == "function_call_output"
+        ]
         reclaimed = 0
-        for i in tool_indices[:-keep_recent] if keep_recent else tool_indices:
-            content = self.state.messages[i].get("content") or ""
+        for i in indices[:-keep_recent] if keep_recent else indices:
+            content = self.state.items[i].get("output") or ""
             if content == CLEARED_TOOL_RESULT:
                 continue
             reclaimed += len(content)
-            self.state.messages[i]["content"] = CLEARED_TOOL_RESULT
+            self.state.items[i]["output"] = CLEARED_TOOL_RESULT
         return reclaimed
 
     def _render_transcript(self, max_chars: int = 60_000) -> str:
-        """Flatten the message list into something a summarizer can read."""
+        """Flatten the item list into something a summarizer can read."""
         parts: List[str] = []
-        for m in self.state.messages:
-            role = m.get("role", "?")
-            content = m.get("content") or ""
-            if role == "tool":
-                parts.append(f"[tool result] {content[:1500]}")
+        for item in self.state.items:
+            kind = item.get("type")
+            if kind == "function_call_output":
+                parts.append(f"[tool result] {(item.get('output') or '')[:1500]}")
                 continue
-            calls = m.get("tool_calls") or []
-            if calls:
-                names = ", ".join(
-                    f"{c['function']['name']}({(c['function'].get('arguments') or '')[:160]})"
-                    for c in calls
-                    if isinstance(c, dict) and c.get("function")
+            if kind == "function_call":
+                parts.append(
+                    f"[assistant tool call] {item.get('name')}"
+                    f"({(item.get('arguments') or '')[:160]})"
                 )
-                parts.append(f"[assistant tool calls] {names}")
+                continue
+            if kind == "web_search_call":
+                _, summary = describe_search(item)
+                parts.append(f"[web search] {summary}")
+                continue
+            if kind == "reasoning":
+                continue  # the model's scratch work, not the record of the session
+            role = item.get("role") or "assistant"
+            content = item.get("content")
+            if not isinstance(content, str):
+                content = "".join(p.get("text") or "" for p in content or [])
             if content:
                 parts.append(f"[{role}] {content[:4000]}")
         text = "\n\n".join(parts)
@@ -632,11 +843,11 @@ class Orchestrator:
         Layer 3: summarize the conversation with the cheap model in an isolated
         context and replace the history with that summary.
         """
-        if not self.state.messages:
+        if not self.state.items:
             return "Nothing to compact — the conversation is empty."
 
-        before_msgs = len(self.state.messages)
-        before_chars = sum(len(m.get("content") or "") for m in self.state.messages)
+        before_items = len(self.state.items)
+        before_chars = len(self._render_transcript(max_chars=10**9))
 
         # Render *before* touching the history: micro-compacting first would hand
         # the summarizer a transcript of blanked placeholders instead of the work
@@ -648,26 +859,26 @@ class Orchestrator:
 
         try:
             with console.status("[accent]Compacting conversation…[/accent]", spinner="dots"):
-                resp = await self.client.chat.completions.create(
+                resp = await self.client.create(
                     model=settings.subagent_model,
-                    messages=[
-                        {"role": "system", "content": COMPACT_SYSTEM},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=2048,
+                    instructions=COMPACT_SYSTEM,
+                    input=[{"role": "user", "content": user_msg}],
+                    max_output_tokens=2048,
                     temperature=0.1,
-                    extra_body={"thinking": {"type": "disabled"}},
+                    reasoning=reasoning_param(enabled=False),
                 )
         except Exception as e:
             return f"Compaction failed: {e}"
 
-        delta = self.usage.record(settings.subagent_model, resp.usage, scope="subagent")
+        from .api import output_text
+
+        delta = self.usage.record(settings.subagent_model, resp.get("usage"), scope="subagent")
         summary_cost = delta.cost(settings.subagent_model)
-        summary = resp.choices[0].message.content or ""
+        summary = output_text(resp)
         if not summary.strip():
             return "Compaction produced an empty summary — history left untouched."
 
-        self.state.messages = [
+        self.state.items = [
             {
                 "role": "user",
                 "content": (
@@ -682,11 +893,18 @@ class Orchestrator:
         ]
         self.state.compactions += 1
 
-        after_chars = sum(len(m.get("content") or "") for m in self.state.messages)
-        saved = max(before_chars - after_chars, 0)
+        after_chars = len(self._render_transcript(max_chars=10**9))
+        saved = before_chars - after_chars
         # The next call re-reads a fresh prefix; reflect that estimate now.
         self.usage.context_tokens = max(self.usage.context_tokens - saved // 4, 0)
+        # A short conversation can summarise to something longer than itself.
+        # Report that rather than clamping it to a flattering "0 reclaimed".
+        change = (
+            f"~{saved // 4:,} tokens reclaimed"
+            if saved > 0
+            else f"no reduction — the summary is ~{-saved // 4:,} tokens larger"
+        )
         return (
-            f"Compacted {before_msgs} messages {Glyph.ARROW} 2 "
-            f"(~{saved // 4:,} tokens reclaimed {Glyph.DOT} summary cost {format_cost(summary_cost)})."
+            f"Compacted {before_items} items {Glyph.ARROW} 2 "
+            f"({change} {Glyph.DOT} summary cost {format_cost(summary_cost)})."
         )
