@@ -191,6 +191,23 @@ COMMANDS: tuple[Command, ...] = (
         ),
     ),
     Command(
+        name="/signals",
+        aliases=("/drift",),
+        summary="What the loop noticed but nobody raised an error about",
+        handler="cmd_signals",
+        group="Context",
+        detail=(
+            "The client does not validate the API's JSON, so that a field DeepSeek adds\n"
+            "tomorrow still reaches the model. The cost of that is that a *renamed* field\n"
+            "fails quietly — the model just looks silent. This is the view from outside:\n\n"
+            "  prefix-cache hit rate  today against the days before it, per project\n"
+            "  unknown item types     response items this client does not read\n"
+            "  empty responses        output items, no text, and no stated reason\n\n"
+            "None of it separates a schema change from a model change from drift in our\n"
+            "own prompts — those look identical from here. It only says something moved."
+        ),
+    ),
+    Command(
         name="/settings",
         aliases=("/config",),
         summary="Show every setting; save or reset the persisted ones",

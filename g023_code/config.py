@@ -128,6 +128,14 @@ class Settings:
     max_search_matches: int = 12
     file_summary_max_tokens: int = 400
     permission_default: str = "ask"  # allow | ask | block
+    # Baseline mode for measuring what delegation actually costs: ReadFile
+    # returns raw file content instead of a summary, so the same task can be run
+    # both ways and the two /cost readings compared. Not a normal setting — it
+    # turns the central design decision off. Off unless G023_READFILE_RAW is set.
+    file_reader_raw: bool = field(
+        default_factory=lambda: os.environ.get("G023_READFILE_RAW", "").lower()
+        in ("1", "true", "yes", "on")
+    )
 
     # Vision (external — DeepSeek V4 Flash is text-only)
     vision_backend: str = "none"  # none | ollama | glm | openai | local

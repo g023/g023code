@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.2.0-informational)](RELEASE_NOTES.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-informational)](releases/1/RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -17,20 +17,27 @@
 
 g023 Code reads your project, searches it, searches the web, runs commands,
 fetches pages, and looks at images — while telling you exactly what it is doing
-and what it just cost. The orchestrator never sees a raw file: every data-heavy
-operation is delegated to a subagent with an isolated, minimal context, and the
-answer that comes back is a summary. That is the whole design, and it is why a
-real session costs fractions of a cent.
+and what it just cost. Data-heavy work is delegated by default: a subagent reads
+the file in an isolated context and what comes back to the orchestrator is a
+structural summary plus a symbol → line-range map. When the summary is not
+enough, the orchestrator asks for an exact line range and gets verbatim source —
+so "summary first, raw on request" is the design, not "never raw".
+
+That trade is a real trade, and it is worth being precise about which half of it
+is measured. The call counts below are asserted by the test suite. Whether
+delegation is *cheaper overall* is not: it depends on how many turns the file's
+text would otherwise have sat in context, which no test here can know. See
+[break-even](#what-delegation-costs) for the arithmetic and its assumptions.
 
 It talks to DeepSeek exclusively through the **Responses API**, which is what
 makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="docs/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="releases/1/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
 </p>
 
-<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command.</sub></p>
+<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.1.0 — see <a href="media/README.md">media/README.md</a> for what has changed since.</sub></p>
 
 ## Table of contents
 
@@ -38,12 +45,15 @@ than a search provider bolted on the side.
 - [What you see while it runs](#what-you-see-while-it-runs)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
+- [What delegation costs](#what-delegation-costs)
+- [Drift signals](#drift-signals)
 - [Slash commands](#slash-commands)
 - [Verbosity, context & cost](#verbosity-context--cost)
 - [Web search (native)](#web-search-native)
 - [Vision (via Ollama)](#vision-via-ollama)
 - [Fetching web pages](#fetching-web-pages)
 - [Design principles](#design-principles)
+- [Tests](#tests)
 - [Extending](#extending)
 - [License](#license)
 
@@ -117,13 +127,20 @@ and everything else behaves identically.
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="docs/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
+  <img src="releases/1/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
 </p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
 sent. The status line after every turn carries the numbers that only mean
 something together — context used, **cache hit rate**, cost of this turn, cost
-of the session — because a cache hit is roughly fifty times cheaper than a miss.
+of the session — because on V4 Flash a cached input token is billed at $0.0028/M
+against $0.14/M for an uncached one. That 50x is DeepSeek's price sheet, not
+something this harness achieves; what the harness does is avoid breaking the
+prefix so more tokens fall on the cheaper side.
+
+Costs shown are computed locally from the token counts the API returns and the
+price table in [`SPEC.md` §3.2](SPEC.md). They are an estimate of your bill, not
+a reading of it.
 
 Anything you type that does not start with `/` is a prompt. Everything else is
 a slash command.
@@ -136,7 +153,7 @@ editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat`, so they follow you across projects.
 
 <p align="center">
-  <img src="docs/snapshot2.png" alt="The /settings and /tools panels" width="880">
+  <img src="releases/1/snapshot2.png" alt="The /settings and /tools panels" width="880">
 </p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
@@ -167,24 +184,28 @@ the prefix cache and desyncs the model's reasoning.
 
 - **Orchestrator** (`deepseek-v4-flash`) keeps only high-level reasoning, tool
   schemas, and compact summaries.
-- **Subagents** handle all data-heavy work in isolated contexts:
-  - `FileReader` → structural metadata + a 2–4 sentence summary, cached by content hash
+- **Subagents** handle data-heavy work in isolated contexts:
+  - `FileReader` → structural metadata, a symbol → line-range map, and a 2–4
+    sentence summary, cached by content hash
   - `Searcher` → metadata-first grep results, **pure local Python — no API call**
   - `Explore` / `Plan` → isolated reasoning with thinking mode
   - `Vision` → an Ollama daemon, local or remote (DeepSeek V4 Flash is text-only)
 - **Native `web_search`** runs server-side inside the model's turn — no client
   executor, no provider chain
-- **Aggressive SQLite cache** → repeated file reads cost $0.00
+- **SQLite cache** → a repeated read of unchanged bytes is a local lookup and
+  costs no API call
 - **Prefix-cache-friendly**: instructions and tool definitions stay static
 - **Thinking mode** with a `reasoning_effort` dial (low / high / max, or off —
   which maps to `reasoning: {"effort": "none"}`, the only thing `/responses`
   actually honours)
 
 **One model.** `deepseek-v4-flash` is the only model sent to the API, in every
-role. `deepseek-v4-pro` is not available on `/responses` yet — DeepSeek reports
-it from early August 2026 — so `/model` refuses it and quotes that reason rather
-than handing you a model every call fails on. Vision is the only exception, and
-it does not use the API at all.
+role. `/model` refuses `deepseek-v4-pro` because calls to it on `/responses`
+returned an error when this was last checked, and refusing with that reason
+attached beats handing you a model every call fails on. If DeepSeek has since
+enabled it, that refusal is stale — it is a hardcoded list in `config.py`, not a
+capability probe. Vision is the only other exception, and it does not use the
+DeepSeek API at all.
 
 The presentation and command layers are deliberately separate from the agent:
 
@@ -196,6 +217,84 @@ The presentation and command layers are deliberately separate from the agent:
 | `ollama_client.py` | Host resolution, reachability probes, model discovery, and vision inference against any daemon. |
 
 See [`SPEC.md`](SPEC.md) for the full specification.
+
+## What delegation costs
+
+Delegating a read is not free — it is a second API call, and sometimes it is the
+wrong trade. Here is what is actually true, separated by how well it is known.
+
+**Measured.** These call counts are asserted in `tests/test_call_accounting.py`,
+so they are checked rather than remembered:
+
+| Operation | API calls |
+|---|---|
+| `SearchContent`, any size | 0 — pure local regex |
+| `ReadFile`, Python under 12k chars, no focus | 0 — summarised from the local AST |
+| `ReadFile`, same bytes again (cache hit) | 0 |
+| `ReadFile` with `start_line`/`end_line` | 0 — returns verbatim source |
+| `ReadFile`, first read of a non-Python file, a file over 12k chars, or any focused read | 1 |
+
+**Arithmetic, given assumptions.** A 40 KB file is roughly 10k tokens. Inlined
+into the orchestrator, it is re-sent on every subsequent turn — cheaply, if it
+stays in the cached prefix, at $0.0028/M. Summarising it costs one Flash call
+(~10k in, ~300 out ≈ $0.0023 at miss rates) and leaves ~300 tokens in context
+instead of 10k. Which wins depends on how many turns follow and whether the
+prefix survives them, and those depend on your session. **Delegation is not
+unconditionally cheaper**; it is unconditionally *smaller*, and smaller context
+is what keeps the model on task and the window from filling.
+
+**Not measured.** Nobody has run a controlled A/B of end-to-end session cost.
+The flag to do it exists:
+
+```bash
+G023_READFILE_RAW=1 g023      # ReadFile returns raw content, no subagent
+```
+
+With it set, whole-file reads return the file's bytes and cost zero API calls —
+the baseline a plain agent loop would have. Run the same task script with and
+without it and compare `/cost`. Until someone does that on their own codebase,
+the honest claim is the one above: fewer tokens in the window, an extra call to
+get there.
+
+**When the summary is not enough.** The known weakness of summary-first is that
+a summary can silently drop the one detail that mattered, and nothing detects
+that. What exists instead is a cheap way out: every Python summary carries
+
+```json
+"symbols": {"Orchestrator.run_turn": [412, 498], "parse_reply": [199, 262]}
+```
+
+with line numbers taken from the AST (decorators included), not from the model.
+Escalating is then one targeted `ReadFile` with those two numbers, which returns
+verbatim text and costs no API call. That turns "the summary was too thin" from
+a re-read of the whole file into a precise second look. It does not turn it into
+something the orchestrator notices automatically — that detector does not exist.
+
+## Drift signals
+
+The client does not validate responses on purpose: an unknown field has to reach
+the model without a client release. The price is that a *renamed* field fails
+quietly — `output_text` returns `""`, the model looks silent, and nothing
+raises. Silent degradation, not a crash, is the realistic worst case here.
+
+`/signals` (alias `/drift`) shows the three cheapest observations that would move
+first:
+
+| Signal | What it catches | What it cannot tell you |
+|---|---|---|
+| Unknown item `type` in a response | An additive API change, at the earliest moment it is visible | Whether it matters |
+| Empty output with no `incomplete_reason` | What a renamed content field looks like from outside | Whether the model simply said nothing |
+| Prefix hit rate diffed against previous days | Anything that started breaking the prefix | Whether the cause is your prompt, the tool list, or the server |
+
+The hit rate is stored per day in `.g023/cache.db` and compared against the
+trailing baseline, so the comparison survives restarts. It needs two prior days
+before it will call anything a baseline, and says so until then. `/cache clear`
+does not erase it — it is a record of what happened, not cached data.
+
+None of these is a diagnosis. A model behaviour change, a schema change, and
+drift in your own prompts all present identically from here: same call, worse
+output, no error. These signals make the change visible and date it; they do not
+separate the causes.
 
 ## Slash commands
 
@@ -235,6 +334,7 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/context` | Break down what is occupying the context window, by role and size |
 | `/cost` | Token usage and spend, split by cache hit/miss, with a per-turn sparkline |
 | `/settings [save\|reset]` | Every setting, marking which persist; save or restore defaults |
+| `/signals` *(alias `/drift`)* | Prefix hit rate against its own history, unknown item types, unexplained empty responses |
 
 </details>
 
@@ -360,8 +460,10 @@ enable it once and the choice persists.
 - While vision is disabled the `AnalyzeImage` tool is not even offered to the
   orchestrator, so it never proposes a call it cannot fulfil.
 - Images are downscaled to 1024 px on the longest edge (needs `pillow`; skipped
-  if not installed) and answers are cached by image hash + question, so
-  re-asking about the same screenshot is free and instant.
+  if not installed) and answers are cached by image hash + question, so re-asking
+  the *same* question about the same image is a local SQLite lookup rather than
+  another inference. A different question about the same image is a new
+  inference — the question is part of the key.
 
 Once enabled, just ask: `analyze screenshot.png — what's the error?`
 
@@ -449,10 +551,14 @@ pip install curl_cffi        # then: /fetch status
 | `httpx` + `h2` | Chrome order | yes | generic Python |
 | `httpx` alone | Chrome order | no | generic Python |
 
-`/fetch status` always tells you which of these you are on. Verified against
-`tls.peet.ws`: with `curl_cffi` the JA4 and the HTTP/2 fingerprint both match
-real Chrome, and Cloudflare- and PerimeterX-protected pages return content
-rather than a challenge.
+`/fetch status` always tells you which of these you are on, and the JA4 column
+reports what `curl_cffi` impersonates rather than a measurement — point `/fetch
+https://tls.peet.ws/api/all` at it to see your own fingerprint on the wire.
+
+What is *not* claimed: that this gets you past any particular bot defence. Those
+systems weigh behaviour, IP reputation and history alongside the fingerprint, and
+they change. A handshake that matches Chrome removes one obvious tell; it is not
+a guarantee about any site, and any site may block you anyway.
 
 > [!NOTE]
 > **There is no JavaScript engine.** Pages that build their body client-side
@@ -461,13 +567,39 @@ rather than a challenge.
 
 ## Design principles
 
-1. **Context is currency** — never pollute the orchestrator with raw files or search dumps.
-2. **Subagents are the treasury** — all heavy I/O happens in isolated, minimal contexts.
+1. **Context is currency** — keep raw files and search dumps out of the
+   orchestrator unless they were asked for by line range.
+2. **Subagents are the treasury** — heavy I/O happens in isolated, minimal
+   contexts, and the escalation path back to verbatim source stays open.
 3. **Cache everything cacheable** — file hashes, vision Q&A, fetched pages.
 4. **Do it off-API where it is free** — search the filesystem locally, see with
    a local GPU, and spend tokens only on reasoning.
 5. **Thinking mode is a dial**, not always-on max.
 6. **Say what happened, not what was sent** — and always say what it cost.
+7. **Claim only what is checked.** Numbers in this documentation are either
+   asserted by a test, quoted from a published price sheet with attribution, or
+   labelled as an estimate. Where something is not measured, it says so.
+
+## Tests
+
+```bash
+pip install pytest && python3 -m pytest tests/ -q
+```
+
+No plugins beyond `pytest` — async tests run through a small hook in
+`tests/conftest.py`, and every test points `G023_PROJECT_ROOT` at a temporary
+directory, so a run never reads your real cache and never touches the network.
+
+| File | What it holds to account |
+|---|---|
+| `test_call_accounting.py` | The API-call table above, counted against a stub client |
+| `test_file_reader.py` | Symbol ranges are exact and in-bounds; truncation is declared; local AST facts outrank the model's |
+| `test_drift_signals.py` | Each signal fires on the shape that matters and stays quiet on ordinary turns; hit-rate history survives restarts |
+| `test_history_integrity.py` | Tool-call pairing survives rollback and repair; output items are echoed back byte-identical |
+| `test_usage_accounting.py` | Cost arithmetic, both usage spellings, worst-case assumption when the split is unreported, command/handler contract |
+
+What these do not cover: anything requiring the real API, end-to-end session
+cost, or whether a summary was good enough for the question asked.
 
 ## Extending
 
@@ -486,8 +618,15 @@ rather than a challenge.
   the default is `block`. Per-tool overrides live in `tools/registry.py` and
   `/tools`.
 
-Environment overrides: `G023_HOME`, `G023_PROJECT_ROOT`, `OLLAMA_HOST`, and
-`G023_ASCII=1` to force plain-ASCII output on terminals that mangle box drawing.
+Environment overrides:
+
+| Variable | Effect |
+|---|---|
+| `G023_HOME` | Installation folder — where `K.dat` and `config.json` live |
+| `G023_PROJECT_ROOT` | The project being worked on |
+| `OLLAMA_HOST` | Vision daemon, when `vision_host` is unset |
+| `G023_ASCII=1` | Force plain-ASCII output on terminals that mangle box drawing |
+| `G023_READFILE_RAW=1` | `ReadFile` returns raw content instead of delegating — the A/B baseline described in [What delegation costs](#what-delegation-costs) |
 
 ## License
 

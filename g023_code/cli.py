@@ -37,6 +37,7 @@ from .config import (
 )
 from .orchestrator import Orchestrator
 from .cache import get_cache
+from .signals import get_signals, hit_rate_verdict
 from .prompt import Reader, choose, confirm, install_hint
 from .tools.registry import ALLOW, ASK, BLOCK, get_registry, _describe_age
 from .ui import Glyph, console, gauge, human_bytes, human_ms, kv_table, panel
@@ -465,6 +466,81 @@ class CLI:
                 f"{Glyph.DOT} mean {format_cost(sum(costs) / len(costs))}[/muted]"
             )
         console.print(self.pricing_note())
+
+    def cmd_signals(self, arg: str = "") -> None:
+        signals = get_signals()
+        console.print()
+
+        try:
+            history = get_cache().prefix_history(days=14)
+        except Exception as e:
+            history = []
+            console.print(f"[muted]Prefix history unavailable: {e}[/muted]")
+
+        verdict, latest, baseline = hit_rate_verdict(history)
+        table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
+        table.add_column("Day", style="key")
+        table.add_column("Calls", justify="right")
+        table.add_column("Hit tokens", justify="right")
+        table.add_column("Miss tokens", justify="right")
+        table.add_column("Hit rate", justify="right")
+        table.add_column("")
+        for row in history:
+            table.add_row(
+                row["day"],
+                f"{row['calls']:,}",
+                f"{row['hit_tokens']:,}",
+                f"{row['miss_tokens']:,}",
+                f"{row['hit_rate']:.0%}",
+                gauge(row["hit_rate"], width=14),
+            )
+        if history:
+            console.print(panel(table, "Prefix-cache hit rate", subtitle="this project, by day"))
+        else:
+            console.print("[muted]No prefix-cache history recorded for this project yet.[/muted]")
+
+        line = f"[muted]Hit rate  {verdict}.[/muted]"
+        if latest is not None and baseline is not None:
+            line = (
+                f"[muted]Hit rate  today {latest:.0%} {Glyph.DOT} baseline {baseline:.0%} "
+                f"{Glyph.DOT} {verdict}.[/muted]"
+            )
+        console.print(line)
+        console.print(
+            "[muted]It moves before answers get visibly worse, but it does not say why: "
+            "a changed prompt here and a server-side change look the same from outside.[/muted]"
+        )
+
+        console.print()
+        if signals.unknown_types:
+            for name, count in sorted(signals.unknown_types.items()):
+                console.print(
+                    f"[warn]{Glyph.BULLET} unknown item type[/warn] [key]{name}[/key] "
+                    f"[muted]seen in {count} response(s) this session — echoed back "
+                    f"verbatim, absent from the trace.[/muted]"
+                )
+        else:
+            console.print(
+                f"[muted]{Glyph.BULLET} No unrecognised response item types this session.[/muted]"
+            )
+
+        if signals.empty_responses:
+            console.print(
+                f"[warn]{Glyph.BULLET} {signals.empty_responses} response(s)[/warn] "
+                "[muted]had output items but no readable text and no stated reason for "
+                "stopping. That is what a renamed content field looks like — and also "
+                "what a model with nothing to say looks like.[/muted]"
+            )
+        else:
+            console.print(
+                f"[muted]{Glyph.BULLET} No unexplained empty responses this session.[/muted]"
+            )
+
+        recent = signals.recent(limit=8)
+        if recent:
+            console.print()
+            for obs in recent:
+                console.print(f"[muted]  turn {obs.turn}  {obs.kind}: {obs.detail}[/muted]")
 
     def cmd_settings(self, arg: str = "") -> None:
         sub = arg.strip().lower()

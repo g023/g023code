@@ -3,29 +3,62 @@
 ## A Pure Python Powered by DeepSeek V4
 
 **Version**: 3.2 (Responses API — g023 Edition)
-**Compiled**: August 2026 · implementation 1.1
+**Compiled**: August 2026 · implementation 1.2
 **Core Principle**: *Context is Currency. Subagents are the Treasury.*
+
+> **On the numbers in this document.** Anything stated as a measurement is
+> either asserted by `tests/` (and named as such), quoted from DeepSeek's
+> published price sheet with attribution, or reported by the API itself.
+> Anything else — design targets, illustrative arithmetic, vendor
+> specifications — is labelled. Sections that describe unimplemented or
+> unverified behaviour say so in place rather than in a footnote.
 
 ---
 
 ## I. Executive Overview & Foundational Philosophy
 
-**g023 Code** is a terminal-native, pure-Python AI programming assistant designed to replicate and surpass the capabilities of current agentic CLI apps while leveraging the cost-efficiency of DeepSeek V4 Flash. Vision is served locally by an Ollama daemon rather than by the API.
+**g023 Code** is a terminal-native, pure-Python AI programming assistant built
+around the cost profile of DeepSeek V4 Flash. Vision is served locally by an
+Ollama daemon rather than by the API. No comparison against other agentic CLIs
+has been benchmarked; the design differences below are stated as design
+differences, not as measured advantages.
 
-Unlike standard AI agents that naively dump raw search results, full file contents, and high-resolution images into a single massive context window (polluting the orchestrator's 1M-token space and destroying prefix-cache economics), g023 Code employs a strict **Subagent-First Delegation Architecture**. 
+The central bet is that dumping raw search results and full file contents into
+one large context window is expensive in two ways — tokens, and the model's
+attention — and that summarising first is usually the better trade.
 
-**The Core Philosophy**: 
-- The **Orchestrator (Flash)** is reserved exclusively for high-level reasoning, tool orchestration, and maintaining conversational flow. 
-- **Subagents (Flash, plus a local Ollama model for vision)** handle all data-heavy tasks (file reading, searching, vision) in isolated, minimal contexts, returning only compact, metadata-rich summaries.
-- **Aggressive Caching (SQLite + Prefix)** ensures that repeated operations (reading the same file, analyzing the same image) cost effectively **$0.00** in API tokens.
-- **The Responses API is the single transport.** Every call — orchestrator, subagent, compaction — goes to `POST /responses`, because that is the only DeepSeek endpoint exposing the server-side `web_search` tool (§XIV).
+**The Core Philosophy**:
+- The **Orchestrator (Flash)** is reserved for high-level reasoning, tool
+  orchestration, and conversational flow.
+- **Subagents (Flash, plus a local Ollama model for vision)** handle data-heavy
+  tasks (file reading, searching, vision) in isolated contexts, returning
+  compact, metadata-rich summaries — plus, for Python, an exact symbol →
+  line-range map so the orchestrator can escalate to verbatim source cheaply.
+- **Caching (SQLite + prefix)** means a repeated operation on unchanged bytes
+  makes **no API call**. It is not free in wall-clock terms — it is a local
+  SQLite read — and it does not make the *first* read free.
+- **The Responses API is the single transport.** Every call — orchestrator,
+  subagent, compaction — goes to `POST /responses`, because that is the only
+  DeepSeek endpoint exposing the server-side `web_search` tool (§XIV).
+
+**What is delegated and what is not.** The orchestrator does not receive whole
+files by default, but it *can* receive verbatim source: a `ReadFile` with
+`start_line`/`end_line` returns the exact text of that range (capped at 20k
+chars, and it reports the line it actually reached when the cap bites). The
+accurate statement of the design is *summary first, verbatim on request* —
+see §5.2 and §XVIII.
 
 ---
 
 ## II. Core Infrastructure: The Agentic Loop
 
 ### 2.1 The Deterministic Engine
-The system operates on a synchronous `while True` loop. Approximately **98% of the codebase is deterministic infrastructure** (permissions, routing, context management), with only ~2% being AI decision logic. This makes g023 Code primarily an engineering project.
+The system operates on an `async while True` loop. Almost all of the ~7,700
+lines of Python are deterministic infrastructure — permissions, routing, context
+management, rendering, caching; the model's contribution is the content of a
+handful of prompts and the decisions it makes inside the loop. No line-level
+split between "infrastructure" and "AI logic" has been computed, because the
+boundary is not well defined enough for a percentage to mean anything.
 
 ```python
 async def agentic_loop(user_prompt: str):
@@ -124,22 +157,39 @@ deepseek-v4-flash instead for now."* Offering the choice would hand the user a
 model every call fails on, so `/model` refuses it and quotes that reason, and
 `/cost` prices only what `/responses` will actually serve.
 
-| Attribute | DeepSeek V4 Flash |
-| :--- | :--- |
-| **Total Parameters** | 284B (MoE) |
-| **Active Parameters** | ~13B |
-| **Context** | 1M Tokens |
-| **Concurrency** | 2,500 req/s |
-| **Vision Support** | ❌ Text-only — vision runs on Ollama (§VI) |
-| **Role** | Orchestrator, all API subagents, compaction |
+Model attributes below are **DeepSeek's published figures**, not measurements
+taken by this project. Only the last two rows describe g023's own behaviour.
+
+| Attribute | DeepSeek V4 Flash | Source |
+| :--- | :--- | :--- |
+| **Total Parameters** | 284B (MoE) | vendor |
+| **Active Parameters** | ~13B | vendor |
+| **Context** | 1M tokens | vendor |
+| **Vision Support** | ❌ Text-only — vision runs on Ollama (§VI) | vendor |
+| **Role here** | Orchestrator, all API subagents, compaction | this project |
+| **Context ceiling used** | 900k (`max_context_tokens`, headroom under 1M) | this project |
 
 ### 3.2 Pricing & Cache Economics
+
+DeepSeek's published rates for V4 Flash, mirrored in `usage.PRICING`:
+
 | Scenario | Flash Price |
 | :--- | :--- |
 | **Input (Cache Hit)** | $0.0028 / 1M |
 | **Input (Cache Miss)** | $0.14 / 1M |
 | **Output** | $0.28 / 1M |
-| **Cache Hit vs Miss** | **50x cheaper — crucial for profitability** |
+
+The ratio between the two input rates is exactly **50x**. That is a property of
+the price sheet, not an achievement of this harness — `tests/test_usage_
+accounting.py::test_the_published_ratio_is_the_price_sheet` asserts only that
+the two numbers in the table divide to 50. What the harness contributes is
+keeping the prompt prefix stable so that more tokens land on the cheaper side;
+how *much* more, in any given session, is not measured (§XVIII).
+
+Costs shown by `/cost` are computed locally from the token counts the API
+reports, priced against this table. They are an estimate of the bill, not a
+reading of the account. A model with no row here is priced as Flash
+(`usage.DEFAULT_PRICING`), so its reported spend is an approximation.
 
 `usage.PRICING` still carries a pro row so historical figures and any future
 re-enablement price correctly, but `/cost` filters its footer to
@@ -154,29 +204,54 @@ re-enablement price correctly, but `/cost` filters its footer to
 
 ---
 
-## IV. DeepSeek V4 Cache Optimization (The Economics Engine)
+## IV. Prefix Cache Behaviour
 
-DeepSeek V4 operates on a **Hybrid Attention** mechanism (SWA + C4/C128). g023 Code exploits this with exacting precision.
+Prefix caching happens **entirely on DeepSeek's side**. This project does not
+run, configure, or tune an inference engine: there is no block size to set, no
+KV cache to manage, no tiering to arrange. What it can do is avoid changing the
+front of the prompt between requests, and then report what the server says
+happened.
 
-### 4.1 Prefix Caching Mechanics
-The API automatically caches the *beginning* of the prompt. If the first N tokens are identical between requests, the cache is hit.
-- **Static Guarantees**: The System Prompt and Tool Definitions are **locked**. They form the first 5,000 tokens of every request. **Hit Rate: 100%**.
-- **Block Size Optimization**: We configure the engine with `--block-size 32`. This granularity increases the probability of exact prefix matches in multi-turn conversations, pushing overall hit rates above 95%.
+### 4.1 What the client actually controls
+The API caches a matching prefix of the prompt. So:
 
-### 4.2 KV Cache Footprint
-DeepSeek V4 Flash uses only **7%** of the KV cache memory required by V3.2 at 1M context. This allows the local harness to handle massive concurrency without manual tiered offloading (L1/L2/L3) unless running extreme 1M contexts. 
+- **The prefix is held still.** `instructions` and the tool schemas are built
+  from static data and sent first on every request. They change only when the
+  configuration does — notably when `/vision` toggles, which adds or removes the
+  `AnalyzeImage` schema and therefore *does* invalidate the prefix once.
+- **Output items are echoed back byte-identical** (§2.2). Reconstructing them
+  from parsed fields would serialise differently and break the match;
+  `tests/test_history_integrity.py` asserts the echo is the server's own dicts,
+  not rebuilt ones.
+- **History grows at the end.** New items are appended, so the unchanged head of
+  the request stays a valid prefix.
 
-### 4.3 Cache Preservation Strategy
-To avoid invalidating the prefix cache:
-1. **Static Prefix**: System/Tools are immutable.
-2. **Variable Middle**: Subagent summaries are injected *after* the static prefix. The cache engine ignores changes far down the prompt.
-3. **Eviction**: When the sliding window evicts old summaries, it removes tokens *after* the static prefix. The cache remains intact for the next turn.
+No target hit rate is claimed here. The rate the server reports is shown live in
+the status bar, broken down in `/cost`, and diffed against previous days in
+`/signals` (§XIX). Those are observations, not guarantees — and a cache hit rate
+is a property of the server's cache state, which no client can promise.
+
+### 4.2 Cache preservation, and where it is knowingly given up
+1. **Static prefix**: system prompt and tool schemas first, unchanged.
+2. **Variable middle**: subagent summaries and tool results are appended after it.
+3. **Eviction**: the sliding window drops the *oldest items after* the static
+   prefix, which keeps the head of the request identical to last time.
+4. **Compaction breaks it deliberately.** `/compact` replaces the history with a
+   summary, so the next request's middle is entirely new. That is the intended
+   trade — a smaller window at the cost of one cold turn — and it is a normal
+   cause of a hit-rate dip in `/signals`.
 
 ---
 
 ## V. Subagent Architecture (The Efficiency Engine)
 
-Subagents are isolated workers. They are the **only** entities allowed to read raw files, run heavy greps, or process images. They always return compact summaries to the Orchestrator. Some are isolated model calls; others are pure local code — the distinction is invisible to the orchestrator, which sees one compact `function_call_output` either way.
+Subagents are isolated workers. They are the only entities that read whole files,
+run repository-wide greps, or process images. They return compact summaries by
+default — with one deliberate exception: an explicit line-range `ReadFile`
+returns verbatim source, because a summary is the wrong answer when the caller
+already knows exactly which lines it needs (§5.2). Some subagents are isolated
+model calls; others are pure local code — the distinction is invisible to the
+orchestrator, which sees one compact `function_call_output` either way.
 
 ### 5.1 Subagent Registry & Auto-Spawning
 The Orchestrator intercepts specific intents via `subagents/router.py`.
@@ -193,25 +268,86 @@ falls back to a `commentary` message when the run produced no `final_answer`
 (§2.3) — that narration *is* their reply.
 
 ### 5.2 The FileReader Subagent (Read + One-Shot Compaction)
-This is the most critical optimization for orchestrator health.
+This is the central optimisation for orchestrator context health, and the one
+with the most honest caveats attached.
 
-**System Prompt Rules**:
-> 1. Extract only structural metadata (Classes, Functions, Imports, Top-level logic).
-> 2. If the user provided a specific context (e.g., "auth logic"), filter the file to that section only.
-> 3. DO NOT return raw text unless `raw=True` is explicitly set in the tool call.
-> 4. Output strict JSON: `{ "metadata": {...}, "summary": "2-sentence description", "hash": "sha256" }`.
+**Four paths, and what each costs.** These counts are asserted in
+`tests/test_call_accounting.py`:
 
-**The Swap Loop**:
+| Condition | Path | API calls |
+| :--- | :--- | :--- |
+| `G023_READFILE_RAW=1`, whole file | raw baseline (§5.2.3) | 0 |
+| `start_line` / `end_line` given | verbatim slice | 0 |
+| Content hash + focus already cached | cache hit | 0 |
+| Python, < 12k chars, no focus | local `ast` summary | 0 |
+| Anything else (non-Python, ≥ 12k chars, or focused) | Flash summary | 1 |
+
+**Result shape.** Every summary result names its own provenance, so a caller can
+tell a measured fact from a generated one:
+
+```json
+{
+  "path": "src/auth.py", "hash": "sha256:…", "lines": 412,
+  "summary_source": "local_ast" | "model" | "local_fallback",
+  "summary_covers": {"chars_summarised": 18000, "chars_total": 54211, "complete": false},
+  "metadata": {"language": "python", "classes": […], "functions": […],
+               "symbols": {"TokenStore.validate": [88, 141], …}},
+  "note": "metadata.symbols maps every top-level symbol …",
+  "from_cache": false
+}
+```
+
+- `summary_source` distinguishes a summary derived from the AST from one written
+  by the model from one produced after an API failure.
+- `summary_covers` appears when the file exceeded the 18k-char summariser input.
+  A summary of the first 18k characters is not a summary of the file, and saying
+  so is the difference between a partial answer and a wrong one. The model is
+  told too — its prompt is headed `--- FILE CONTENT (TRUNCATED) ---`.
+- `metadata.parse_error` appears when Python fails to parse. Previously a syntax
+  error produced an empty structure, which read as *"this file has no classes and
+  no functions"*.
+
+**§5.2.1 The symbol map (escalation path).** For Python, `metadata.symbols` maps
+every top-level symbol and `Class.method` to its exact `[start_line, end_line]`,
+computed from `ast` node positions with `decorator_list` taken into account, so
+the range starts at the first decorator rather than at `def`. These are measured
+line numbers; where the model returns its own, the local values win
+(`_merge_metadata`), because a line number the model did not compute is a guess.
+
+This is what makes a thin summary recoverable at low cost: name → range → a
+line-range `ReadFile` → verbatim text, zero API calls. `tests/test_file_reader.py`
+asserts that round trip.
+
+**§5.2.2 The known gap.** Nothing detects that a summary was *insufficient* for
+the question asked. The orchestrator escalates only if it recognises that it is
+missing something, which is exactly the judgement a model is unreliable at. The
+symbol map lowers the cost of escalating; it does not trigger it. No detector is
+specified here because none is implemented, and a specified-but-absent detector
+in this document would be the same class of claim this pass exists to remove.
+
+**§5.2.3 The raw baseline (`G023_READFILE_RAW=1`).** With this environment
+variable set, a whole-file `ReadFile` returns the file's content verbatim and
+makes no subagent call — the behaviour a plain agent loop would have. It exists
+so the delegation trade can be measured rather than asserted: run the same task
+script with and without it and compare `/cost`. No such comparison is published
+here, because none has been run under controlled conditions.
+
+**The swap loop.**
 1. Orchestrator needs `auth.py`.
-2. Spawns `FileReader`. It reads the file, extracts metadata, and compacts it to ~200 tokens.
-3. `FileReader` stores the raw content + summary in the local SQLite `file_cache.db`, keyed by the SHA256 hash.
-4. Orchestrator discards the raw file from its memory and stores only the summary + hash.
-5. *Later*: If the summary is evicted, the Orchestrator still holds the hash. It requests the summary again. `FileReader` checks SQLite, finds the hash, returns the cached summary in <10ms. **Cost: $0.00**.
+2. `FileReader` reads it and returns metadata + summary (typically a few hundred
+   tokens; the exact size depends on the file).
+3. Content and summary are stored in `file_cache`, keyed by SHA-256 of the bytes
+   **and** the focus string — a summary written for one question is not served
+   as the answer to another.
+4. The orchestrator keeps the compact object, not the file.
+5. A later read of unchanged bytes with the same focus is a local SQLite lookup:
+   **no API call**. Changed bytes miss and re-summarise.
 
 ### 5.3 The Searcher Subagent (Metadata-First Extraction — Local)
 Standard `grep` returns hundreds of lines of raw code. g023 Code's Searcher
 transforms this, and does so **without any API call**: `subagents/searcher.py`
-is pure Python. It costs $0.00 and returns in milliseconds.
+is pure Python, so it costs nothing in tokens. Wall-clock time is whatever
+walking your tree costs. `tests/test_call_accounting.py` asserts the zero.
 
 **Contract**:
 > 1. Cap at `max_matches` (default 12; ≤3 per file).
@@ -227,12 +363,25 @@ the search root, so a project that happens to live under a directory called
 
 **Orchestrator Impact**: The orchestrator receives a JSON blob of ~150 tokens instead of a 5,000-token text dump. The line numbers allow the orchestrator to request exact snippets later via FileReader if needed.
 
-### 5.4 Subagent Context Isolation Metrics
-| Task | Orchestrator Direct Cost | Subagent Isolated Cost | Savings |
-| :--- | :--- | :--- | :--- |
-| Reading a 500-line file | 100k tokens (context) + 2k raw | ~200 tokens (summary) | **99.8%** token reduction |
-| Searching whole repo | 100k tokens + 10k results | ~150 tokens (JSON metadata) | **99.5%** reduction |
-| Vision (Full HD) | 100k + 2.5k image | 0 API tokens (local Ollama) | **100%** — vision is off-API |
+### 5.4 What Isolation Actually Buys
+
+Earlier revisions of this document carried a table of percentage savings
+(99.8%, 99.5%) computed from invented baselines. Those numbers were not
+measured and have been removed rather than restated more carefully.
+
+What can be said precisely:
+
+| Task | Enters orchestrator context | Extra API calls |
+| :--- | :--- | :--- |
+| Reading a 500-line file | Structural summary + symbol map, in place of the file | 1, or 0 for small Python / cache hits / line ranges |
+| Searching the repo | A capped JSON match list, in place of raw grep output | 0 — always local |
+| Analysing an image | The vision model's text answer, never image bytes | 0 DeepSeek calls; the work moves to your GPU |
+
+The ratio between "the file" and "the summary" depends entirely on the file, so
+no single percentage describes it. The generalisation that survives scrutiny is
+directional: the orchestrator's context grows by a bounded, small amount per
+operation instead of by the size of the data. What that saves in money depends
+on turn count and prefix survival, which §XVIII spells out.
 
 ---
 
@@ -241,8 +390,9 @@ the search root, so a project that happens to live under a directory called
 **Vision never touches the DeepSeek API.** `deepseek-v4-flash` is text-only, and
 `deepseek-v4-pro` is not available on `/responses` (§3.1). Image analysis is
 served entirely by an **Ollama daemon**, which may be local or on another
-machine (§XII-A). The API cost of vision is therefore **$0.00**; the only cost
-is GPU time on the daemon.
+machine (§XII-A). The DeepSeek API cost of vision is therefore **$0.00** — the
+cost moves to GPU time, VRAM, and whatever the daemon's hardware costs to run.
+"Off-API" is the accurate description; "free" is not.
 
 ### 6.1 The Pipeline
 1. **Gate**: `AnalyzeImage` is hidden from the tool schema entirely unless
@@ -251,7 +401,9 @@ is GPU time on the daemon.
 2. **Load & downscale**: `ollama_client.load_image()` reads the path or URL and
    downscales to `settings.vision_max_image_dim`, returning raw bytes + base64.
 3. **Cache probe**: keyed on `(sha256(raw image), question, "ollama:<model>")`.
-   A hit returns instantly with `"cached": true` and no GPU work.
+   A hit is a local SQLite read — `"cached": true`, no GPU work. Because the
+   question is part of the key, a *different* question about the same image is a
+   fresh inference.
 4. **Inference**: `vision_chat_detailed()` posts the image and `VISION_SYSTEM`
    to the daemon, honouring `vision_timeout`, `vision_num_ctx` and
    `vision_keep_alive`.
@@ -280,16 +432,23 @@ so this remains specified but unscheduled.
 
 ## VII. File & Directory Handling (One-Swoop Compact)
 
-To avoid polluting the orchestrator's prefix cache, **all file reads are delegated to Subagents**. Raw file content is never stored in the orchestrator's message history.
+File reads are delegated to subagents by default. Whole file bodies do not enter
+the orchestrator's history unless a line range was explicitly requested, in
+which case that range's text does — capped at 20k characters, cut at a line
+boundary, with the true final line reported.
 
 ### 7.1 The "Read-Compaction-Swap" Cycle
 1. **Spawn**: Router spawns `FileReader` Subagent.
-2. **Process**: Subagent reads the file (or directory structure) and immediately compiles a structured summary.
-3. **Swap**: Subagent returns `{ summary, hash }`. Orchestrator stores this compact object.
-4. **Local Cache**: Subagent stores the raw content + summary in `file_cache.db` (SQLite) keyed by `hash`.
+2. **Process**: Subagent reads the file (or directory structure) and compiles a structured summary.
+3. **Swap**: Subagent returns `{ summary, metadata, hash }`. Orchestrator stores this compact object.
+4. **Local Cache**: Subagent stores the content + summary in `file_cache` (SQLite), keyed by content hash **and** focus.
 5. **Eviction**: Orchestrator context fills up. Sliding window removes the summary.
-6. **Re-fetch**: Orchestrator needs the file again. It passes the hash to the Subagent.
-7. **Zero-Cost Return**: Subagent queries SQLite, finds the hash, returns the summary in <10ms. **No API call made**.
+6. **Re-fetch**: Orchestrator asks for the file again.
+7. **Return without an API call**: the bytes still hash the same, so the cached summary is served from SQLite. If the file changed on disk, the hash differs and it is re-summarised — a stale summary is never served for changed content.
+
+Raw content is **not** never-seen: step 2 is bypassed entirely for a line-range
+request, which returns the exact text (§5.2). The invariant is that the
+orchestrator does not receive whole file bodies *unrequested*.
 
 ### 7.2 Directory Handling
 If the user asks to "look at the src folder":
@@ -428,7 +587,7 @@ As implemented (`config.get_scratch_dir`, `config.get_cache_db`):
 ```
 <project_root>/                     # cwd, or $G023_PROJECT_ROOT
 └── .g023/                          # Auto-created on launch
-    ├── cache.db                    # One SQLite file, four tables (§XIII)
+    ├── cache.db                    # One SQLite file, five tables (§XIII)
     ├── cookies.json                # Per-host cookies (created on first fetch)
     └── history                     # prompt_toolkit REPL history
 ```
@@ -468,7 +627,7 @@ Exclusions are the hardcoded list in §11.2 instead.
 
 ### 11.3 Startup Behavior
 1. On launch, `get_scratch_dir()` creates `.g023/` if missing.
-2. `Cache` opens `cache.db` and runs `CREATE TABLE IF NOT EXISTS` for all four tables.
+2. `Cache` opens `cache.db` and runs `CREATE TABLE IF NOT EXISTS` for all five tables.
 3. `check_handlers()` asserts every catalogued command has a `cmd_*` method (§12.1).
 
 ---
@@ -505,6 +664,7 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 | `/context` | Break down the window by role and size; recommends which compaction applies. | Local. |
 | `/cost` | Token usage and cost, split by hit/miss, with a per-turn sparkline. | Local aggregator. |
 | `/settings [save\|reset]` | All settings, marking which persist. | Local / `config.json`. |
+| `/signals` | Hit rate against its own daily history, unknown item types, unexplained empty responses (§XIX). | Local; reads `prefix_stats`. |
 | `/tools` | Tools, permission levels, and run counts this turn. | Local. |
 | `/tools <tool> allow\|ask\|block` | Change one tool's permission. | Local. |
 | `/fetch <url>` | Fetch a page yourself, via the cache/fresh prompt. | May write the URL cache. |
@@ -522,7 +682,17 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 Aliases: `/?` `/h` `/commands` → `/help`; `/reset` → `/clear`; `/quit` `/q` →
 `/exit`; `/effort` → `/thinking`; `/v` → `/verbose`; `/usage` → `/cost`;
 `/config` → `/settings`; `/permissions` `/perm` → `/tools`; `/dash` → `/status`;
-`/config_vision` → `/vision` (retained from 1.0).
+`/drift` → `/signals`; `/config_vision` → `/vision` (retained from 1.0).
+
+### 12.2.1 Environment Overrides
+
+| Variable | Effect |
+| :--- | :--- |
+| `G023_HOME` | Installation folder — `K.dat`, `config.json` |
+| `G023_PROJECT_ROOT` | The project being worked on; `.g023/` is created under it |
+| `OLLAMA_HOST` | Vision daemon, when `settings.vision_host` is unset (§XII-A) |
+| `G023_ASCII=1` | Force plain-ASCII rendering |
+| `G023_READFILE_RAW=1` | `ReadFile` returns raw content instead of delegating — the measurement baseline of §5.2.3 |
 
 ### 12.3 Deferred
 
@@ -575,7 +745,8 @@ authenticating reverse proxy. `/help ollama` states this in-app.
 
 To eliminate redundant API calls, g023 Code uses an aggressive local SQLite cache.
 
-Everything lives in **one** database — `.g023/cache.db` — with four tables.
+Everything lives in **one** database — `.g023/cache.db` — with five tables: four
+caches, plus `prefix_stats`, which is a record rather than a cache (§13.5).
 Inspect and purge it with `/cache [stats|web|clear]`.
 
 ### 13.1 File Cache Schema
@@ -636,10 +807,33 @@ CREATE TABLE session_facts (
 );
 ```
 
-### 13.5 Benefits
-- **Zero-cost re-reads**: file summaries are retrieved in <10ms.
-- **Zero-cost vision**: repeated image analysis returns instantly, with no GPU work.
-- **Zero-cost re-fetch**: a cached URL skips the network entirely.
+### 13.5 Prefix Stats Schema
+Not a cache — a record of what the server reported, kept per local day so
+`/signals` can diff today against the trailing baseline (§XIX). `/cache clear`
+deliberately leaves it alone: erasing the baseline to reclaim a few kilobytes
+would destroy the only history that makes the hit rate interpretable.
+```sql
+CREATE TABLE prefix_stats (
+    day         TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    hit_tokens  INTEGER NOT NULL DEFAULT 0,
+    miss_tokens INTEGER NOT NULL DEFAULT 0,
+    calls       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, model)
+);
+```
+
+### 13.6 What Caching Does and Does Not Do
+- **Re-reads**: a repeated read of unchanged bytes with the same focus makes no
+  API call. It is a local SQLite query, not an instant one — and the *first*
+  read still costs whatever it costs.
+- **Vision**: an identical (image, question, model) triple is served from SQLite
+  with no GPU work. A different question about the same image is not.
+- **Re-fetch**: a cached URL skips the network. The user is still asked, and can
+  still choose `fresh`.
+- **What it cannot do**: notice that a cached summary is inadequate for the
+  question being asked (§5.2.2), or that a file's *meaning* changed while its
+  bytes did not (an edited import elsewhere, say).
 
 ---
 
@@ -695,14 +889,38 @@ reports; `_strip_call_id()` removes it so the trace shows what was actually
 searched for. `open_page` can fail — the server meets timeouts and blocks like
 any other client — so its status is surfaced rather than assumed.
 
-### 14.2 URL Fetch Providers (Fallback Chain)
+### 14.2 URL Fetch Engines
 
-`FetchUrl` remains a client-side tool with its own provider chain, since the
-server-side `open_page` is only reachable through the model's own reasoning:
-1. **web4agent**: Self-hosted (Python library).
-2. **webpeel**: 500/week (Free tier).
-3. **crw (fastCRW)**: 500 credits (Free tier).
-4. **Direct fallback**: `BeautifulSoup` parsing of raw HTML.
+`FetchUrl` remains a client-side tool, since the server-side `open_page` is only
+reachable through the model's own reasoning.
+
+> Earlier revisions of this document listed a provider chain of third-party
+> services (`web4agent`, `webpeel`, `crw`). **No such integration exists and none
+> ever did in this codebase** — `web_fetch.py` makes the request itself. The list
+> is removed rather than corrected in place.
+
+What is actually implemented is an engine ladder, chosen by what is installed
+(`web_fetch.engine_name()`), plus HTML-to-text extraction:
+
+| Engine | Headers | HTTP/2 | TLS fingerprint |
+| :--- | :--- | :--- | :--- |
+| `curl_cffi` | Chrome order | yes | Chrome's own handshake, via impersonation |
+| `httpx` + `h2` | Chrome order | yes | generic Python |
+| `httpx` alone | Chrome order | no | generic Python |
+
+Beyond the engine: per-host cookie persistence (`.g023/cookies.json`), per-host
+request pacing, and header ordering matched to the profile being impersonated.
+`/fetch status` reports which rung you are on.
+
+**What is not claimed.** That any of this defeats a particular bot defence.
+`fidelity_report()` describes what the installed engine *impersonates*; it is not
+a measurement of your traffic. To measure it, fetch `https://tls.peet.ws/api/all`
+and read your own fingerprint back. Anti-bot systems weigh IP reputation,
+behaviour and history alongside TLS, and they change; a matching handshake
+removes one tell and guarantees nothing.
+
+There is also **no JavaScript engine**. A page that builds its body client-side
+returns the shell.
 
 ---
 
@@ -718,32 +936,154 @@ server-side `open_page` is only reachable through the model's own reasoning:
   `web_search`, `reasoning.effort`, message phases. Flash-only.
 - **Phase 8** (open): `/btw`, `/vision_tiles` (§6.4), `deepseek-v4-pro` once
   DeepSeek enables it on `/responses`.
+- **Phase 9** (done, 1.2): symbol → line-range map (§5.2.1), raw-read baseline
+  flag (§5.2.3), drift signals and `/signals` (§XIX), first test suite (§XX),
+  and this honesty pass over the documentation.
+- **Phase 10** (open): an actual A/B measurement using §5.2.3; a summary-
+  sufficiency signal, if one can be designed that is not just another guess.
 
 ---
 
-## XVI. Success Metrics & KPIs
+## XVI. Metrics: What Is Asserted, Targeted, and Unmeasured
 
-| Metric | Target | Why it matters |
-| :--- | :--- | :--- |
-| **Orchestrator Context Pollution** | < 5% raw data. | Ensures 95% context is pure reasoning. |
-| **Prefix Cache Hit Rate** | ≥ 95% (System/Tools). | Guarantees 50x input cost savings. |
-| **File Summary Hit Rate** | ≥ 90% (SQLite). | Eliminates redundant file reading API costs. |
-| **Vision API Cost** | $0.00. | Vision is served off-API by Ollama. |
-| **Subagent Spawn Latency** | ≤ 500ms. | Ensures UX feels instant. |
-| **Tool-Call Pairing Integrity** | 100%. | An unpaired item is a hard 400 (§2.2). |
+Earlier revisions listed these as "KPIs" with targets and the word *guarantees*.
+Nothing was measuring them. Split by what is actually known:
+
+**Asserted by tests** (`python3 -m pytest tests/`):
+
+| Property | Where |
+| :--- | :--- |
+| Tool-call pairing survives rollback, repair, and error recovery | `test_history_integrity.py` |
+| Output items are echoed back byte-identical, unknown types included | `test_history_integrity.py` |
+| The per-operation API-call counts in §5.2 | `test_call_accounting.py` |
+| Symbol ranges are decorator-aware, in-bounds, and round-trip to real source | `test_file_reader.py` |
+| Truncated summaries and truncated ranges declare themselves | `test_file_reader.py` |
+| Cost arithmetic, both usage spellings, worst-case when the split is unreported | `test_usage_accounting.py` |
+| Each drift signal fires on the shape that matters and is quiet otherwise | `test_drift_signals.py` |
+
+**Observed live, not guaranteed**: prefix-cache hit rate (status bar, `/cost`,
+`/signals`), file-summary cache hit rate (`/cache stats`), DeepSeek API spend
+(`/cost`, priced locally per §3.2).
+
+**Design intent, unmeasured**: that the orchestrator's context stays mostly
+reasoning rather than data; that subagent spawn latency is imperceptible; that
+delegation lowers end-to-end session cost (§XVIII).
+
+**Structurally true**: vision costs $0.00 in DeepSeek tokens, because it never
+calls DeepSeek. `SearchContent` costs $0.00 in tokens, because it never calls
+the API at all.
 
 ---
 
-## XVII. Summary of All Savings
+## XVII. Where the Savings Actually Come From
 
-| Optimization Layer | Mechanism | Token/Cost Reduction |
+| Layer | Mechanism | What is true |
 | :--- | :--- | :--- |
-| **Subagent Isolation** | Orchestrator keeps 100k context; Subagent uses 200. | 99.8% context reduction. |
-| **File One-Shot** | Read + Compact in one turn. Hash-based re-fetch. | 99% token reduction + $0.00 re-reads. |
-| **Local Vision** | Ollama daemon instead of a vision-capable API model. | 100% — no API tokens at all. |
-| **Local Search** | `Searcher` is pure Python; no model call. | 100% — no API tokens at all. |
-| **Search Metadata** | JSON snippets vs raw text dumps. | 95% search overhead reduction. |
-| **Prefix Caching** | Static instructions/tools + verbatim item echo. | 50x cheaper input tokens. |
-| **Native Web Search** | Server-side; results never round-trip as tool output. | No client-side fetch, parse or token spend. |
+| **Subagent isolation** | Summary enters context instead of the file | The context increment is bounded and small; the ratio depends on the file, so no single percentage applies |
+| **File cache** | Keyed on content hash + focus | A repeat read of unchanged bytes makes no API call; the first read is unchanged |
+| **Local vision** | Ollama instead of a vision API model | Zero DeepSeek tokens; the cost moves to your GPU |
+| **Local search** | `Searcher` is pure Python | Zero tokens, always |
+| **Search metadata** | Capped JSON matches instead of raw dumps | Bounded output regardless of match count, and it says when the cap truncated |
+| **Prefix caching** | Static instructions/tools + verbatim echo | Tokens that hit are billed at 1/50th; the harness affects *how many* hit, not the ratio |
+| **Native web search** | Server-side, inside the turn | No client fetch/parse; the search's own tokens are still billed by DeepSeek |
 
-g023 Code delivers a coding assistant that completely decouples data retrieval from high-level reasoning, preserving the LLM's precious context for what it does best: logic, planning, and conversation. The result is a system that is not only functionally equivalent to current agentic CLI, but is algorithmically superior in cost-efficiency and context hygiene.
+The honest summary: g023 Code decouples data retrieval from high-level reasoning
+and keeps the orchestrator's window small and interpretable. Whether that also
+makes it cheaper end-to-end than a naive loop is a claim this project has set up
+the means to test (§5.2.3) and has not yet tested.
+
+---
+
+## XVIII. The Delegation Trade
+
+Delegating a read is a second API call. It is worth stating when that pays and
+when it does not, rather than asserting that it always does.
+
+**The arithmetic** (illustrative — the token figures are approximations, and the
+conclusion is a conditional, not a result):
+
+A 40 KB source file is roughly 10k tokens.
+
+- *Inlined*: 10k tokens enter the orchestrator's context and are re-sent every
+  subsequent turn. If they stay inside a surviving cached prefix, each resend is
+  ~$0.000028. If a compaction or an edit breaks the prefix, the same tokens cost
+  ~$0.0014 to resend.
+- *Delegated*: one Flash call (~10k in at miss rates, ~300 out) ≈ $0.0023, and
+  ~300 tokens enter context instead of 10k.
+
+So delegation costs more up front and less thereafter, and the crossover depends
+on turn count and prefix survival — both of which are properties of a session,
+not of the harness. **Delegation is not unconditionally cheaper. It is
+unconditionally smaller**, and a smaller window is what keeps the model on task,
+keeps `/context` readable, and delays compaction.
+
+**How to settle it for your own repo**: set `G023_READFILE_RAW=1` (§5.2.3), run
+the same task script both ways, compare `/cost`. Publishing a number here
+without having done that would be exactly the kind of claim this revision
+removed.
+
+---
+
+## XIX. Drift Signals
+
+The client does not validate responses, deliberately (§I): an unknown field must
+reach the model without a client release. The cost of that openness is that a
+**renamed** field fails silently — `output_text()` returns `""`, the model looks
+like it said nothing, and nothing raises. Silent degradation, not a crash, is
+this program's realistic worst case.
+
+`g023_code/signals.py` records the three cheapest observations that would move
+first. `/signals` (alias `/drift`) displays them.
+
+| Signal | Implementation | Fires on | Cannot tell you |
+| :--- | :--- | :--- | :--- |
+| Unknown item `type` | `api.unknown_item_types()` vs `KNOWN_ITEM_TYPES` | An item type this client does not read — the earliest visible sign of an additive API change | Whether it matters |
+| Unexplained empty output | `api.silent_degradation()` | Assistant `message` items with no readable `output_text` and no `incomplete_reason` | Whether the model simply said nothing |
+| Hit-rate drift | `cache.record_prefix_stats()` per local day + `signals.hit_rate_verdict()` | The newest day falling ≥ 15 points below the trailing baseline | Whether the cause is your prompts, the tool list, or the server |
+
+Design decisions worth stating:
+
+- **Persistent, because the interesting comparison is across days.** The hit rate
+  was already logged per turn; a per-turn number has no baseline to be judged
+  against. `prefix_stats` is keyed `(day, model)` and survives `/cache clear`.
+- **It refuses to call one day a baseline.** With fewer than
+  `MIN_BASELINE_DAYS = 2` prior days it says so instead of reporting a
+  comparison that means nothing.
+- **The threshold is 15 points**, not 1. Below that, ordinary session-to-session
+  variation — one long session versus one short, a compaction versus none —
+  dominates, and a signal that fires on normal turns gets ignored.
+- **Recording can never cost a turn.** `Orchestrator._record_signals` is wrapped
+  in a bare `except`. Observability that can break the thing it observes is worse
+  than no observability.
+- **None of this is a diagnosis.** A model behaviour change, a schema change, and
+  drift in this project's own prompts all present identically from here: same
+  call, worse output, no error. These signals make the change visible and date
+  it. Separating the causes still requires a person.
+
+---
+
+## XX. Tests
+
+```bash
+pip install pytest && python3 -m pytest tests/ -q
+```
+
+No plugins: `tests/conftest.py` runs coroutine tests through a `pytest_pyfunc_
+call` hook, because a suite that needs its own install story tends not to get
+run. An autouse fixture points `G023_PROJECT_ROOT` and `G023_HOME` at a
+temporary directory and resets the cache and signal singletons, so a run never
+reads a developer's real `.g023/cache.db` and never reaches the network — API
+behaviour is exercised through a stub client that counts calls.
+
+| File | Holds to account |
+| :--- | :--- |
+| `test_call_accounting.py` | The per-operation API-call table (§5.2) |
+| `test_file_reader.py` | Symbol ranges, range clamping and truncation, partial-summary disclosure, local AST facts outranking the model's |
+| `test_drift_signals.py` | Each signal's true positives *and* its true negatives; hit-rate history surviving a restart and a `/cache clear` |
+| `test_history_integrity.py` | Pairing repair, rollback, byte-identical echo |
+| `test_usage_accounting.py` | Pricing arithmetic, both usage spellings, the command/handler contract |
+
+**Not covered**: anything requiring the live API, end-to-end session cost, vision
+against a real daemon, `FetchUrl` against a real server, and — the significant
+one — whether a summary was good enough for the question that prompted it
+(§5.2.2).

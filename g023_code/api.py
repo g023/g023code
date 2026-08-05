@@ -218,6 +218,79 @@ def reasoning_text(response: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Drift detection
+# ---------------------------------------------------------------------------
+#
+# Nothing here validates the response, on purpose — an unknown field must still
+# reach the model without a client release. The cost of that is that a *renamed*
+# field fails silently: ``output_text`` returns "", the model looks like it said
+# nothing, and no exception is raised anywhere. These two checks are the cheapest
+# thing that turns that silence into a visible signal. They only ever report;
+# they never change what is sent or how a response is interpreted.
+
+# Item types this codebase knows how to read. Anything else is echoed back
+# verbatim and skipped by the parse loop — harmless, but worth noticing, because
+# it is the earliest visible sign that the API grew something new.
+KNOWN_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "message",
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "web_search_call",
+    }
+)
+
+
+def unknown_item_types(response: Dict[str, Any]) -> set[str]:
+    """Item ``type`` values in this response that this client does not read."""
+    return {
+        str(item.get("type"))
+        for item in response.get("output") or []
+        if isinstance(item, dict) and item.get("type") not in KNOWN_ITEM_TYPES
+    }
+
+
+def silent_degradation(response: Dict[str, Any]) -> Optional[str]:
+    """A description of a response that looks empty for no stated reason.
+
+    An ``output`` list with assistant messages in it, no text recovered from
+    them, and no ``incomplete`` status is what a renamed content field looks
+    like from out here. It is *also* what a model that genuinely said nothing
+    looks like, so this is a signal and not a diagnosis — which is exactly why it
+    is worth surfacing rather than acting on.
+
+    Returns ``None`` when nothing is off.
+    """
+    items = [i for i in response.get("output") or [] if isinstance(i, dict)]
+    if not items:
+        return None
+    if incomplete_reason(response):
+        return None  # the model stopped early and said so — not a silent failure
+    if output_text(response):
+        return None
+
+    messages = [i for i in items if i.get("type") == "message"]
+    if not messages:
+        return None
+    empty = [
+        m
+        for m in messages
+        if not any(
+            (p or {}).get("type") == "output_text" and (p or {}).get("text")
+            for p in m.get("content") or []
+        )
+    ]
+    if not empty:
+        return None
+    return (
+        f"{len(empty)} assistant message item(s) carried no readable output_text, "
+        "and the response did not report stopping early. Either the model said "
+        "nothing, or the content field has been renamed."
+    )
+
+
 _client: Optional[ResponsesClient] = None
 
 

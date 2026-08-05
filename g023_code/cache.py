@@ -81,6 +81,15 @@ class Cache:
                     created_at  REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS prefix_stats (
+                    day         TEXT NOT NULL,
+                    model       TEXT NOT NULL,
+                    hit_tokens  INTEGER NOT NULL DEFAULT 0,
+                    miss_tokens INTEGER NOT NULL DEFAULT 0,
+                    calls       INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, model)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_file_path ON file_cache(file_path);
                 CREATE INDEX IF NOT EXISTS idx_file_accessed ON file_cache(accessed_at);
                 CREATE INDEX IF NOT EXISTS idx_web_url ON web_cache(url);
@@ -285,6 +294,57 @@ class Cache:
             else:
                 cur = conn.execute("DELETE FROM web_cache")
             return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Prefix-cache hit rate, bucketed by day
+    # ------------------------------------------------------------------
+    #
+    # The hit rate is a continuous number the API reports on every call, and it
+    # moves as soon as anything perturbs the prefix — a changed prompt, a
+    # different tool list, or a server-side change in how items serialise. A
+    # single session's number says little; the same number against the last two
+    # weeks says whether something moved. Storing it is the only way to compare.
+
+    def record_prefix_stats(self, model: str, hit_tokens: int, miss_tokens: int, calls: int = 1) -> None:
+        if hit_tokens <= 0 and miss_tokens <= 0:
+            return
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO prefix_stats (day, model, hit_tokens, miss_tokens, calls)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day, model) DO UPDATE SET
+                    hit_tokens  = hit_tokens  + excluded.hit_tokens,
+                    miss_tokens = miss_tokens + excluded.miss_tokens,
+                    calls       = calls       + excluded.calls
+                """,
+                (day, model, int(hit_tokens), int(miss_tokens), int(calls)),
+            )
+
+    def prefix_history(self, days: int = 14) -> list[dict]:
+        """Per-day hit/miss totals, oldest first, with the hit rate computed."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT day, model, hit_tokens, miss_tokens, calls FROM prefix_stats "
+                "ORDER BY day DESC LIMIT ?",
+                (days * 4,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            total = (r["hit_tokens"] or 0) + (r["miss_tokens"] or 0)
+            out.append(
+                {
+                    "day": r["day"],
+                    "model": r["model"],
+                    "hit_tokens": r["hit_tokens"],
+                    "miss_tokens": r["miss_tokens"],
+                    "calls": r["calls"],
+                    "hit_rate": (r["hit_tokens"] / total) if total else 0.0,
+                }
+            )
+        out.sort(key=lambda d: d["day"])
+        return out[-days:]
 
     # ------------------------------------------------------------------
     # Session facts (lightweight memory)

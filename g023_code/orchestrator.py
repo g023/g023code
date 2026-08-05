@@ -32,8 +32,16 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from . import ui
-from .api import DeepSeekError, get_client, reasoning_param
+from .api import (
+    DeepSeekError,
+    get_client,
+    reasoning_param,
+    silent_degradation,
+    unknown_item_types,
+)
+from .cache import get_cache
 from .config import get_project_root, settings
+from .signals import get_signals
 from .tools.registry import get_registry
 from .subagents.router import get_router
 from .ui import ActivityPrinter, Glyph, ToolEvent, TurnTrace, console
@@ -183,6 +191,9 @@ class Reply:
     status: str = "completed"
     incomplete_reason: str = ""
     streamed: bool = False
+    # Drift signals, recorded but never acted on — see g023_code.signals.
+    unknown_types: set = field(default_factory=set)
+    degradation: Optional[str] = None
 
 
 def parse_reply(response: Dict[str, Any], rendered_ids: Optional[set] = None) -> Reply:
@@ -192,6 +203,8 @@ def parse_reply(response: Dict[str, Any], rendered_ids: Optional[set] = None) ->
         usage=response.get("usage"),
         status=response.get("status") or "completed",
         incomplete_reason=((response.get("incomplete_details") or {}).get("reason") or ""),
+        unknown_types=unknown_item_types(response),
+        degradation=silent_degradation(response),
     )
     answer: List[str] = []
     commentary: List[str] = []
@@ -328,6 +341,7 @@ class Orchestrator:
         self.usage.reset()
         self.trace = TurnTrace()
         self._streamed_answer = False
+        get_signals().reset()
 
     @property
     def _system(self) -> str:
@@ -561,6 +575,7 @@ class Orchestrator:
 
             self.state.add_output(reply.output)
             delta = self.usage.record(settings.orchestrator_model, reply.usage, scope="orchestrator")
+            self._record_signals(reply, delta)
 
             for item in reply.searches:
                 args, summary = describe_search(item)
@@ -626,6 +641,40 @@ class Orchestrator:
             )
         )
         return final_content
+
+    def _record_signals(self, reply: Reply, delta) -> None:
+        """Log what looked off about a response, and bank the hit rate.
+
+        Recording only. None of these change the loop's behaviour: an unknown
+        item type is not an error, and an empty response is not necessarily a
+        broken one. What they buy is that when the answers get worse, there is
+        something to look at other than the answers — see /signals.
+        """
+        signals = get_signals()
+        if reply.unknown_types:
+            signals.note_unknown_types(reply.unknown_types, self.state.turn)
+            if settings.show_answer_detail:
+                console.print(
+                    f"[warn]{Glyph.BULLET} unrecognised response item(s): "
+                    f"{', '.join(sorted(reply.unknown_types))} — carried through "
+                    "untouched, but not shown in the trace.[/warn]"
+                )
+        if reply.degradation and not reply.tool_calls:
+            signals.note_empty_response(reply.degradation, self.state.turn)
+            if settings.show_answer_detail:
+                console.print(f"[warn]{Glyph.BULLET} {reply.degradation}[/warn]")
+
+        if delta.calls and (delta.cache_hit_tokens or delta.cache_miss_tokens):
+            try:
+                get_cache().record_prefix_stats(
+                    settings.orchestrator_model,
+                    delta.cache_hit_tokens,
+                    delta.cache_miss_tokens,
+                    delta.calls,
+                )
+            except Exception:
+                # Observability must never be able to cost someone a turn.
+                pass
 
     @property
     def answer_was_streamed(self) -> bool:
