@@ -34,7 +34,7 @@ makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="releases/1/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="snapshots/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
 </p>
 
 <p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.1.0 — see <a href="media/README.md">media/README.md</a> for what has changed since.</sub></p>
@@ -127,7 +127,7 @@ and everything else behaves identically.
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="releases/1/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
+  <img src="snapshots/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
 </p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
@@ -153,7 +153,7 @@ editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat`, so they follow you across projects.
 
 <p align="center">
-  <img src="releases/1/snapshot2.png" alt="The /settings and /tools panels" width="880">
+  <img src="snapshots/snapshot2.png" alt="The /settings and /tools panels" width="880">
 </p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
