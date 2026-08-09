@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.2-informational)](releases/1/RELEASE_NOTES.md)
+[![Version](https://img.shields.io/badge/version-1.3.2-informational)](../RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -34,18 +34,21 @@ makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="releases/1/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="docs/session.png" alt="One question answered: the live tool trace, the boxed answer, and the accounting line under it" width="880">
 </p>
 
-<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.1.0 — see <a href="media/README.md">media/README.md</a> for what has changed since.</sub></p>
+<p align="center"><sub>One read-only question, answered. Every tool call is named as it runs, and the turn ends with what it took: 3 iterations, 4 tool calls, 5.5 s of model time, 11 ms of tool time, $0.00044. Captured on 1.3.2 — <a href="docs/README.md">docs/README.md</a> indexes every screenshot and states how they were taken.</sub></p>
 
 ## Table of contents
 
 - [Quick start](#quick-start)
 - [What you see while it runs](#what-you-see-while-it-runs)
 - [Configuration](#configuration)
+- [The tools](#the-tools)
+- [Permissions](#permissions)
 - [Architecture](#architecture)
 - [What delegation costs](#what-delegation-costs)
+- [How compaction works](#how-compaction-works)
 - [Drift signals](#drift-signals)
 - [Slash commands](#slash-commands)
 - [Verbosity, context & cost](#verbosity-context--cost)
@@ -56,6 +59,9 @@ than a search provider bolted on the side.
 - [Tests](#tests)
 - [Extending](#extending)
 - [License](#license)
+
+All screenshots below are real captures from a 1.3.2 session — see
+[docs/README.md](docs/README.md) for the full index and the capture conditions.
 
 ## Quick start
 
@@ -115,20 +121,54 @@ folder when one exists, and set two environment variables for you:
 | `G023_HOME` | The installation folder — where `K.dat` and `config.json` live |
 | `G023_PROJECT_ROOT` | The directory you launched from — your project |
 
-A per-project `.g023/` folder holds the SQLite cache and your input history.
+Everything g023 writes about your project lives in one hidden folder beside it,
+created on launch:
+
+```
+<project>/
+└── .g023/
+    ├── cache.db       # one SQLite file — file summaries, vision answers,
+    │                  #   fetched pages, session facts, prefix-cache history
+    ├── cookies.json   # per-host cookies, created on the first FetchUrl
+    └── history        # your input history for the REPL
+```
+
+Nothing in it is required to run: delete the folder and the next session rebuilds
+it, having lost only cached work. `cache.db` holds five tables — file summaries,
+vision answers, fetched pages, session facts and the daily prefix-cache history —
+and `/cache` reports what is in each of them, how large the file is and where it
+sits.
+
+<p align="center">
+  <img src="docs/cache.png" alt="The /cache panel: per-table counts for the local SQLite caches, with the database size and path" width="880">
+</p>
+
+<p align="center"><sub><code>/cache</code>. <code>/cache clear</code> empties the caches but deliberately leaves the prefix-cache history alone — that is a record of what happened, not cached work.</sub></p>
 
 `prompt_toolkit` is listed as a dependency but is not strictly required: with it
 you get tab completion, persistent history, and a live status bar pinned to the
 bottom of the terminal. Without it the input line falls back to a plain prompt
 and everything else behaves identically.
 
+At the prompt: **Tab** completes commands, **↑/↓** walks your history,
+**Esc-Enter** starts a new line inside the same prompt, and **Ctrl-C** cancels
+the turn in flight and hands the prompt back rather than killing the process.
+
+<p align="center">
+  <img src="docs/startup.png" alt="The startup banner: version, project, home, model, and a live probe of the vision daemon" width="880">
+</p>
+
+<p align="center"><sub>Startup states where it is and what it is configured with, and probes the vision daemon rather than assuming it is there.</sub></p>
+
 ## What you see while it runs
 
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="releases/1/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
+  <img src="docs/cost.png" alt="The /cost dashboard: calls, cache hit, cache miss, output and cost per model" width="880">
 </p>
+
+<p align="center"><sub><code>/cost</code>. Cache hit and cache miss are separate columns because they are priced an order of magnitude apart, and the price line is printed underneath so the arithmetic is checkable rather than trusted.</sub></p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
 sent. The status line after every turn carries the numbers that only mean
@@ -142,24 +182,106 @@ Costs shown are computed locally from the token counts the API returns and the
 price table in [`SPEC.md` §3.2](SPEC.md). They are an estimate of your bill, not
 a reading of it.
 
+Answers **stream** by default (`stream`, on), so text appears as it is written
+rather than after the turn completes. A *transport* failure mid-stream does not
+cost you the turn: it is printed (`streaming unavailable (…); falling back`) and
+the same request is re-issued unstreamed. An error the API itself returned is
+raised as-is — retrying a rejected request would only get it rejected again.
+
+`/status` (alias `/dash`) is the same information from the other direction: not
+what the last turn cost, but where the session stands overall.
+
+<p align="center">
+  <img src="docs/status.png" alt="The /status dashboard: model, session counters, vision, project, cache size, context and spend" width="880">
+</p>
+
 Anything you type that does not start with `/` is a prompt. Everything else is
 a slash command.
 
 ## Configuration
 
-`/settings` shows every setting in one place and marks which ones persist;
-`/tools` shows what the agent may do and what it has done this turn. Both are
+`/settings` shows every setting in one place and marks which ones persist. It is
 editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat`, so they follow you across projects.
 
 <p align="center">
-  <img src="releases/1/snapshot2.png" alt="The /settings and /tools panels" width="880">
+  <img src="docs/settings.png" alt="The /settings panel: every setting, its live value, and which ones persist" width="880">
 </p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
 on at **high** effort, verbosity **low**, auto-compaction **on** at 85% of the
-window, acting tools set to **ask**, and **vision disabled**. Nothing that
-writes, runs, or leaves your machine happens without a prompt.
+window, up to **100** tool steps per turn, **12** search matches returned, acting
+tools set to **ask**, and **vision disabled**. Nothing that writes, runs, or
+leaves your machine happens without a prompt.
+
+`/settings save` writes the persisted subset now; `/settings reset` restores the
+built-in defaults. A hand-edited `config.json` cannot put the session into a
+state its own commands cannot describe — a value outside the allowed set (an
+unavailable model, a verbosity that is not `low`/`mid`/`high`, a negative step
+count) is dropped and the default kept, rather than obeyed.
+
+## The tools
+
+Eight function tools, plus DeepSeek's server-side `web_search`. `/tools` lists
+them with their current permission and how many times each has run this turn.
+
+| Tool | Takes | Returns |
+|---|---|---|
+| `ReadFile` | `path`, and optionally `raw`, `focus`, `start_line`, `end_line` | A structural summary plus a symbol → line-range map — **never** the whole file unless you ask. `start_line`/`end_line` returns that range as verbatim source instead; `focus` steers the summary; `raw` adds a truncated excerpt. |
+| `SearchContent` | `query`, `path`, `max_matches` (12), `file_glob` | File, line, the matching text and a little context — metadata, not file dumps. Pure local Python: no API call at any size. |
+| `ListDir` | `path`, `recursive` | Names, types and sizes. `recursive` gives a shallow tree, capped at depth 2, so listing a large repo cannot flood the window. |
+| `Bash` | `command`, `timeout` (60 s) | Stdout/stderr from the project root. Asks first. |
+| `WriteFile` | `path`, `content` | Writes or overwrites. Asks first, showing the path and an excerpt of what would be written. |
+| `Agent` | `kind` (`explore` \| `plan`), `objective` | An isolated subagent's conclusion, reasoned out in its own context rather than in the orchestrator's. |
+| `AnalyzeImage` | `path_or_url`, `question` | A textual answer from a local vision model. Not offered at all while vision is disabled. |
+| `FetchUrl` | `url`, `cache_mode`, `max_age` (3600 s), `extract` (`text`/`markdown`/`links`/`raw`), `max_chars` (20000) | Readable text from a page, not raw HTML. Always asks. |
+| `web_search` | — | Nothing on this side: DeepSeek runs it server-side inside the turn. See [Web search](#web-search-native). |
+
+Whatever a tool returns, the orchestrator's copy is capped: a result over 6,000
+characters is cut to 5,500 and labelled *"truncated for orchestrator context;
+re-run the tool with a narrower scope for the rest"*. A single tool call cannot
+fill the window by accident.
+
+<p align="center">
+  <img src="docs/tools.png" alt="The /tools panel: each tool, its permission, and whether it runs in an isolated subagent context" width="880">
+</p>
+
+The **subagent-isolated** column is the architecture made visible: `ReadFile`,
+`SearchContent`, `AnalyzeImage` and `Agent` do their work in a context that is
+thrown away, and only their conclusion comes back.
+
+## Permissions
+
+Every tool sits at one of three levels — `allow`, `ask`, `block`. The ones that
+write, run, spend or leave the machine (`Bash`, `WriteFile`, `Agent`,
+`AnalyzeImage`) start at `permission_default`, which is `ask`. The read-only,
+local, free ones (`ReadFile`, `SearchContent`, `ListDir`) start at `allow` and
+stay there whatever the default is — there is nothing to approve about reading a
+file you already own. Change any of them with `/tools <tool> allow|ask|block`.
+
+When something needs permission, the prompt shows what would actually happen —
+the path, and an excerpt of the exact content — before you answer:
+
+<p align="center">
+  <img src="docs/permission.png" alt="A WriteFile permission prompt showing the path and content excerpt" width="880">
+</p>
+
+`y` allows this one call, **`a` promotes the tool to `allow` for the rest of the
+session**, and `n` refuses — the refusal goes back to the model as the tool's
+result, so it can try another way instead of stalling. Ctrl-C or Ctrl-D at the
+prompt counts as a refusal of that one call, not as a crash. `FetchUrl` is the
+exception to the default: it asks every time unless you have blocked it outright,
+because every fetch touches a different third party.
+
+That capture also shows the escalation path working unprompted: `read
+app/schemas.py` returned a summary (25 lines, 3 classes), and the model then
+asked for `app/schemas.py:1-8` to see the head verbatim before overwriting it.
+
+<p align="center">
+  <img src="docs/write.png" alt="The same turn after approving: wrote 197 B in 7 ms, then the answer" width="880">
+</p>
+
+<p align="center"><sub>After <code>y</code>: <code>wrote 197 B · 7 ms</code>, then the answer. The trace says what happened to the file, not what was sent to the model.</sub></p>
 
 ## Architecture
 
@@ -270,6 +392,161 @@ verbatim text and costs no API call. That turns "the summary was too thin" from
 a re-read of the whole file into a precise second look. It does not turn it into
 something the orchestrator notices automatically — that detector does not exist.
 
+## How compaction works
+
+Delegation keeps a *turn* small. Compaction is what keeps a long *session* small.
+Both exist because the same history is re-sent on every single request: an item
+that entered the transcript twenty turns ago is still being paid for now.
+
+There are three places where history gets smaller, and they are worth keeping
+apart, because two of them are free and one of them costs money.
+
+### 0 · On the way in — tool results are capped
+
+Before a tool result is ever appended to the transcript, the orchestrator
+truncates it:
+
+```python
+if len(result) > 6000:
+    result = result[:5500] + "…[truncated for orchestrator context; " \
+                             "re-run the tool with a narrower scope for the rest]"
+```
+
+This is not compaction so much as its precondition. It puts a hard ceiling on
+what one call can cost you, and the wording tells the model what to do about it —
+narrow the scope and call again — rather than leaving it to guess that something
+was cut.
+
+### 1 · `/compact micro` — free, local, manual
+
+Tool results are almost always the largest thing in a long history, and almost
+always the least useful part of it once they have been acted on. `/compact micro`
+(aliases `local`, `free`) walks the history, keeps the **six most recent** tool
+results intact, and replaces the `output` text of every older one with:
+
+```
+[Old tool result content cleared]
+```
+
+Two properties matter. First, **no API call happens** — this is string surgery on
+a local list, so it costs nothing and takes no measurable time. Second, the items
+themselves are *not removed*. A `function_call` and its `function_call_output`
+must both be echoed back on the next request; deleting one would orphan the other
+and the next request would be a hard 400. So the shape of the conversation
+survives exactly, and only the bytes inside it go.
+
+<p align="center">
+  <img src="docs/compact-before.png" alt="/context before compacting: 33 items, ~3,922 tokens, tool results 46%" width="880">
+</p>
+
+<p align="center"><sub><code>/context</code> after three read-heavy turns: 33 items, ~3,922 tokens, and tool results are 46% of it — the largest slice, and the one that has already been read.</sub></p>
+
+<p align="center">
+  <img src="docs/compact-micro.png" alt="/compact micro clearing old tool results for ~949 tokens at no API cost" width="880">
+</p>
+
+<p align="center"><sub>The same session, one command later: <code>~949 tokens</code> gone for nothing. The session cost on the status bar does not move, because nothing was sent anywhere.</sub></p>
+
+It is **manual on purpose** and never runs by itself. It is worth doing when the
+history is mostly finished tool output and you want to keep reading — it is the
+cheapest thing in the program.
+
+### 2 · `/compact` — one summary, paid for once
+
+When the session itself has become long, blanking results is not enough: the
+turns, the reasoning and the decisions are the bulk. `/compact` replaces the
+whole history with a written summary of it.
+
+The order of operations is deliberate. The transcript is rendered **before**
+anything is blanked — micro-compacting first would hand the summariser a page of
+`[Old tool result content cleared]` placeholders and it would faithfully
+summarise nothing. Rendering caps each piece so a single monster item cannot
+dominate: tool results to 1,500 characters, call arguments to 160, message text
+to 4,000, and the whole transcript to 60,000. Over that cap it keeps the **tail**,
+marked `…[earlier transcript elided]…`, because the recent end of a session is
+the part still being worked on. `reasoning` items are dropped outright — they are
+the model's scratch work, not the record of what happened.
+
+That rendered text goes to the **subagent model** in an isolated call —
+`temperature 0.1`, reasoning off, 2,048 output tokens — with a system prompt that
+asks for five things in order:
+
+1. goals and constraints still in force
+2. files read or modified, with the key facts about them
+3. decisions taken, and why
+4. work completed
+5. what remains, and the next step
+
+The result replaces the history with exactly **two** items: a user item carrying
+the summary, and an assistant item acknowledging it. The session continues from
+there as if that summary were what you had said all along.
+
+<p align="center">
+  <img src="docs/compact-summary.png" alt="/compact reporting 33 items compacted to 2, ~1,448 tokens reclaimed, summary cost $0.00086" width="880">
+</p>
+
+<p align="center"><sub>Both sides of the trade on one line: <code>Compacted 33 items → 2 (~1,448 tokens reclaimed · summary cost $0.00086)</code>. The summary is a real API call and it is billed as one — that call is charged to the subagent scope, so <code>/cost</code> shows it separately from your turns.</sub></p>
+
+<p align="center">
+  <img src="docs/compact-after.png" alt="/context after compaction: two items, ~1,348 tokens" width="880">
+</p>
+
+<p align="center"><sub>Afterwards: two items, ~1,348 tokens. Everything that was thirty-three items of reads, calls and replies is now one paragraph the model wrote about itself.</sub></p>
+
+Compaction can fail to pay for itself, and when it does it says so. If the
+summary comes out larger than what it replaced — a short session with a long
+answer in it — the report reads `no reduction — the summary is ~N tokens larger`
+rather than claiming a win. Nothing is rolled back; you are told.
+
+Two useful forms:
+
+```
+/compact                      # summarise everything
+/compact the auth refactor    # anything else is a focus hint for the summary
+```
+
+The focus form appends *"Focus the summary on: …"* to the request, which is worth
+using when the session covered several unrelated things and only one of them is
+still live.
+
+### Automatic compaction
+
+`/compact` also runs by itself. Before each turn the orchestrator compares the
+context against the window, and if `auto_compact` is on and the fraction has
+reached `compact_threshold` — **85% of 900,000 tokens** by default — it prints
+
+```
+Context at 86% → auto-compacting.
+```
+
+and compacts before continuing. That is the *only* automatic mechanism: there is
+no sliding window and nothing silently drops the oldest items behind your back.
+Either you compact, or auto-compact does it at 85% and tells you, or the history
+stays as it is.
+
+```
+/compact auto off        # never compact on its own
+/compact auto on         # restore (saved to config.json)
+```
+
+Turning it off does not raise the ceiling; it hands you the responsibility for
+staying under it.
+
+### What is not here
+
+The on-disk cache has a `session_facts` table, and helpers to read and write it,
+intended as a middle layer that would carry durable facts across compactions.
+**Nothing in the shipped code calls them.** The two layers described above are
+the two that run. It is listed here so that finding the table in `cache.db` does
+not read as a feature you failed to switch on.
+
+### Watching it
+
+`/context` is the instrument for all of this — items, estimated tokens, and the
+share taken by each kind of content, with a hint naming the cheapest thing to do
+about it. Check it before compacting and after; the numbers in the four captures
+above are from one continuous session and nothing else.
+
 ## Drift signals
 
 The client does not validate responses on purpose: an unknown field has to reach
@@ -286,6 +563,12 @@ first:
 | Empty output with no `incomplete_reason` | What a renamed content field looks like from outside | Whether the model simply said nothing |
 | Prefix hit rate diffed against previous days | Anything that started breaking the prefix | Whether the cause is your prompt, the tool list, or the server |
 
+<p align="center">
+  <img src="docs/signals.png" alt="The /signals panel: prefix hit rate against baseline, unknown item types, unexplained empty responses" width="880">
+</p>
+
+<p align="center"><sub>What the loop noticed and nobody raised an error about. A clean panel is the normal case — the point is that it is checkable rather than assumed.</sub></p>
+
 The hit rate is stored per day in `.g023/cache.db` and compared against the
 trailing baseline, so the comparison survives restarts. It needs two prior days
 before it will call anything a baseline, and says so until then. `/cache clear`
@@ -300,17 +583,23 @@ separate the causes.
 
 Commands that take a fixed set of options **open a picker when typed bare**, so
 `/vision` is as usable as `/vision qwen3.5:2b` — there is nothing to memorise.
-`/help <command>` explains any one of them in full.
+`/help <command>` explains any one of them in full. Every command has short
+aliases, listed in italics below — you never have to type `/permissions` when
+`/perm` will do.
+
+<p align="center">
+  <img src="docs/help.png" alt="The /help panel: the whole command surface on one screen, grouped by what it touches" width="880">
+</p>
 
 <details open>
 <summary><b>Session</b></summary>
 
 | Command | Action |
 |---|---|
-| `/help [command]` | List commands, or explain one in detail |
-| `/status` | One-screen dashboard: model, context, cost, vision, cache |
-| `/clear` | Reset the conversation and usage counters |
-| `/exit` | Quit |
+| `/help [command]` *(`/?`, `/h`, `/commands`)* | List commands, or explain one in detail |
+| `/status` *(`/dash`)* | One-screen dashboard: model, context, cost, vision, cache |
+| `/clear` *(`/reset`)* | Reset the conversation and usage counters |
+| `/exit` *(`/quit`, `/q`)* | Quit |
 
 </details>
 
@@ -320,9 +609,9 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | Command | Action |
 |---|---|
 | `/model [flash]` | Show or set the orchestrator model — `flash` is the only one the Responses API serves |
-| `/thinking [low\|high\|max\|off]` | Set reasoning effort, or turn thinking off |
-| `/verbose [low\|mid\|high]` | How much detail to print while working |
-| `/steps [n\|off\|default]` | Cap the tool steps one turn may take before it gives up (default 100; `off` for no cap, with progress printed every 10 steps) |
+| `/thinking [low\|high\|max\|off]` *(`/effort`)* | Set reasoning effort, or turn thinking off |
+| `/verbose [low\|mid\|high]` *(`/v`)* | How much detail to print while working |
+| `/steps [n\|off\|default]` *(`/iterations`, `/maxsteps`)* | Cap the tool steps one turn may take before it gives up (default 100; `off` for no cap, with progress printed every 10 steps) |
 
 </details>
 
@@ -331,11 +620,13 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/compact [focus]` | Summarise the history (`micro` = free local pass, `auto on\|off`) |
+| `/compact [focus]` | Summarise the history — see [How compaction works](#how-compaction-works) |
+| `/compact micro` *(`local`, `free`)* | Blank old tool results locally; no API call, no cost |
+| `/compact auto on\|off` | Toggle automatic compaction at the threshold, and save it |
 | `/context` | Break down what is occupying the context window, by role and size |
-| `/cost` | Token usage and spend, split by cache hit/miss, with a per-turn sparkline |
-| `/settings [save\|reset]` | Every setting, marking which persist; save or restore defaults |
-| `/signals` *(alias `/drift`)* | Prefix hit rate against its own history, unknown item types, unexplained empty responses |
+| `/cost` *(`/usage`)* | Token usage and spend, split by cache hit/miss, with a per-turn sparkline |
+| `/settings [save\|reset]` *(`/config`)* | Every setting, marking which persist; save or restore defaults |
+| `/signals` *(`/drift`)* | Prefix hit rate against its own history, unknown item types, unexplained empty responses |
 
 </details>
 
@@ -344,10 +635,11 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/tools` | List tools, their permission level, and how often each ran |
+| `/tools` *(`/permissions`, `/perm`)* | List tools, their permission level, and how often each ran |
 | `/tools <tool> allow\|ask\|block` | Change one tool's permission |
 | `/fetch <url>` | Fetch a URL yourself, with the cache/fresh prompt |
 | `/fetch status` | Report how closely fetches imitate a real browser |
+| `/fetch cookies clear` | Drop every stored cookie and start the next fetch cold |
 | `/cache [stats\|web\|clear]` | Inspect and purge the local SQLite caches |
 
 </details>
@@ -363,8 +655,9 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/ollama models` | List installed models, sizes, quantisation, vision capability |
 | `/ollama test [model]` | Run a real inference — proves the whole path, not just the port |
 | `/ollama ps` | What the daemon currently holds in VRAM |
-| `/vision` | Interactive picker of installed vision models |
+| `/vision` *(`/config_vision`)* | Interactive picker of installed vision models |
 | `/vision <model>` · `/vision off` | Enable a specific model, or disable |
+| `/vision backend <name>` | Choose the vision provider. The setting accepts `none`, `ollama`, `glm`, `openai` and `local`; **only `ollama` is implemented**, and the command says so rather than failing later. |
 
 </details>
 
@@ -376,6 +669,11 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/goal <text>` | State a high-level objective; runs one turn at max reasoning effort |
 
 </details>
+
+Two keys are worth knowing and are not commands. **Ctrl-C** cancels the turn in
+flight and gives the prompt back — it does not kill the process, so the session
+and its history survive an answer you did not want to wait for. **Esc-Enter**
+adds a line to the prompt you are typing instead of submitting it.
 
 ## Verbosity, context & cost
 
@@ -393,6 +691,12 @@ it is real conversation, `/compact` summarises it with the cheap model in an
 isolated context. The command tells you which of the two applies. Compaction
 also runs automatically once the context passes `compact_threshold` (85%) —
 turn that off with `/compact auto off`.
+
+<p align="center">
+  <img src="docs/context.png" alt="/context: items, estimated tokens, and the share taken by each kind of content" width="880">
+</p>
+
+<p align="center"><sub><code>/context</code> after a single read-heavy turn: tool results are 76% of a ~1,752-token history, and the hint under the table names the cheapest fix rather than leaving you to work it out.</sub></p>
 
 Every API call — orchestrator *and* subagents — reports its token usage to a
 single tracker, so `/cost` and `/settings` show the cache-hit / cache-miss /
@@ -466,6 +770,12 @@ enable it once and the choice persists.
   another inference. A different question about the same image is a new
   inference — the question is part of the key.
 
+<p align="center">
+  <img src="docs/vision.png" alt="/vision with no argument: a picker listing the vision models the daemon actually reports" width="880">
+</p>
+
+<p align="center"><sub><code>/vision</code> bare opens a picker built from what the daemon reports, not from a hard-coded list — so the models offered are the ones you can actually run.</sub></p>
+
 Once enabled, just ask: `analyze screenshot.png — what's the error?`
 
 ### Running the model on another machine
@@ -496,6 +806,12 @@ Three commands make a remote setup diagnosable rather than a guessing game:
 | `/ollama` | Is anything listening, what version, how far away (latency), how many models |
 | `/ollama models` | What that machine actually has — names, sizes, quantisation, vision capability |
 | `/ollama test` | A real inference round-trip: g023 sends a generated image and checks the answer. This proves the whole path — encoding, transport, and the model genuinely being image-capable — rather than just that the port is open. |
+
+<p align="center">
+  <img src="docs/ollama.png" alt="/ollama: which daemon vision is pointed at, whether it answers, its version and latency" width="880">
+</p>
+
+<p align="center"><sub><code>/ollama</code> reports the host actually in effect and whether it answered, so "vision is not working" resolves to a specific step rather than a shrug.</sub></p>
 
 > [!WARNING]
 > For a remote daemon to accept connections it must be bound to the network
@@ -598,6 +914,7 @@ directory, so a run never reads your real cache and never touches the network.
 | `test_drift_signals.py` | Each signal fires on the shape that matters and stays quiet on ordinary turns; hit-rate history survives restarts |
 | `test_history_integrity.py` | Tool-call pairing survives rollback and repair; output items are echoed back byte-identical |
 | `test_usage_accounting.py` | Cost arithmetic, both usage spellings, worst-case assumption when the split is unreported, command/handler contract |
+| `test_step_limit.py` | A turn spends exactly `max_iterations` model calls and no more; the cap is read from the setting on every turn rather than baked in; `0` means uncapped, prints progress as it goes, and reads back as a word; a meaningless value in `config.json` is ignored while any deliberate large one is honoured |
 
 What these do not cover: anything requiring the real API, end-to-end session
 cost, or whether a summary was good enough for the question asked.
