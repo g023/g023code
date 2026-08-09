@@ -17,6 +17,12 @@ import difflib
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from .config import ITERATION_NOTICE_EVERY, MIN_ITERATIONS, Settings
+
+# The help text quotes the default rather than restating it, so the two cannot
+# drift apart.
+DEFAULT_MAX_ITERATIONS = Settings.max_iterations
+
 
 @dataclass(frozen=True)
 class Argument:
@@ -151,6 +157,32 @@ COMMANDS: tuple[Command, ...] = (
             "Saved to config.json."
         ),
         examples=("/verbose", "/verbose high"),
+    ),
+    Command(
+        name="/steps",
+        aliases=("/iterations", "/maxsteps"),
+        summary="Cap how many tool steps one turn may take",
+        handler="cmd_steps",
+        group="Model",
+        args=(
+            Argument("count", (), f"{MIN_ITERATIONS} or more, 'off', or 'default'"),
+        ),
+        detail=(
+            "One step is one call to the orchestrator model. A step that comes back\n"
+            "with tool calls runs them and takes another step; the first step that\n"
+            "answers instead ends the turn. This is the backstop for a turn that keeps\n"
+            "tooling without ever answering — when it trips, the turn ends with\n"
+            "'Stopped after N tool iterations' instead of an answer.\n\n"
+            "There is no upper bound: any count is accepted, and 'off' removes the\n"
+            "backstop so a turn runs until the model answers. An uncapped turn is\n"
+            f"still visible — every {ITERATION_NOTICE_EVERY} steps it prints where it\n"
+            "is, how long it has run and what it has cost, at any verbosity, and\n"
+            "Ctrl-C ends it.\n\n"
+            f"Default {DEFAULT_MAX_ITERATIONS}. Raising it raises what a single runaway\n"
+            "turn can cost, since every step is a billed round trip. With no argument,\n"
+            "prints the current cap. Saved to config.json."
+        ),
+        examples=("/steps", "/steps 250", "/steps off", "/steps default"),
     ),
     # -- Context ----------------------------------------------------------
     Command(

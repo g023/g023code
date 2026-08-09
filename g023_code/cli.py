@@ -24,9 +24,13 @@ from . import ui
 from .commands import Command
 from .config import (
     AVAILABLE_MODELS,
+    ITERATION_NOTICE_EVERY,
+    MIN_ITERATIONS,
     PERSISTED_KEYS,
     Settings,
     UNAVAILABLE_MODELS,
+    UNLIMITED_ITERATIONS,
+    describe_steps,
     get_config_file,
     get_home,
     get_project_root,
@@ -371,6 +375,57 @@ class CLI:
             f"[muted]{Glyph.DOT} {self.VERBOSE_HELP[level]} ·saved[/muted]"
         )
 
+    def cmd_steps(self, arg: str = "") -> None:
+        value = arg.strip().lower()
+
+        if not value:
+            current = describe_steps(settings.max_iterations)
+            console.print(
+                f"[key]Steps per turn[/key] {Glyph.ARROW} {current}  "
+                f"[muted]{Glyph.DOT} one model call each "
+                f"(/steps <n> to change, /steps off to remove the cap, "
+                f"/steps default for {Settings.max_iterations})[/muted]"
+            )
+            return
+
+        if value in ("default", "reset"):
+            count = Settings.max_iterations
+        elif value in ("off", "none", "unlimited", "no", "infinite"):
+            count = UNLIMITED_ITERATIONS
+        else:
+            try:
+                count = int(value)
+            except ValueError:
+                console.print(
+                    f"[warn]Not a number:[/warn] {escape(arg.strip())}  "
+                    f"[muted](a step count, 'off', or 'default')[/muted]"
+                )
+                return
+
+        # No upper bound — a long job is allowed to be a long job. Only a
+        # negative count is meaningless, and 0 already means "no cap".
+        if count < UNLIMITED_ITERATIONS:
+            console.print(
+                f"[warn]Not a step count:[/warn] {count}  "
+                f"[muted](use {MIN_ITERATIONS} or more, or 'off' for no cap)[/muted]"
+            )
+            return
+
+        settings.max_iterations = count
+        save_config()
+        if count == UNLIMITED_ITERATIONS:
+            console.print(
+                f"[ok]{Glyph.CHECK} Steps per turn {Glyph.ARROW} unlimited[/ok] "
+                f"[muted]{Glyph.DOT} a turn now runs until the model answers; "
+                f"progress prints every {ITERATION_NOTICE_EVERY} steps and "
+                f"Ctrl-C stops it ·saved[/muted]"
+            )
+            return
+        console.print(
+            f"[ok]{Glyph.CHECK} Steps per turn {Glyph.ARROW} {count}[/ok] "
+            f"[muted]{Glyph.DOT} every step is a billed model call ·saved[/muted]"
+        )
+
     # ------------------------------------------------------------------
     # Context commands
     # ------------------------------------------------------------------
@@ -585,6 +640,11 @@ class CLI:
         row("max_context_tokens", f"{settings.max_context_tokens:,}")
         row("compact_threshold", f"{settings.compact_threshold:.0%}", "auto-compact trigger")
         row("auto_compact", settings.auto_compact, "/compact auto on|off")
+        row(
+            "max_iterations",
+            describe_steps(settings.max_iterations),
+            "tool steps per turn · /steps",
+        )
         row("max_search_matches", settings.max_search_matches)
         row("file_summary_max_tokens", settings.file_summary_max_tokens)
         row("permission_default", settings.permission_default, "/tools")

@@ -21,6 +21,7 @@ with an honest account of where the time and the money went.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import re
 import time
@@ -40,7 +41,7 @@ from .api import (
     unknown_item_types,
 )
 from .cache import get_cache
-from .config import get_project_root, settings
+from .config import ITERATION_NOTICE_EVERY, get_project_root, settings
 from .signals import get_signals
 from .tools.registry import get_registry
 from .subagents.router import get_router
@@ -524,9 +525,10 @@ class Orchestrator:
             raise DeepSeekError(0, error.get("message") or "the model reported a failure")
         return parse_reply(final, rendered_ids=rendered_ids)
 
-    async def _call_model(self, iteration: int) -> Reply:
+    async def _call_model(self, iteration: int, limit: int = 0) -> Reply:
         body = self._request_body()
-        label = f"Thinking{Glyph.ELLIPSIS} (turn {self.state.turn}, step {iteration})"
+        step = f"step {iteration}/{limit}" if limit else f"step {iteration}"
+        label = f"Thinking{Glyph.ELLIPSIS} (turn {self.state.turn}, {step})"
         if settings.stream:
             try:
                 return await self._call_streaming(body, label)
@@ -557,15 +559,31 @@ class Orchestrator:
         self.state.add_user(user_input)
         self.state.turn += 1
 
-        max_iterations = 25
+        # Read per turn, so /steps takes effect on the next thing you ask.
+        # 0 is "no limit": count up forever and let the model, or Ctrl-C, end it.
+        configured = max(0, int(settings.max_iterations))
+        steps = itertools.count(1) if not configured else iter(range(1, configured + 1))
         final_content = ""
 
-        for iteration in range(1, max_iterations + 1):
+        for iteration in steps:
             self.trace.iterations = iteration
+
+            # Progress the user can see at any verbosity. The spinner shows the
+            # step while a call is in flight and then repaints over itself, so
+            # without this an uncapped turn leaves nothing behind saying how far
+            # in it is or what it has cost.
+            if iteration > 1 and iteration % ITERATION_NOTICE_EVERY == 0:
+                self.printer.step_notice(
+                    iteration,
+                    configured,
+                    (time.perf_counter() - turn_started) * 1000,
+                    format_cost(self.usage.turn_cost),
+                    tools=self.trace.tool_count,
+                )
 
             think_started = time.perf_counter()
             try:
-                reply = await self._call_model(iteration)
+                reply = await self._call_model(iteration, configured)
             except Exception as e:
                 console.print(f"[bad]API error:[/bad] {e}")
                 # Drop the dangling exchange so the next turn starts clean.
@@ -623,9 +641,12 @@ class Orchestrator:
             self._streamed_answer = reply.streamed
             break
         else:
+            # Unreachable when the step count is unlimited — that loop only ends
+            # by answering, by an API error, or by Ctrl-C.
             final_content = (
-                f"Stopped after {max_iterations} tool iterations without a final answer. "
-                "Try narrowing the request, or run /compact and ask again."
+                f"Stopped after {configured} tool iterations without a final answer. "
+                "Try narrowing the request, run /compact and ask again, or raise the "
+                "cap with /steps (/steps off removes it)."
             )
             self._streamed_answer = False
 

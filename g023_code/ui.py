@@ -404,6 +404,25 @@ class ActivityPrinter:
     def tool_denied(self, name: str) -> None:
         self.console.print(f"     [warn]{Glyph.CROSS} denied by user[/warn]")
 
+    def step_notice(
+        self, n: int, limit: int, elapsed_ms: float, cost: str, tools: int = 0
+    ) -> None:
+        """
+        Where a long turn has got to — printed at every verbosity on purpose.
+
+        A turn with no step cap can run as long as the model keeps calling tools,
+        and the only other sign of that is a spinner that repaints over itself.
+        This line stays in the scrollback, so the count, the clock and the money
+        are all visible while the turn is still running rather than after it.
+        """
+        of = f"/{limit}" if limit else ""
+        tail = "" if limit else f"  [muted]no step cap {Glyph.DOT} Ctrl-C stops[/muted]"
+        self.console.print(
+            f"  [warn]{Glyph.BULLET} step {n}{of}[/warn] "
+            f"[muted]{Glyph.DOT} {human_ms(elapsed_ms)} {Glyph.DOT} "
+            f"{tools} tool call(s) {Glyph.DOT} {cost} this turn[/muted]{tail}"
+        )
+
     def iteration(self, n: int, tokens_in: int, tokens_out: int, cost: str) -> None:
         self.console.print(
             f"  [muted]iter {n} {Glyph.DOT} {tokens_in:,} in {Glyph.DOT} "

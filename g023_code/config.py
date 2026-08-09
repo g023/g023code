@@ -100,6 +100,21 @@ UNAVAILABLE_MODELS: dict[str, str] = {
 VerboseLevel = Literal["low", "mid", "high"]
 VERBOSE_LEVELS: tuple[str, ...] = ("low", "mid", "high")
 
+# Bounds on the per-turn tool loop. One is a legitimate setting — a single model
+# call, no tool follow-up. There is no upper bound: a long job is a long job, and
+# a cap the user cannot raise past turns work into "Stopped after N iterations".
+# ``max_iterations = 0`` means run until the model answers, with no step limit at
+# all. What replaces the ceiling is visibility, not a smaller number: the loop
+# reports where it is (see ITERATION_NOTICE_EVERY) so an uncapped run is watched
+# rather than silent, and Ctrl-C ends the turn.
+MIN_ITERATIONS = 1
+UNLIMITED_ITERATIONS = 0
+
+# How often the loop prints a progress line, in steps. Every step already updates
+# the spinner, but that line is transient; this one stays in the scrollback, at
+# any verbosity, so a turn that is 60 steps deep says so on its own.
+ITERATION_NOTICE_EVERY = 10
+
 
 @dataclass
 class Settings:
@@ -123,6 +138,12 @@ class Settings:
     # Context
     max_context_tokens: int = 900_000  # leave headroom under 1M
     compact_threshold: float = 0.85
+
+    # Agent loop: how many model calls one user turn may spend before the loop
+    # gives up. Every step that returns tool calls costs another round trip, so
+    # this is the backstop against a turn that tools forever without answering.
+    # 0 removes the backstop entirely — see UNLIMITED_ITERATIONS.
+    max_iterations: int = 100
 
     # Subagents / Tools
     max_search_matches: int = 12
@@ -196,6 +217,7 @@ PERSISTED_KEYS = (
     "show_tool_timing",
     "show_context_bar",
     "permission_default",
+    "max_iterations",
     "vision_backend",
     "vision_model",
     "vision_host",
@@ -219,6 +241,11 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
 }
 
 
+def describe_steps(count: int) -> str:
+    """How a step cap reads to the user — one wording, used everywhere."""
+    return "unlimited" if count == UNLIMITED_ITERATIONS else str(count)
+
+
 def _coerce(key: str, value: Any, default: Any) -> Any:
     """
     Validate one persisted value, returning ``None`` to mean "ignore this key".
@@ -229,6 +256,15 @@ def _coerce(key: str, value: Any, default: Any) -> Any:
     if key == "verbose" and isinstance(value, bool):
         # Older configs stored a bool; map it onto the three-level scale.
         return "high" if value else "low"
+
+    if key == "max_iterations":
+        # Any positive step count is honoured, however large, and 0 means "no
+        # limit". Only a negative or non-numeric value is a broken config, and
+        # that keeps the built-in default rather than being obeyed.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = int(value)
+        return value if value >= UNLIMITED_ITERATIONS else None
 
     allowed = _ALLOWED.get(key)
     if allowed is not None:
@@ -261,9 +297,14 @@ def load_config(target: Optional["Settings"] = None) -> dict[str, Any]:
     for key in PERSISTED_KEYS:
         if key not in data:
             continue
-        value = _coerce(key, data[key], getattr(target, key, None))
-        if value is None and data[key] is not None:
-            continue  # invalid — keep the built-in default
+        current = getattr(target, key, None)
+        value = _coerce(key, data[key], current)
+        if value is None and current is not None:
+            # Either _coerce rejected the value, or the file holds an explicit
+            # null for a key that has no meaningful null (only the optional
+            # vision keys default to None, and those still accept one). Keep the
+            # built-in default rather than writing None into a typed field.
+            continue
         setattr(target, key, value)
         applied[key] = value
     return applied
