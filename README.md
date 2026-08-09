@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.2.0-informational)](releases/1/RELEASE_NOTES.md)
+[![Version](https://img.shields.io/badge/version-1.3.2-informational)](releases/1/RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -34,7 +34,7 @@ makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="snapshots/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="releases/1/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
 </p>
 
 <p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.1.0 — see <a href="media/README.md">media/README.md</a> for what has changed since.</sub></p>
@@ -127,7 +127,7 @@ and everything else behaves identically.
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="snapshots/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
+  <img src="releases/1/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
 </p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
@@ -153,7 +153,7 @@ editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat`, so they follow you across projects.
 
 <p align="center">
-  <img src="snapshots/snapshot2.png" alt="The /settings and /tools panels" width="880">
+  <img src="releases/1/snapshot2.png" alt="The /settings and /tools panels" width="880">
 </p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
@@ -322,6 +322,7 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/model [flash]` | Show or set the orchestrator model — `flash` is the only one the Responses API serves |
 | `/thinking [low\|high\|max\|off]` | Set reasoning effort, or turn thinking off |
 | `/verbose [low\|mid\|high]` | How much detail to print while working |
+| `/steps [n\|off\|default]` | Cap the tool steps one turn may take before it gives up (default 100; `off` for no cap, with progress printed every 10 steps) |
 
 </details>
 

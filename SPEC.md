@@ -2,8 +2,8 @@
 
 ## A Pure Python Powered by DeepSeek V4
 
-**Version**: 3.2 (Responses API — g023 Edition)
-**Compiled**: August 2026 · implementation 1.2
+**Version**: 3.3 (Responses API — g023 Edition)
+**Compiled**: August 2026 · implementation 1.3.2
 **Core Principle**: *Context is Currency. Subagents are the Treasury.*
 
 > **On the numbers in this document.** Anything stated as a measurement is
@@ -93,6 +93,34 @@ async def agentic_loop(user_prompt: str):
             state.items.append({"type": "function_call_output",
                                 "call_id": call["call_id"], "output": result})
 ```
+
+The real loop counts its own model calls rather than running a literal
+`while True`. It stops at `settings.max_iterations`, ending the turn with
+"Stopped after N tool iterations without a final answer" instead of an answer.
+The cap exists because a model that keeps calling tools has no other stopping
+condition — nothing in the protocol obliges it to ever answer. It is read at the
+start of every turn, so `/steps` applies to the next thing asked; it defaults to
+100 and persists to `config.json`.
+
+There is **no upper bound** on the setting, and `max_iterations = 0` (`/steps
+off`) removes the cap entirely: the loop counts up with `itertools.count` and
+ends only when the model answers, when the API errors, or on Ctrl-C. Only a
+negative or non-numeric value in the config file is ignored in favour of the
+default. Raising the cap raises the worst case a single runaway turn can bill,
+since each step is a round trip.
+
+What replaces the ceiling is visibility. Every step's spinner is labelled
+`step N/100` — or `step N` when uncapped — and every `ITERATION_NOTICE_EVERY`
+(10) steps the loop prints a line that stays in the scrollback:
+
+```
+  • step 140 · 6m 52s · 96 tool call(s) · $1.42 this turn  no step cap · Ctrl-C stops
+```
+
+That line is printed by the loop itself, not by the verbosity-gated activity
+trace, so it appears at `low` as well as `high`. An uncapped turn is therefore
+watched — count, clock and cost, while it is still running — rather than being
+bounded by a number the user cannot raise.
 
 ### 2.2 State Management — Items, Not Messages
 `/responses` does not take a message list. It takes `input`: a flat array of
@@ -658,6 +686,7 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 | `/model [flash]` | Show or set the orchestrator model. Flash is the only one `/responses` serves; `pro` is refused with DeepSeek's own reason (§3.1). | Local config. |
 | `/thinking [low\|high\|max\|off]` | Reasoning effort, or disable thinking. | Local config. |
 | `/verbose [low\|mid\|high]` | Trace / +outcomes & timing / +reasoning. | Local config. |
+| `/steps [n\|off\|default]` | Model calls one turn may spend before the loop gives up; any count, `off` for no cap, default 100 (§2.1). | Local config. |
 | `/compact [focus]` | Compress conversation history. | API call to Flash (summary). |
 | `/compact micro` | Layer-1 only: blank out stale tool results. | Local, free. |
 | `/compact auto on\|off` | Toggle auto-compaction at `compact_threshold`. | Local config. |
@@ -680,7 +709,8 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 | `/goal <objective>` | One turn at forced max reasoning effort. | Restores prior effort after. |
 
 Aliases: `/?` `/h` `/commands` → `/help`; `/reset` → `/clear`; `/quit` `/q` →
-`/exit`; `/effort` → `/thinking`; `/v` → `/verbose`; `/usage` → `/cost`;
+`/exit`; `/effort` → `/thinking`; `/v` → `/verbose`; `/iterations` `/maxsteps` →
+`/steps`; `/usage` → `/cost`;
 `/config` → `/settings`; `/permissions` `/perm` → `/tools`; `/dash` → `/status`;
 `/drift` → `/signals`; `/config_vision` → `/vision` (retained from 1.0).
 
