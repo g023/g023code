@@ -110,6 +110,14 @@ VERBOSE_LEVELS: tuple[str, ...] = ("low", "mid", "high")
 MIN_ITERATIONS = 1
 UNLIMITED_ITERATIONS = 0
 
+# Bounds on one reply's output budget, in tokens. The same reasoning as the step
+# cap applies, for the same reason: a ceiling the user cannot raise turns a long
+# answer into a sentence that stops mid-word. ``max_tokens = 0`` sends no
+# ``max_output_tokens`` at all, which leaves the ceiling to the model's own
+# maximum rather than to a number this client picked. That is the default.
+MIN_OUTPUT_TOKENS = 1
+UNLIMITED_OUTPUT_TOKENS = 0
+
 # How often the loop prints a progress line, in steps. Every step already updates
 # the spinner, but that line is transient; this one stays in the scrollback, at
 # any verbosity, so a turn that is 60 steps deep says so on its own.
@@ -126,7 +134,11 @@ class Settings:
 
     # API
     base_url: str = "https://api.deepseek.com"
-    max_tokens: int = 8192
+    # Per-reply output budget. 0 means the request omits ``max_output_tokens``
+    # entirely and the model's own maximum is the only ceiling — see
+    # UNLIMITED_OUTPUT_TOKENS. A positive value is sent as-is, however large —
+    # what happens to one the model cannot honour is the server's to decide.
+    max_tokens: int = UNLIMITED_OUTPUT_TOKENS
     temperature: float = 0.2
 
     # Web search is DeepSeek's server-side ``web_search`` tool, offered to the
@@ -143,7 +155,7 @@ class Settings:
     # gives up. Every step that returns tool calls costs another round trip, so
     # this is the backstop against a turn that tools forever without answering.
     # 0 removes the backstop entirely — see UNLIMITED_ITERATIONS.
-    max_iterations: int = 100
+    max_iterations: int = 255
 
     # Subagents / Tools
     max_search_matches: int = 12
@@ -218,6 +230,7 @@ PERSISTED_KEYS = (
     "show_context_bar",
     "permission_default",
     "max_iterations",
+    "max_tokens",
     "vision_backend",
     "vision_model",
     "vision_host",
@@ -246,6 +259,13 @@ def describe_steps(count: int) -> str:
     return "unlimited" if count == UNLIMITED_ITERATIONS else str(count)
 
 
+def describe_max_tokens(count: int) -> str:
+    """How an output budget reads to the user — one wording, used everywhere."""
+    if count == UNLIMITED_OUTPUT_TOKENS:
+        return "unlimited (model maximum)"
+    return f"{count:,}"
+
+
 def _coerce(key: str, value: Any, default: Any) -> Any:
     """
     Validate one persisted value, returning ``None`` to mean "ignore this key".
@@ -265,6 +285,15 @@ def _coerce(key: str, value: Any, default: Any) -> Any:
             return None
         value = int(value)
         return value if value >= UNLIMITED_ITERATIONS else None
+
+    if key == "max_tokens":
+        # Same shape as max_iterations: any non-negative budget is honoured, 0
+        # means "no client-side cap", and only a negative or non-numeric value
+        # is a broken config that keeps the built-in default.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = int(value)
+        return value if value >= UNLIMITED_OUTPUT_TOKENS else None
 
     allowed = _ALLOWED.get(key)
     if allowed is not None:

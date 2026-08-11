@@ -4,11 +4,13 @@ be turned off entirely.
 
 A turn ends when the model answers instead of calling tools. A model that never
 stops calling tools would otherwise loop forever, so the loop counts its own
-model calls and gives up at ``settings.max_iterations``. Four things are worth
+model calls and gives up at ``settings.max_iterations``. Five things are worth
 pinning: that a cap really spends that many calls and no more, that
 ``max_iterations = 0`` means no cap at all, that an uncapped run says where it
-is as it goes rather than running silently, and that a config file cannot put
-the cap somewhere the CLI would refuse to set it.
+is as it goes rather than running silently, that a config file cannot put the
+cap somewhere the CLI would refuse to set it, and that /goal — the one command
+whose point is "however many steps it takes" — lifts the cap for its own turn
+and puts the setting back afterwards.
 """
 
 from __future__ import annotations
@@ -189,8 +191,8 @@ def test_unlimited_reads_as_a_word_not_a_zero():
 # ---------------------------------------------------------------------------
 
 
-def test_default_is_one_hundred():
-    assert Settings().max_iterations == 100
+def test_default_is_two_hundred_and_fifty_five():
+    assert Settings().max_iterations == 255
 
 
 def test_the_cap_persists_to_config_json(isolated_project):
@@ -230,3 +232,63 @@ def test_any_non_negative_config_value_is_applied(isolated_project, good):
     load_config(target)
 
     assert target.max_iterations == good
+
+
+# ---------------------------------------------------------------------------
+# /goal
+# ---------------------------------------------------------------------------
+
+
+def make_cli():
+    from g023_code.cli import CLI
+
+    return CLI()
+
+
+@pytest.mark.asyncio
+async def test_goal_runs_its_turn_with_no_step_cap(monkeypatch):
+    """A goal is not allowed to end in 'Stopped after N tool iterations'."""
+    monkeypatch.setattr(config_module.settings, "max_iterations", 5)
+    cli = make_cli()
+
+    seen: list[int] = []
+
+    async def fake_run_prompt(text, title="g023"):
+        seen.append(config_module.settings.max_iterations)
+
+    monkeypatch.setattr(cli, "run_prompt", fake_run_prompt)
+    await cli.cmd_goal("ship the thing")
+
+    assert seen == [UNLIMITED_ITERATIONS]
+
+
+@pytest.mark.asyncio
+async def test_goal_restores_the_saved_cap_afterwards(monkeypatch):
+    """Lifting the cap is for the goal's turn only — /steps is not rewritten."""
+    monkeypatch.setattr(config_module.settings, "max_iterations", 5)
+    cli = make_cli()
+
+    async def boom(text, title="g023"):
+        raise RuntimeError("turn blew up")
+
+    monkeypatch.setattr(cli, "run_prompt", boom)
+    with pytest.raises(RuntimeError):
+        await cli.cmd_goal("ship the thing")
+
+    # Restored even when the turn raises, since a lost cap would silently
+    # outlive the goal and apply to every later turn.
+    assert config_module.settings.max_iterations == 5
+
+
+@pytest.mark.asyncio
+async def test_goal_with_no_objective_changes_nothing(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "max_iterations", 5)
+    cli = make_cli()
+
+    async def unreached(text, title="g023"):
+        raise AssertionError("no objective — nothing should run")
+
+    monkeypatch.setattr(cli, "run_prompt", unreached)
+    await cli.cmd_goal("")
+
+    assert config_module.settings.max_iterations == 5

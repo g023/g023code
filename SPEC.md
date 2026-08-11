@@ -100,7 +100,7 @@ The real loop counts its own model calls rather than running a literal
 The cap exists because a model that keeps calling tools has no other stopping
 condition — nothing in the protocol obliges it to ever answer. It is read at the
 start of every turn, so `/steps` applies to the next thing asked; it defaults to
-100 and persists to `config.json`.
+255 and persists to `config.json`.
 
 There is **no upper bound** on the setting, and `max_iterations = 0` (`/steps
 off`) removes the cap entirely: the loop counts up with `itertools.count` and
@@ -109,8 +109,13 @@ negative or non-numeric value in the config file is ignored in favour of the
 default. Raising the cap raises the worst case a single runaway turn can bill,
 since each step is a round trip.
 
+`/goal` is the one command that lifts the cap on its own account: for the
+duration of its turn `max_iterations` is set to `UNLIMITED_ITERATIONS` and the
+previous value is restored in a `finally`, so a goal runs until the model
+answers and the saved `/steps` setting is neither consulted nor rewritten.
+
 What replaces the ceiling is visibility. Every step's spinner is labelled
-`step N/100` — or `step N` when uncapped — and every `ITERATION_NOTICE_EVERY`
+`step N/255` — or `step N` when uncapped — and every `ITERATION_NOTICE_EVERY`
 (10) steps the loop prints a line that stays in the scrollback:
 
 ```
@@ -121,6 +126,34 @@ That line is printed by the loop itself, not by the verbosity-gated activity
 trace, so it appears at `low` as well as `high`. An uncapped turn is therefore
 watched — count, clock and cost, while it is still running — rather than being
 bounded by a number the user cannot raise.
+
+#### The output budget
+
+The other ceiling on a turn is how much one reply may say. `settings.max_tokens`
+is sent as the request's `max_output_tokens`, and it follows the same rule as the
+step cap for the same reason: **it defaults to unlimited**. At `max_tokens = 0`
+(`/max-tokens off`, the shipped default) `_request_body` omits the field
+entirely, which leaves the model's own maximum as the only ceiling — the field is
+omitted rather than sent as `0`, since `0` would ask for an empty reply. A
+positive value is passed through unchanged, however large; what the API does with
+a budget the model cannot honour is its call, not this client's.
+
+Earlier versions hard-coded 8,192, which is where "The reply hit the 8,192-token
+output limit and was cut off" came from — a number this client picked, not one
+the model imposed. Unlimited is not the same as infinite: the model still has a
+maximum, and a reply can still come back `incomplete`. When it does, the turn
+says so rather than presenting a sentence that stops mid-word, and names whichever
+limit applied — the configured budget, with `/max-tokens` offered to raise it, or
+the model's own when no budget was sent.
+
+The budget persists to `config.json`; a negative or non-numeric value there is
+ignored in favour of the default. It applies to the orchestrator's reply only.
+Subagents keep their own small budgets (§5.2, §5.3) — a file summary or a router
+plan is meant to be short, and every token it returns is spent in the
+orchestrator's context.
+
+`tests/test_output_limit.py` asserts the omission, the pass-through, both
+cut-off wordings, and the config round trip.
 
 ### 2.2 State Management — Items, Not Messages
 `/responses` does not take a message list. It takes `input`: a flat array of
@@ -686,7 +719,8 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 | `/model [flash]` | Show or set the orchestrator model. Flash is the only one `/responses` serves; `pro` is refused with DeepSeek's own reason (§3.1). | Local config. |
 | `/thinking [low\|high\|max\|off]` | Reasoning effort, or disable thinking. | Local config. |
 | `/verbose [low\|mid\|high]` | Trace / +outcomes & timing / +reasoning. | Local config. |
-| `/steps [n\|off\|default]` | Model calls one turn may spend before the loop gives up; any count, `off` for no cap, default 100 (§2.1). | Local config. |
+| `/steps [n\|off\|default]` | Model calls one turn may spend before the loop gives up; any count, `off` for no cap, default 255 (§2.1). | Local config. |
+| `/max-tokens [n\|off\|default]` | Output budget for one reply; any count, `off` (the default) sends no budget so the model's own maximum applies (§2.1). | Local config. |
 | `/compact [focus]` | Compress conversation history. | API call to Flash (summary). |
 | `/compact micro` | Layer-1 only: blank out stale tool results. | Local, free. |
 | `/compact auto on\|off` | Toggle auto-compaction at `compact_threshold`. | Local config. |
@@ -706,7 +740,7 @@ in advance — `/vision` and `/vision qwen3.5:2b` are both first-class.
 | `/ollama ps` | What the daemon holds in VRAM. | Network. |
 | `/vision` | Picker of installed vision models. | Persisted; hides/shows `AnalyzeImage`. |
 | `/vision <model>\|off\|status` | Direct enable / disable / inspect. | Persisted. |
-| `/goal <objective>` | One turn at forced max reasoning effort. | Restores prior effort after. |
+| `/goal <objective>` | One turn at forced max reasoning effort and no step cap (§2.1). | Restores prior effort and step cap after. |
 
 Aliases: `/?` `/h` `/commands` → `/help`; `/reset` → `/clear`; `/quit` `/q` →
 `/exit`; `/effort` → `/thinking`; `/v` → `/verbose`; `/iterations` `/maxsteps` →

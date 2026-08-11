@@ -13,7 +13,8 @@
   "show_tool_timing": true,
   "show_context_bar": true,
   "permission_default": "ask",
-  "max_iterations": 100,
+  "max_iterations": 255,
+  "max_tokens": 0,
   "vision_num_ctx": 4096,
   "vision_keep_alive": "5m"
 }

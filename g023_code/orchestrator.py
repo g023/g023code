@@ -41,7 +41,12 @@ from .api import (
     unknown_item_types,
 )
 from .cache import get_cache
-from .config import ITERATION_NOTICE_EVERY, get_project_root, settings
+from .config import (
+    ITERATION_NOTICE_EVERY,
+    UNLIMITED_OUTPUT_TOKENS,
+    get_project_root,
+    settings,
+)
 from .signals import get_signals
 from .tools.registry import get_registry
 from .subagents.router import get_router
@@ -362,15 +367,20 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _request_body(self) -> Dict[str, Any]:
-        return {
+        body = {
             "model": settings.orchestrator_model,
             "instructions": self._system,
             "input": list(self.state.items),
             "tools": self.registry.get_schemas(),
-            "max_output_tokens": settings.max_tokens,
             "temperature": settings.temperature,
             "reasoning": reasoning_param(),
         }
+        # Omitted rather than sent as 0 when the budget is unlimited: the field
+        # is optional, and leaving it out is what hands the ceiling back to the
+        # model's own maximum. Sending 0 would ask for an empty reply.
+        if settings.max_tokens != UNLIMITED_OUTPUT_TOKENS:
+            body["max_output_tokens"] = settings.max_tokens
+        return body
 
     async def _call_blocking(self, body: Dict[str, Any], label: str) -> Reply:
         """Non-streaming call, with a spinner that counts the seconds."""
@@ -629,11 +639,22 @@ class Orchestrator:
 
             if reply.incomplete_reason == "max_output_tokens":
                 # Say so rather than presenting a sentence that stops mid-word
-                # as if it were the whole answer.
-                console.print(
-                    f"[warn]The reply hit the {settings.max_tokens:,}-token output "
-                    "limit and was cut off.[/warn]"
-                )
+                # as if it were the whole answer. Which limit was hit depends on
+                # who set it: with no budget configured we never sent one, so the
+                # ceiling is the model's own and /max-tokens cannot raise it.
+                if settings.max_tokens == UNLIMITED_OUTPUT_TOKENS:
+                    console.print(
+                        "[warn]The reply hit the model's own output limit and was "
+                        "cut off.[/warn] [muted]No budget was sent with the request; "
+                        "ask for the rest, or for the work in smaller pieces.[/muted]"
+                    )
+                else:
+                    console.print(
+                        f"[warn]The reply hit the {settings.max_tokens:,}-token output "
+                        "limit and was cut off.[/warn] [muted]Raise it with "
+                        "/max-tokens, or /max-tokens off for the model maximum."
+                        "[/muted]"
+                    )
 
             # The model can finish a turn having only narrated. That narration is
             # all it said, so present it rather than an empty panel.

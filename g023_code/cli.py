@@ -26,10 +26,13 @@ from .config import (
     AVAILABLE_MODELS,
     ITERATION_NOTICE_EVERY,
     MIN_ITERATIONS,
+    MIN_OUTPUT_TOKENS,
     PERSISTED_KEYS,
     Settings,
     UNAVAILABLE_MODELS,
     UNLIMITED_ITERATIONS,
+    UNLIMITED_OUTPUT_TOKENS,
+    describe_max_tokens,
     describe_steps,
     get_config_file,
     get_home,
@@ -426,6 +429,59 @@ class CLI:
             f"[muted]{Glyph.DOT} every step is a billed model call ·saved[/muted]"
         )
 
+    def cmd_max_tokens(self, arg: str = "") -> None:
+        value = arg.strip().lower()
+
+        if not value:
+            console.print(
+                f"[key]Output budget[/key] {Glyph.ARROW} "
+                f"{describe_max_tokens(settings.max_tokens)}  "
+                f"[muted]{Glyph.DOT} per reply "
+                f"(/max-tokens <n> to cap it, /max-tokens off for the model "
+                f"maximum, /max-tokens default to restore the shipped setting)"
+                f"[/muted]"
+            )
+            return
+
+        if value in ("default", "reset"):
+            count = Settings.max_tokens
+        elif value in ("off", "none", "unlimited", "no", "infinite", "max"):
+            count = UNLIMITED_OUTPUT_TOKENS
+        else:
+            try:
+                count = int(value.replace(",", "").replace("_", ""))
+            except ValueError:
+                console.print(
+                    f"[warn]Not a number:[/warn] {escape(arg.strip())}  "
+                    f"[muted](a token budget, 'off', or 'default')[/muted]"
+                )
+                return
+
+        # No upper bound here — a budget larger than the model can honour is the
+        # server's to clamp or refuse, and either way it says so. Only a negative
+        # budget is meaningless, and 0 already means "no cap".
+        if count < UNLIMITED_OUTPUT_TOKENS:
+            console.print(
+                f"[warn]Not a token budget:[/warn] {count}  "
+                f"[muted](use {MIN_OUTPUT_TOKENS} or more, or 'off' for no cap)"
+                f"[/muted]"
+            )
+            return
+
+        settings.max_tokens = count
+        save_config()
+        if count == UNLIMITED_OUTPUT_TOKENS:
+            console.print(
+                f"[ok]{Glyph.CHECK} Output budget {Glyph.ARROW} unlimited[/ok] "
+                f"[muted]{Glyph.DOT} requests no longer send max_output_tokens, so "
+                f"a reply runs to the model's own maximum ·saved[/muted]"
+            )
+            return
+        console.print(
+            f"[ok]{Glyph.CHECK} Output budget {Glyph.ARROW} {count:,}[/ok] "
+            f"[muted]{Glyph.DOT} replies longer than this are cut off ·saved[/muted]"
+        )
+
     # ------------------------------------------------------------------
     # Context commands
     # ------------------------------------------------------------------
@@ -635,7 +691,11 @@ class CLI:
         row("stream", settings.stream, "answers render as they are written")
         row("show_tool_timing", settings.show_tool_timing)
         row("show_context_bar", settings.show_context_bar)
-        row("max_tokens", f"{settings.max_tokens:,}", "per response")
+        row(
+            "max_tokens",
+            describe_max_tokens(settings.max_tokens),
+            "output per response · /max-tokens",
+        )
         row("temperature", settings.temperature)
         row("max_context_tokens", f"{settings.max_context_tokens:,}")
         row("compact_threshold", f"{settings.compact_threshold:.0%}", "auto-compact trigger")
@@ -1330,10 +1390,19 @@ class CLI:
 
         previous = settings.reasoning_effort
         previous_enabled = settings.thinking_enabled
+        # A goal is the one command whose whole point is "however many steps it
+        # takes". The step cap is the backstop against a turn that tools forever
+        # without answering; here it is the thing that would cut the job short,
+        # so the turn runs uncapped and the loop's progress line plus Ctrl-C are
+        # what keep it watched. The saved /steps setting is untouched — this is
+        # for the duration of this turn only, and is not written to config.
+        previous_iterations = settings.max_iterations
         settings.reasoning_effort = "max"  # type: ignore[assignment]
         settings.thinking_enabled = True
+        settings.max_iterations = UNLIMITED_ITERATIONS
         console.print(
-            f"[accent]Goal[/accent] [muted]{Glyph.DOT} max reasoning effort for this turn[/muted]\n{arg}"
+            f"[accent]Goal[/accent] [muted]{Glyph.DOT} max reasoning effort, "
+            f"no step limit for this turn[/muted]\n{arg}"
         )
         try:
             await self.run_prompt(
@@ -1343,6 +1412,7 @@ class CLI:
         finally:
             settings.reasoning_effort = previous  # type: ignore[assignment]
             settings.thinking_enabled = previous_enabled
+            settings.max_iterations = previous_iterations
 
     # ------------------------------------------------------------------
     # Turn execution

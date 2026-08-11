@@ -17,7 +17,12 @@ import difflib
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .config import ITERATION_NOTICE_EVERY, MIN_ITERATIONS, Settings
+from .config import (
+    ITERATION_NOTICE_EVERY,
+    MIN_ITERATIONS,
+    MIN_OUTPUT_TOKENS,
+    Settings,
+)
 
 # The help text quotes the default rather than restating it, so the two cannot
 # drift apart.
@@ -138,7 +143,8 @@ COMMANDS: tuple[Command, ...] = (
         args=(Argument("effort", EFFORT_CHOICES, "higher effort spends more output tokens"),),
         detail=(
             "Reasoning tokens are billed as output, so effort is a cost dial as much as\n"
-            "a quality one. /goal temporarily forces max regardless of this setting."
+            "a quality one. /goal temporarily forces max regardless of this setting,\n"
+            "and also runs its turn with no step cap."
         ),
         examples=("/thinking", "/thinking max", "/thinking off"),
     ),
@@ -180,9 +186,44 @@ COMMANDS: tuple[Command, ...] = (
             "Ctrl-C ends it.\n\n"
             f"Default {DEFAULT_MAX_ITERATIONS}. Raising it raises what a single runaway\n"
             "turn can cost, since every step is a billed round trip. With no argument,\n"
-            "prints the current cap. Saved to config.json."
+            "prints the current cap. Saved to config.json.\n\n"
+            "/goal ignores this cap for its own turn and restores it afterwards."
         ),
-        examples=("/steps", "/steps 250", "/steps off", "/steps default"),
+        examples=("/steps", "/steps 400", "/steps off", "/steps default"),
+    ),
+    Command(
+        name="/max-tokens",
+        aliases=("/maxtokens", "/output"),
+        summary="Cap how long one reply may be",
+        handler="cmd_max_tokens",
+        group="Model",
+        args=(
+            Argument("count", (), f"{MIN_OUTPUT_TOKENS} or more, 'off', or 'default'"),
+        ),
+        detail=(
+            "The output budget for a single orchestrator reply, in tokens. Reasoning\n"
+            "is billed out of the same budget as the answer, so a small cap at high\n"
+            "effort can end a reply before any of it is written.\n\n"
+            "'off' — the default — sends no budget at all, leaving the model's own\n"
+            "maximum as the only ceiling. That is not the same as infinite output:\n"
+            "the model still has a maximum, and a reply can still be cut off by it.\n"
+            "When that happens the turn says so instead of presenting a sentence\n"
+            "that stops mid-word.\n\n"
+            "There is no upper bound on what this accepts: the number is passed to\n"
+            "the API as given, and what the API does with a budget larger than the\n"
+            "model can honour — clamp it or reject the request — is its call, not\n"
+            "this client's. With no argument, prints the current budget. Saved to\n"
+            "config.json.\n\n"
+            "This is the orchestrator's reply only. Subagents keep their own small\n"
+            "budgets — a file summary or a router plan is meant to be short, and\n"
+            "returning it to the orchestrator costs context."
+        ),
+        examples=(
+            "/max-tokens",
+            "/max-tokens 32000",
+            "/max-tokens off",
+            "/max-tokens default",
+        ),
     ),
     # -- Context ----------------------------------------------------------
     Command(
@@ -364,14 +405,16 @@ COMMANDS: tuple[Command, ...] = (
     # -- Work -------------------------------------------------------------
     Command(
         name="/goal",
-        summary="State a high-level objective; runs at max reasoning effort",
+        summary="State a high-level objective; max effort, no step limit",
         handler="cmd_goal",
         group="Work",
         args=(Argument("objective", (), "what you want achieved", required=True),),
         detail=(
-            "Runs one turn with reasoning effort forced to max and a prompt that asks\n"
-            "the model to break the objective into steps and use tools freely. Your\n"
-            "usual /thinking setting is restored afterwards."
+            "Runs one turn with reasoning effort forced to max, the per-turn step cap\n"
+            "lifted, and a prompt that asks the model to break the objective into steps\n"
+            "and use tools freely. A goal runs until the model answers rather than\n"
+            "stopping at /steps; progress prints as it goes and Ctrl-C ends it. Your\n"
+            "usual /thinking and /steps settings are restored afterwards."
         ),
         examples=("/goal add retry-with-backoff to every outbound HTTP call",),
     ),
