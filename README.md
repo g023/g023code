@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.2-informational)](releases/1/RELEASE_NOTES.md)
+[![Version](https://img.shields.io/badge/version-1.3.2-informational)](../RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -34,10 +34,10 @@ makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="releases/1/snapshot.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="docs/startup.png" alt="The g023 Code startup banner: version, project root, program home, model and thinking level, vision backend and a live Ollama reachability probe" width="880">
 </p>
 
-<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.1.0 — see <a href="media/README.md">media/README.md</a> for what has changed since.</sub></p>
+<p align="center"><sub>The banner on launch — version, project root, program home, model and thinking level, and the vision backend with a live reachability probe of the Ollama daemon. Every screenshot in this README is a real terminal from a real 1.3.2 session; <a href="docs/README.md">docs/README.md</a> is the full index and explains how they were captured.</sub></p>
 
 ## Table of contents
 
@@ -56,6 +56,7 @@ than a search provider bolted on the side.
 - [Tests](#tests)
 - [Extending](#extending)
 - [License](#license)
+- [Screenshot index](docs/README.md)
 
 ## Quick start
 
@@ -127,8 +128,10 @@ and everything else behaves identically.
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="releases/1/snapshot3.png" alt="A finished answer, the context and cost bar, and the /cost dashboard" width="880">
+  <img src="docs/session.png" alt="One read-only question answered: a tool trace of list, search and two reads with timings, the boxed answer, and the per-turn accounting line" width="880">
 </p>
+
+<p align="center"><sub>One question, end to end. Each tool call prints its result line and duration (<code>list .</code> → 2 entries, <code>search "api"</code> → 8 matches in 3 files, two <code>read</code>s), then the answer, then the accounting: <code>3 iteration(s) · 4 tool call(s) · slowest ReadFile 5 ms · model 5.5 s / tools 11 ms</code> over <code>4,299/900,000 (0%) · cache 79% · turn $0.00044</code>.</sub></p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
 sent. The status line after every turn carries the numbers that only mean
@@ -140,7 +143,27 @@ prefix so more tokens fall on the cheaper side.
 
 Costs shown are computed locally from the token counts the API returns and the
 price table in [`SPEC.md` §3.2](SPEC.md). They are an estimate of your bill, not
-a reading of it.
+a reading of it — `/cost` prints the price line it used so the arithmetic is
+checkable, and splits cache hit from cache miss because they are priced an order
+of magnitude apart.
+
+<p align="center">
+  <img src="docs/cost.png" alt="The /cost dashboard: tokens and spend split into cache-hit and cache-miss columns, with the price line printed underneath" width="880">
+</p>
+
+Nothing that writes, runs a command, or leaves your machine happens without a
+prompt. The prompt shows the path and an excerpt of the exact content, and takes
+`y` (once), `a` (always for this tool this session) or `n`:
+
+<p align="center">
+  <img src="docs/permission.png" alt="WriteFile stopping for permission, showing the target path and an excerpt of the content to be written" width="880">
+</p>
+
+<p align="center">
+  <img src="docs/write.png" alt="The same turn after approving: wrote 197 B in 7 ms, followed by the answer" width="880">
+</p>
+
+<p align="center"><sub>The trace above the prompt also shows the escalation path in use: <code>read app/schemas.py</code> returns a summary (25 lines, 3 classes), then <code>read app/schemas.py:1-8</code> fetches that head verbatim.</sub></p>
 
 Anything you type that does not start with `/` is a prompt. Everything else is
 a slash command.
@@ -153,13 +176,25 @@ editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat`, so they follow you across projects.
 
 <p align="center">
-  <img src="releases/1/snapshot2.png" alt="The /settings and /tools panels" width="880">
+  <img src="docs/settings.png" alt="The /settings panel: every setting with its live value, with the persistent ones marked ·saved" width="880">
 </p>
+
+<p align="center">
+  <img src="docs/tools.png" alt="The /tools panel: all eight tools, their current permission, and which run in an isolated subagent context" width="880">
+</p>
+
+<p align="center"><sub><code>/tools</code> also marks which tools run in an isolated subagent context rather than in the orchestrator's — that column is the delegation policy, visible.</sub></p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
 on at **high** effort, verbosity **low**, auto-compaction **on** at 85% of the
-window, acting tools set to **ask**, and **vision disabled**. Nothing that
-writes, runs, or leaves your machine happens without a prompt.
+window, acting tools set to **ask**, and **vision disabled**.
+
+`/status` puts the whole session on one screen when you want the summary rather
+than the knobs:
+
+<p align="center">
+  <img src="docs/status.png" alt="The /status dashboard: model, session counters, vision, project, cache size, context and spend on one screen" width="880">
+</p>
 
 ## Architecture
 
@@ -278,7 +313,11 @@ quietly — `output_text` returns `""`, the model looks silent, and nothing
 raises. Silent degradation, not a crash, is the realistic worst case here.
 
 `/signals` (alias `/drift`) shows the three cheapest observations that would move
-first:
+first — what the loop noticed but nobody raised an error about:
+
+<p align="center">
+  <img src="docs/signals.png" alt="The /signals panel: prefix cache hit-rate drift, unrecognised response item types, and unexplained empty responses" width="880">
+</p>
 
 | Signal | What it catches | What it cannot tell you |
 |---|---|---|
@@ -300,7 +339,12 @@ separate the causes.
 
 Commands that take a fixed set of options **open a picker when typed bare**, so
 `/vision` is as usable as `/vision qwen3.5:2b` — there is nothing to memorise.
-`/help <command>` explains any one of them in full.
+`/help <command>` explains any one of them in full, and bare `/help` puts the
+whole command surface on one screen, grouped by what it touches:
+
+<p align="center">
+  <img src="docs/help.png" alt="The /help panel: every slash command on one screen, grouped by what it touches" width="880">
+</p>
 
 <details open>
 <summary><b>Session</b></summary>
@@ -353,6 +397,10 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 </details>
 
+<p align="center">
+  <img src="docs/cache.png" alt="The /cache panel: entry counts for each local SQLite cache, plus the database's size and path" width="880">
+</p>
+
 <details>
 <summary><b>Vision</b></summary>
 
@@ -389,11 +437,45 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `high` | ↑ plus the orchestrator's reasoning excerpts and per-iteration token counts |
 
 `/context` answers the question `/cost` cannot: *what* is filling the window.
+It breaks the history down by role and size, and the hint under the table names
+the cheapest fix:
+
+<p align="center">
+  <img src="docs/context.png" alt="The /context breakdown: tool results are 76% of a ~1,752-token history, with a hint naming the cheapest fix" width="880">
+</p>
+
 If tool results dominate, `/compact micro` clears the stale ones for free; if
 it is real conversation, `/compact` summarises it with the cheap model in an
 isolated context. The command tells you which of the two applies. Compaction
 also runs automatically once the context passes `compact_threshold` (85%) —
 turn that off with `/compact auto off`.
+
+The four frames below are one continuous run — three read-heavy turns, then
+`/context`, `/compact micro`, `/compact`, `/context`:
+
+<p align="center">
+  <img src="docs/compact-before.png" alt="Before compacting: 33 items, about 3,922 tokens, tool results 46% of it" width="880">
+</p>
+
+<p align="center"><sub><b>Before</b> — 33 items, ~3,922 tokens, tool results 46% of it.</sub></p>
+
+<p align="center">
+  <img src="docs/compact-micro.png" alt="/compact micro clearing old tool results: about 949 tokens reclaimed at no API cost" width="880">
+</p>
+
+<p align="center"><sub><b><code>/compact micro</code></b> — <code>cleared old tool results (~949 tokens, no API cost)</code>. This layer is local string surgery, so the session cost on the status bar does not move.</sub></p>
+
+<p align="center">
+  <img src="docs/compact-summary.png" alt="/compact summarising 33 items down to 2, reclaiming about 1,448 tokens for a summary cost of $0.00086" width="880">
+</p>
+
+<p align="center"><sub><b><code>/compact</code></b> — <code>Compacted 33 items → 2 (~1,448 tokens reclaimed · summary cost $0.00086)</code>. The summarising layer pays the cheap model and reports both sides of the trade.</sub></p>
+
+<p align="center">
+  <img src="docs/compact-after.png" alt="/context after compaction: two items totalling about 1,348 tokens" width="880">
+</p>
+
+<p align="center"><sub><b>After</b> — two items, ~1,348 tokens: one user item holding the summary, plus one assistant acknowledgement.</sub></p>
 
 Every API call — orchestrator *and* subagents — reports its token usage to a
 single tracker, so `/cost` and `/settings` show the cache-hit / cache-miss /
@@ -456,6 +538,10 @@ enable it once and the choice persists.
 /vision status       # show the current setting
 ```
 
+<p align="center">
+  <img src="docs/vision.png" alt="/vision with no argument, opening a numbered picker of the vision models the daemon actually reports" width="880">
+</p>
+
 - Only models Ollama reports as `vision`-capable are listed (if none are, every
   model is listed so you can force a choice). Sizes are shown so you can stay
   inside your VRAM budget — on a 12 GB GPU anything up to ~8 GB is comfortable.
@@ -497,6 +583,10 @@ Three commands make a remote setup diagnosable rather than a guessing game:
 | `/ollama` | Is anything listening, what version, how far away (latency), how many models |
 | `/ollama models` | What that machine actually has — names, sizes, quantisation, vision capability |
 | `/ollama test` | A real inference round-trip: g023 sends a generated image and checks the answer. This proves the whole path — encoding, transport, and the model genuinely being image-capable — rather than just that the port is open. |
+
+<p align="center">
+  <img src="docs/ollama.png" alt="The /ollama panel: which daemon vision is pointed at, whether it answers, its version and latency" width="880">
+</p>
 
 > [!WARNING]
 > For a remote daemon to accept connections it must be bound to the network
