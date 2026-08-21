@@ -227,3 +227,46 @@ async def test_api_failure_falls_back_locally_and_says_so(isolated_project):
 async def test_missing_file_is_an_error_not_an_empty_summary(isolated_project):
     result = json.loads(await run_file_reader(path=str(isolated_project / "nope.py")))
     assert "error" in result
+
+
+async def test_raw_read_returns_the_entire_file_verbatim(isolated_project):
+    body = "def one():\n    return 1\n\n\n# a comment\nclass Two:\n    pass\n"
+    path = isolated_project / "raw.txt"
+    path.write_text(body, encoding="utf-8")
+
+    result = json.loads(await run_file_reader(path=str(path), raw=True))
+
+    assert result["mode"] == "raw_full"
+    assert result["verbatim"] is True
+    assert result["content"] == body
+    assert result["total_lines"] == body.count("\n") + 1
+    assert result["bytes"] == len(body)
+
+
+async def test_raw_read_too_large_is_refused_with_a_ranges_hint(isolated_project):
+    from g023_code.subagents.file_reader import FULL_READ_MAX_CHARS
+
+    path = isolated_project / "huge.txt"
+    path.write_text("x" * (FULL_READ_MAX_CHARS + 1), encoding="utf-8")
+
+    result = json.loads(await run_file_reader(path=str(path), raw=True))
+
+    assert result["mode"] == "raw_full"
+    assert result["verbatim"] is False
+    assert "error" in result
+    assert "start_line" in result["error"]
+
+
+async def test_range_reads_are_unchanged_by_raw_mode(isolated_project):
+    body = "a\nb\nc\nd\ne\n"
+    path = isolated_project / "range.txt"
+    path.write_text(body, encoding="utf-8")
+
+    # raw=true with an explicit range must still honour the range, not dump
+    # the whole file — that combination is a range read, not a full read.
+    result = json.loads(await run_file_reader(path=str(path), raw=True, start_line=2, end_line=4))
+
+    assert result["verbatim"] is True
+    assert result["content"] == "b\nc\nd"
+    assert result["start_line"] == 2
+    assert result["end_line"] == 4

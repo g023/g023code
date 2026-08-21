@@ -72,7 +72,10 @@ LEVEL_CHOICES = ("low", "mid", "high")
 EFFORT_CHOICES = ("low", "high", "max", "off")
 MODEL_CHOICES = ("flash",)
 PERMISSION_CHOICES = ("allow", "ask", "block")
-BACKEND_CHOICES = ("none", "ollama", "glm", "openai", "local")
+BACKEND_CHOICES = ("none", "ollama", "deepseek", "openrouter")
+ENDPOINT_CHOICES = ("responses", "chat_completions")
+OR_TIER_CHOICES = ("free", "credits")
+SURGE_SUB_CHOICES = ("status", "on", "off", "buffer", "notify", "now")
 
 
 COMMANDS: tuple[Command, ...] = (
@@ -282,7 +285,6 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command(
         name="/settings",
-        aliases=("/config",),
         summary="Show every setting; save or reset the persisted ones",
         handler="cmd_settings",
         group="Context",
@@ -390,17 +392,105 @@ COMMANDS: tuple[Command, ...] = (
             Argument("value", BACKEND_CHOICES, "for 'backend'"),
         ),
         detail=(
-            "DeepSeek V4 is text-only, so images go to a local vision model over Ollama.\n"
-            "Vision is off by default, and while it is off the AnalyzeImage tool is not\n"
-            "even offered to the orchestrator.\n\n"
-            "/vision                  interactive picker of installed vision models\n"
+            "Images go to a vision backend — DeepSeek's own multimodal model,\n"
+            "an OpenRouter model, or a local Ollama daemon. Vision is off by\n"
+            "default, and while it is off the AnalyzeImage tool is not even\n"
+            "offered to the orchestrator.\n\n"
+            "/vision                  pick a model for the active backend\n"
             "/vision <model>          enable a specific model directly\n"
             "/vision off              disable\n"
             "/vision status           show the current setting\n"
-            "/vision backend <name>   switch backend (only 'ollama' is implemented)\n\n"
-            "Use /ollama host to choose which daemon serves it."
+            "/vision backend <name>   none | ollama | deepseek | openrouter\n"
+            "/vision endpoint <name>  deepseek only: responses | chat_completions\n\n"
+            "deepseek  — deepseek-v4-flash-vision-exp on the K.dat key (default).\n"
+            "openrouter — OK.dat key; models from ./OR_VISION.json, rotated on\n"
+            "            rate limits. Default model google/gemma-4-26b-a4b-it:free.\n"
+            "ollama    — a local/remote daemon; /ollama host points at it."
         ),
-        examples=("/vision", "/vision qwen2.5vl:7b", "/vision off"),
+        examples=(
+            "/vision",
+            "/vision backend deepseek",
+            "/vision backend openrouter",
+            "/vision endpoint chat_completions",
+            "/vision off",
+        ),
+    ),
+    Command(
+        name="/surge",
+        summary="DeepSeek surge pricing — status, notify, auto-pause around peak",
+        handler="cmd_surge",
+        group="Vision",
+        args=(
+            Argument("status|on|off|buffer|notify", SURGE_SUB_CHOICES, "see /help surge"),
+            Argument("value", (), "minutes for 'buffer', on|off for 'notify'"),
+        ),
+        detail=(
+            "DeepSeek bills peak/off-peak: peak hours are 09:00-12:00 and\n"
+            "14:00-18:00 Beijing time (UTC+8) — converted to your local clock\n"
+            "here (AM/PM and 24-hour) — and off-peak prices are half of peak.\n"
+            "Status shows the countdown to the next surge and how long it lasts.\n\n"
+            "/surge                 status: state, local windows, countdown +\n"
+            "                       duration, reg vs surge prices\n"
+            "/surge notify on|off   show a banner when surge pricing starts/ends\n"
+            "/surge on              pause usage from 5 min before peak until 5 min\n"
+            "                       after it ends, then resume automatically\n"
+            "/surge buffer <min>    widen the pause by N minutes each side\n\n"
+            "While paused the CLI waits out the window instead of reading input,"
+            "\nso no requests are sent at double price. Ctrl-C always works."
+        ),
+        examples=("/surge", "/surge on", "/surge buffer 10", "/surge notify off"),
+    ),
+    Command(
+        name="/or",
+        summary="OpenRouter vision — key, models, rate-limit tier, usage",
+        handler="cmd_or",
+        group="Vision",
+        interactive=True,
+        args=(
+            Argument("status|model|models|tier|usage", ("status", "model", "models", "tier", "usage"), "subcommand"),
+            Argument("value", OR_TIER_CHOICES, "for 'tier': free | credits"),
+        ),
+        detail=(
+            "OpenRouter vision uses the OK.dat key. Models come from\n"
+            "./OR_VISION.json (project folder) in priority order; on a rate\n"
+            "limit the next model on the list is tried. Without the file the\n"
+            "default google/gemma-4-26b-a4b-it:free is used.\n\n"
+            "/or status             key, tier, models, today's usage\n"
+            "/or model <name>       set the vision model (or 'default')\n"
+            "/or models             reload the list from OR_VISION.json\n"
+            "/or tier free|credits  rate-limit ceiling: free = 50/24h,\n"
+            "                       credits ($10+ bought) = 1000/24h\n"
+            "/or usage              show today's request count vs the ceiling\n\n"
+            "Free :free models are capped per account; buying $10+ credits\n"
+            "lifetime raises the daily ceiling from 50 to 1000 requests."
+        ),
+        examples=("/or", "/or status", "/or model google/gemma-4-26b-a4b-it:free", "/or tier credits"),
+    ),
+    Command(
+        name="/config",
+        aliases=("/cfg",),
+        summary="Per-project vs global config, and set current settings as global default",
+        handler="cmd_config",
+        group="Session",
+        interactive=True,
+        args=(
+            Argument("status|save|global|project|clear", ("status", "save", "global", "project", "clear"), "subcommand"),
+        ),
+        detail=(
+            "Settings live in two files: the machine-level config.json next to\n"
+            "K.dat (applies to every project) and, if present, the project's\n"
+            "own .g023/config.json (overrides the machine file for this project).\n\n"
+            "/config              show both files and which one is active\n"
+            "/config save         write current settings to the active scope\n"
+            "/config save global  write them to the machine-level config.json\n"
+            "/config global       set current settings as the global default\n"
+            "                     (same as 'save global' — new projects inherit)\n"
+            "/config save project pin them to this project only\n"
+            "/config clear        drop this project's override; global applies\n\n"
+            "So you can tune settings inside a project, then promote the result\n"
+            "to the global default for every future project."
+        ),
+        examples=("/config", "/config global", "/config save project", "/config clear"),
     ),
     # -- Work -------------------------------------------------------------
     Command(

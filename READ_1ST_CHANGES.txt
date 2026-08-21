@@ -1,0 +1,38 @@
+# READ 1ST — doc keep-alive map
+# Edit code -> refresh the listed docs in the same change. Paths only, no prose.
+# Every docs/*.md page has a "Related" section with back-links.
+
+g023_code/cli.py                 -> docs/cli.md
+g023_code/commands.py            -> docs/commands.md
+g023_code/orchestrator.py        -> docs/orchestrator.md, docs/overview.md
+g023_code/api.py                 -> docs/api.md
+g023_code/config.py              -> docs/config.md, docs/overview.md
+g023_code/cache.py               -> docs/cache.md
+g023_code/usage.py               -> docs/usage.md
+g023_code/signals.py             -> docs/signals.md
+g023_code/surge.py               -> docs/surge.md
+g023_code/ui.py                  -> docs/ui.md
+g023_code/web_fetch.py           -> docs/web_fetch.md
+g023_code/prompt.py              -> docs/prompt.md
+g023_code/ollama_client.py       -> docs/ollama_client.md
+g023_code/openrouter_client.py   -> docs/openrouter_client.md
+g023_code/tools/                 -> docs/tools.md
+g023_code/subagents/             -> docs/subagents.md, docs/overview.md
+g023_code/__main__.py, __init__.py -> docs/entrypoints.md
+g023.sh, g023.bat                -> docs/entrypoints.md
+installer.sh, installer.bat      -> docs/installers.md
+requirements.txt                 -> docs/installers.md
+tests/                           -> docs/tests.md
+K.dat, K.dat.example, OK.dat     -> docs/data_files.md, docs/config.md
+config.json                      -> docs/data_files.md, docs/config.md
+OR_VISION.json                   -> docs/data_files.md, docs/openrouter_client.md
+ds_pricing.json                  -> docs/usage.md
+ds_times.json                    -> docs/surge.md, docs/config.md
+
+# Cross-cutting triggers:
+#  - new/changed tool schema   -> docs/tools.md + docs/orchestrator.md + docs/subagents.md
+#  - new slash command         -> docs/commands.md + docs/cli.md
+#  - new Settings key          -> docs/config.md (+ docs/data_files.md if persisted)
+#  - new module                -> docs/overview.md + new docs/<name>.md + add to docs/README.md
+#  - responses wire shape      -> docs/api.md + docs/orchestrator.md + docs/signals.md
+#  - pricing/times numbers     -> ds_*.json only (code falls back; tests pin relationships)

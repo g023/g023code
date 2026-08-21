@@ -25,10 +25,11 @@ TOOL_SCHEMAS = [
         "name": "ReadFile",
         "description": (
             "Read a file and return a compact structural summary + metadata. "
-            "NEVER returns raw full content unless raw=true is explicitly requested. "
-            "Pass start_line/end_line to get the exact source of a known range "
-            "verbatim instead of a summary — use that rather than shelling out to sed. "
-            "Prefer this over dumping entire files into context."
+            "The summary is NOT the file: it omits code bodies, so never rewrite "
+            "a file from it. Set raw=true to get the FULL file verbatim (capped) "
+            "when you need exact bytes — e.g. immediately before a WriteFile edit. "
+            "Pass start_line/end_line to get a specific range verbatim instead of "
+            "a summary. Prefer summaries and ranges over full dumps: context is expensive."
         ),
         "parameters": {
             "type": "object",
@@ -39,7 +40,11 @@ TOOL_SCHEMAS = [
                 },
                 "raw": {
                     "type": "boolean",
-                    "description": "If true, also include a truncated raw excerpt (use sparingly)",
+                    "description": (
+                        "Return the FULL file verbatim, capped at 200,000 chars. "
+                        "Use only when exact content is required — e.g. before a "
+                        "WriteFile edit. False (default) returns a compact summary."
+                    ),
                     "default": False,
                 },
                 "focus": {
@@ -145,7 +150,15 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "name": "WriteFile",
-        "description": "Write or overwrite a file with the given content. Requires confirmation.",
+        "description": (
+            "OVERWRITES THE ENTIRE FILE with content. Never reconstruct a file "
+            "from a ReadFile summary or from memory — summaries omit code, and a "
+            "summary-based rewrite truncates the file. First ReadFile with "
+            "raw=true (or read every range you will touch) so you hold the complete "
+            "current content. The previous version is automatically backed up to "
+            ".g023/backups/ before the write (newest few kept per file). "
+            "Requires confirmation."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

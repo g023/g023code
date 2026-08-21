@@ -3,7 +3,7 @@
 ## A Pure Python Powered by DeepSeek V4
 
 **Version**: 3.3 (Responses API — g023 Edition)
-**Compiled**: August 2026 · implementation 1.3.2
+**Compiled**: August 2026 · implementation 1.3.3
 **Core Principle**: *Context is Currency. Subagents are the Treasury.*
 
 > **On the numbers in this document.** Anything stated as a measurement is
@@ -232,24 +232,35 @@ taken by this project. Only the last two rows describe g023's own behaviour.
 
 ### 3.2 Pricing & Cache Economics
 
-DeepSeek's published rates for V4 Flash, mirrored in `usage.PRICING`:
+DeepSeek moved to **tidal (peak/off-peak) pricing on 2026-08-17**: every rate
+has a **regular** (off-peak) price and a **surge** (peak) price that is exactly
+**2× regular**. The sheet is mirrored in `usage.PRICING` (loaded from
+`ds_pricing.json` when present) and the peak windows come from `ds_times.json`:
 
-| Scenario | Flash Price |
-| :--- | :--- |
-| **Input (Cache Hit)** | $0.0028 / 1M |
-| **Input (Cache Miss)** | $0.14 / 1M |
-| **Output** | $0.28 / 1M |
+| Model | Scenario | Regular (off-peak) | Surge (peak) |
+| :--- | :--- | :--- | :--- |
+| **V4 Flash** | Input (Cache Hit) | $0.007 / 1M | $0.014 / 1M |
+| | Input (Cache Miss) | $0.22 / 1M | $0.44 / 1M |
+| | Output | $0.66 / 1M | $1.32 / 1M |
+| **V4 Pro** | Input (Cache Hit) | $0.022 / 1M | $0.044 / 1M |
+| | Input (Cache Miss) | $0.66 / 1M | $1.32 / 1M |
+| | Output | $1.98 / 1M | $3.96 / 1M |
+| **V4 Flash Vision-Exp** | same as V4 Flash | same as V4 Flash | same as V4 Flash |
 
-The ratio between the two input rates is exactly **50x**. That is a property of
-the price sheet, not an achievement of this harness — `tests/test_usage_
-accounting.py::test_the_published_ratio_is_the_price_sheet` asserts only that
-the two numbers in the table divide to 50. What the harness contributes is
-keeping the prompt prefix stable so that more tokens land on the cheaper side;
-how *much* more, in any given session, is not measured (§XVIII).
+Peak hours are **09:00–12:00 and 14:00–18:00 Beijing time (UTC+8)** — see
+`ds_times.json`, and the `/surge` command (§XII Slash Commands) converts them to
+the machine's local clock. The headline property of the sheet is that **off-peak is
+exactly half of peak**; `tests/test_usage_accounting.py` pins both that and the
+published USD rows. What the harness contributes is keeping the prompt prefix
+stable so that more tokens land on the cheaper side; how *much* more, in any
+given session, is not measured (§XVIII).
 
 Costs shown by `/cost` are computed locally from the token counts the API
-reports, priced against this table. They are an estimate of the bill, not a
-reading of the account. A model with no row here is priced as Flash
+reports, priced at the **regular** rates (usage is accumulated without
+timestamps, so a peak/off-peak split cannot be reconstructed). They are an
+estimate of the bill, not a reading of the account — during surge hours actual
+billing is 2× the displayed figure, which is why `/surge status` shows the surge
+rates side by side. A model with no row here is priced as Flash
 (`usage.DEFAULT_PRICING`), so its reported spend is an approximation.
 
 `usage.PRICING` still carries a pro row so historical figures and any future
@@ -634,7 +645,7 @@ crosses that threshold, if `settings.auto_compact` is on.
 ### 10.3 Prefix Cache Preservation
 - The System Prompt and Tool Schemas are **immutable**.
 - Subagent summaries are injected in the **middle** of the prompt.
-- When the sliding window cleans the middle, the **start** of the prompt remains identical to the previous request. The cache engine hits immediately for the next turn, saving up to 50x on input costs.
+- When the sliding window cleans the middle, the **start** of the prompt remains identical to the previous request. The cache engine hits immediately for the next turn, saving ~30x on input costs (the hit/miss gap on the current price sheet).
 
 ---
 

@@ -1,0 +1,22 @@
+{
+  "$schema": "g023-code ds_pricing.json — DeepSeek API price sheet (loaded by g023_code/usage.py)",
+  "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "currency": "USD",
+  "unit": "per 1,000,000 tokens",
+  "effective": "2026-08-17",
+  "note": "DeepSeek tidal pricing. Regular = off-peak rate; surge = peak rate (exactly 2x regular). Peak hours are 09:00-12:00 & 14:00-18:00 Beijing (UTC+8) = 01:00-04:00 & 06:00-10:00 UTC — see ds_times.json.",
+  "models": {
+    "deepseek-v4-flash": {
+      "regular": { "cache_hit": 0.007, "cache_miss": 0.22, "output": 0.66 },
+      "surge":   { "cache_hit": 0.014, "cache_miss": 0.44, "output": 1.32 }
+    },
+    "deepseek-v4-pro": {
+      "regular": { "cache_hit": 0.022, "cache_miss": 0.66, "output": 1.98 },
+      "surge":   { "cache_hit": 0.044, "cache_miss": 1.32, "output": 3.96 }
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "regular": { "cache_hit": 0.007, "cache_miss": 0.22, "output": 0.66 },
+      "surge":   { "cache_hit": 0.014, "cache_miss": 0.44, "output": 1.32 }
+    }
+  }
+}

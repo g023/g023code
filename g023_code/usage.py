@@ -5,30 +5,110 @@ Every API call in the process funnels its ``usage`` block through the global
 tracker, so /cost, /settings and the auto-compaction trigger all read from the
 same numbers. DeepSeek reports the prefix-cache split directly
 (``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``), which matters a
-lot here: a cache hit is ~50x cheaper than a miss.
+lot here: a cache hit is ~30x cheaper than a miss on the current sheet.
+
+Pricing follows DeepSeek's tidal sheet (effective 2026-08-17): every model has
+a **regular** (off-peak) rate and a **surge** (peak) rate that is exactly 2x
+the regular one. The rates are loaded from ``ds_pricing.json`` when present
+(home dir, then project root) and otherwise fall back to the published USD
+table below. The peak windows live in ``ds_times.json`` and are consumed by
+``surge.py``; both files come from the same price sheet.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 # ---------------------------------------------------------------------------
-# Pricing (USD per 1M tokens) — SPEC §3.2
+# Pricing (USD per 1M tokens) — DeepSeek tidal sheet, effective 2026-08-17.
+# Regular = off-peak; surge = peak (exactly 2x regular). Mirrors ds_pricing.json.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ModelPricing:
+    # Regular (off-peak) rates
     cache_hit: float
     cache_miss: float
     output: float
+    # Surge (peak) rates — 2x regular on the tidal sheet
+    surge_cache_hit: float
+    surge_cache_miss: float
+    surge_output: float
+
+    @property
+    def surge_multiplier(self) -> float:
+        """Peak is exactly twice off-peak on the current tidal sheet."""
+        return self.surge_output / self.output
 
 
-PRICING: Dict[str, ModelPricing] = {
-    "deepseek-v4-flash": ModelPricing(cache_hit=0.0028, cache_miss=0.14, output=0.28),
-    "deepseek-v4-pro": ModelPricing(cache_hit=0.003625, cache_miss=0.435, output=0.87),
+_DEFAULT_PRICING: Dict[str, ModelPricing] = {
+    "deepseek-v4-flash": ModelPricing(
+        cache_hit=0.007,
+        cache_miss=0.22,
+        output=0.66,
+        surge_cache_hit=0.014,
+        surge_cache_miss=0.44,
+        surge_output=1.32,
+    ),
+    "deepseek-v4-pro": ModelPricing(
+        cache_hit=0.022,
+        cache_miss=0.66,
+        output=1.98,
+        surge_cache_hit=0.044,
+        surge_cache_miss=1.32,
+        surge_output=3.96,
+    ),
+    # The vision model runs the same engine under the hood, so it bills at
+    # Flash rates (per the price sheet).
+    "deepseek-v4-flash-vision-exp": ModelPricing(
+        cache_hit=0.007,
+        cache_miss=0.22,
+        output=0.66,
+        surge_cache_hit=0.014,
+        surge_cache_miss=0.44,
+        surge_output=1.32,
+    ),
 }
+
+
+def _load_ds_pricing() -> Dict[str, ModelPricing]:
+    """Overlay ds_pricing.json (home, then project root) on the defaults."""
+    from .config import get_home, get_project_root  # local import: no cycle
+
+    for path in (
+        get_home() / "ds_pricing.json",
+        get_project_root() / "ds_pricing.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        models = data.get("models")
+        if not isinstance(models, dict):
+            continue
+        out: Dict[str, ModelPricing] = {}
+        for name, row in models.items():
+            try:
+                reg, sur = row["regular"], row["surge"]
+                out[name] = ModelPricing(
+                    cache_hit=float(reg["cache_hit"]),
+                    cache_miss=float(reg["cache_miss"]),
+                    output=float(reg["output"]),
+                    surge_cache_hit=float(sur["cache_hit"]),
+                    surge_cache_miss=float(sur["cache_miss"]),
+                    surge_output=float(sur["output"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        if out:
+            return {**_DEFAULT_PRICING, **out}
+    return _DEFAULT_PRICING
+
+
+PRICING: Dict[str, ModelPricing] = _load_ds_pricing()
 
 # Anything unknown is priced as Flash so estimates stay in the right ballpark.
 DEFAULT_PRICING = PRICING["deepseek-v4-flash"]
@@ -59,12 +139,23 @@ class ModelUsage:
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def cost(self, model: str) -> float:
+    def cost(self, model: str, surge: bool = False) -> float:
+        """USD cost at the model's rates.
+
+        ``surge=True`` prices the tokens at the peak (surge) rates instead of
+        the regular (off-peak) ones — 2x on the current tidal sheet. Totals
+        default to regular rates because usage is accumulated without
+        timestamps, so a peak/off-peak split cannot be reconstructed; the
+        surge figure is the worst case for the session so far.
+        """
         p = pricing_for(model)
+        cache_hit = p.surge_cache_hit if surge else p.cache_hit
+        cache_miss = p.surge_cache_miss if surge else p.cache_miss
+        output = p.surge_output if surge else p.output
         return (
-            self.cache_hit_tokens * p.cache_hit
-            + self.cache_miss_tokens * p.cache_miss
-            + self.output_tokens * p.output
+            self.cache_hit_tokens * cache_hit
+            + self.cache_miss_tokens * cache_miss
+            + self.output_tokens * output
         ) / 1_000_000
 
     def hit_rate(self) -> float:
@@ -199,12 +290,12 @@ class UsageTracker:
             total = total.merge(u)
         return total
 
-    def cost(self) -> float:
-        return sum(u.cost(model) for model, u in self.per_model().items())
+    def cost(self, surge: bool = False) -> float:
+        return sum(u.cost(model, surge=surge) for model, u in self.per_model().items())
 
-    def scope_cost(self, scope: str) -> float:
+    def scope_cost(self, scope: str, surge: bool = False) -> float:
         bucket = self.orchestrator if scope == "orchestrator" else self.subagent
-        return sum(u.cost(model) for model, u in bucket.items())
+        return sum(u.cost(model, surge=surge) for model, u in bucket.items())
 
     def reset(self) -> None:
         self.orchestrator.clear()

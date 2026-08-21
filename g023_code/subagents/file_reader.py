@@ -58,6 +58,11 @@ LLM_INPUT_MAX_CHARS = 18_000
 # orchestrator's context.
 RANGE_MAX_CHARS = 20_000
 
+# Hard ceiling on a raw=true full-file read. Above this the read is refused and
+# the caller is pointed at start_line/end_line ranges instead, so an explicit
+# request for the whole file cannot blow the orchestrator's context either.
+FULL_READ_MAX_CHARS = 200_000
+
 SYMBOL_MAP_NOTE = (
     "metadata.symbols maps every top-level symbol (and Class.method) to its exact "
     "[start_line, end_line]. To see a definition's real source, call ReadFile again "
@@ -296,6 +301,37 @@ async def run_file_reader(
             )
         return json.dumps(payload, ensure_ascii=False)
 
+    # raw=true is an explicit request for the whole file: return it verbatim,
+    # capped so a huge file cannot flood the orchestrator's context. This is
+    # the correct way to prepare a WriteFile edit — a summary is never enough
+    # to rewrite a file safely, and a summary-based rewrite is how files end
+    # up truncated.
+    if raw and start_line is None and end_line is None:
+        language = _detect_language(p)
+        if len(content) > FULL_READ_MAX_CHARS:
+            return json.dumps({
+                "path": str(p),
+                "hash": content_hash,
+                "language": language,
+                "mode": "raw_full",
+                "verbatim": False,
+                "error": (
+                    f"File is {len(content):,} chars — too large for one raw read "
+                    f"(limit {FULL_READ_MAX_CHARS:,}). Read it in start_line/end_line "
+                    "ranges instead."
+                ),
+            }, ensure_ascii=False)
+        return json.dumps({
+            "path": str(p),
+            "hash": content_hash,
+            "language": language,
+            "mode": "raw_full",
+            "verbatim": True,
+            "total_lines": content.count("\n") + 1,
+            "bytes": len(content),
+            "content": content,
+        }, ensure_ascii=False)
+
     # Cache hit. A focused read is a different question about the same bytes, so
     # a generic cached summary would silently answer the wrong one — the key has
     # to carry the focus.
@@ -344,8 +380,6 @@ async def run_file_reader(
             "summary": summary,
             "note": SYMBOL_MAP_NOTE if metadata.get("symbols") else RANGE_NOTE,
         }
-        if raw:
-            result["raw_excerpt"] = content[:3000] + ("…" if len(content) > 3000 else "")
         cache.put_file_summary(str(p), summary, metadata, content, content_hash)
         return json.dumps(result, ensure_ascii=False)
 
@@ -429,9 +463,6 @@ async def run_file_reader(
             f"Only the first {len(sent):,} of {len(content):,} characters were summarised. "
             + result["note"]
         )
-    if raw:
-        result["raw_excerpt"] = content[:2500] + ("…" if len(content) > 2500 else "")
-
     cache.put_file_summary(
         str(p),
         result["summary"],

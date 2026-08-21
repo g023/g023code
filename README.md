@@ -7,7 +7,7 @@
 *Subagent-First · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.2-informational)](../RELEASE_NOTES.md)
+[![Version](https://img.shields.io/badge/version-1.3.3-informational)](releases/1.3.3/RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
 
@@ -34,10 +34,10 @@ makes DeepSeek's own **native web search** a first-class tool of the loop rather
 than a search provider bolted on the side.
 
 <p align="center">
-  <img src="docs/startup.png" alt="The g023 Code startup banner: version, project root, program home, model and thinking level, vision backend and a live Ollama reachability probe" width="880">
+  <img src="media/screenshots/01-startup-banner.png" alt="g023 Code starting up and working through a request" width="880">
 </p>
 
-<p align="center"><sub>The banner on launch — version, project root, program home, model and thinking level, and the vision backend with a live reachability probe of the Ollama daemon. Every screenshot in this README is a real terminal from a real 1.3.2 session; <a href="docs/README.md">docs/README.md</a> is the full index and explains how they were captured.</sub></p>
+<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.3.3 from sanitised paths — see <a href="media/README.md">media/README.md</a>.</sub></p>
 
 ## Table of contents
 
@@ -56,7 +56,6 @@ than a search provider bolted on the side.
 - [Tests](#tests)
 - [Extending](#extending)
 - [License](#license)
-- [Screenshot index](docs/README.md)
 
 ## Quick start
 
@@ -116,7 +115,10 @@ folder when one exists, and set two environment variables for you:
 | `G023_HOME` | The installation folder — where `K.dat` and `config.json` live |
 | `G023_PROJECT_ROOT` | The directory you launched from — your project |
 
-A per-project `.g023/` folder holds the SQLite cache and your input history.
+A per-project `.g023/` folder holds the SQLite cache, your input history, and —
+since v1.3.3 — `backups/`: every `WriteFile` overwrite snapshots the previous
+version there (mirroring the file tree, newest few kept per file) so a bad
+write is one copy away.
 
 `prompt_toolkit` is listed as a dependency but is not strictly required: with it
 you get tab completion, persistent history, and a live status bar pinned to the
@@ -128,42 +130,22 @@ and everything else behaves identically.
 The point is to never wonder what it is doing, or what it just cost.
 
 <p align="center">
-  <img src="docs/session.png" alt="One read-only question answered: a tool trace of list, search and two reads with timings, the boxed answer, and the per-turn accounting line" width="880">
+  <img src="media/screenshots/07-agent-answer.png" alt="A finished answer: tool trace, boxed reply, and the per-turn accounting line" width="880">
 </p>
-
-<p align="center"><sub>One question, end to end. Each tool call prints its result line and duration (<code>list .</code> → 2 entries, <code>search "api"</code> → 8 matches in 3 files, two <code>read</code>s), then the answer, then the accounting: <code>3 iteration(s) · 4 tool call(s) · slowest ReadFile 5 ms · model 5.5 s / tools 11 ms</code> over <code>4,299/900,000 (0%) · cache 79% · turn $0.00044</code>.</sub></p>
 
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
 sent. The status line after every turn carries the numbers that only mean
 something together — context used, **cache hit rate**, cost of this turn, cost
-of the session — because on V4 Flash a cached input token is billed at $0.0028/M
-against $0.14/M for an uncached one. That 50x is DeepSeek's price sheet, not
-something this harness achieves; what the harness does is avoid breaking the
-prefix so more tokens fall on the cheaper side.
+of the session — because on V4 Flash a cached input token is billed at $0.007/M
+off-peak against $0.22/M for an uncached one, and both double during surge
+hours (peak times are 09:00–12:00 & 14:00–18:00 Beijing time). The hit/miss
+gap is DeepSeek's price sheet, not something this harness achieves; what the
+harness does is avoid breaking the prefix so more tokens fall on the cheaper
+side.
 
 Costs shown are computed locally from the token counts the API returns and the
 price table in [`SPEC.md` §3.2](SPEC.md). They are an estimate of your bill, not
-a reading of it — `/cost` prints the price line it used so the arithmetic is
-checkable, and splits cache hit from cache miss because they are priced an order
-of magnitude apart.
-
-<p align="center">
-  <img src="docs/cost.png" alt="The /cost dashboard: tokens and spend split into cache-hit and cache-miss columns, with the price line printed underneath" width="880">
-</p>
-
-Nothing that writes, runs a command, or leaves your machine happens without a
-prompt. The prompt shows the path and an excerpt of the exact content, and takes
-`y` (once), `a` (always for this tool this session) or `n`:
-
-<p align="center">
-  <img src="docs/permission.png" alt="WriteFile stopping for permission, showing the target path and an excerpt of the content to be written" width="880">
-</p>
-
-<p align="center">
-  <img src="docs/write.png" alt="The same turn after approving: wrote 197 B in 7 ms, followed by the answer" width="880">
-</p>
-
-<p align="center"><sub>The trace above the prompt also shows the escalation path in use: <code>read app/schemas.py</code> returns a summary (25 lines, 3 classes), then <code>read app/schemas.py:1-8</code> fetches that head verbatim.</sub></p>
+a reading of it.
 
 Anything you type that does not start with `/` is a prompt. Everything else is
 a slash command.
@@ -173,28 +155,39 @@ a slash command.
 `/settings` shows every setting in one place and marks which ones persist;
 `/tools` shows what the agent may do and what it has done this turn. Both are
 editable from inside the session, and the `·saved` keys are written to
-`config.json` next to `K.dat`, so they follow you across projects.
+`config.json` next to `K.dat` — the **global** default that follows you across
+projects — or, if the project has one, to the project's `.g023/config.json`.
+
+### Per-project overrides and the global default
+
+Settings live in two layers:
+
+- **Global** — `config.json` next to `K.dat`. Applies to every project.
+- **Project** — `.g023/config.json` in the project folder. When present it
+  overrides the global file for *this* project only.
+
+```
+/config              show both files and which scope is active
+/config global       promote the current settings to the global default
+                     (new projects inherit them)
+/config save project pin the current settings to this project
+/config save         save to the active scope
+/config clear        drop this project's override; global applies again
+```
+
+So you can tune settings while inside a project, then run `/config global` to
+make exactly those settings the default for every future project — even when a
+project file would otherwise mask them.
 
 <p align="center">
-  <img src="docs/settings.png" alt="The /settings panel: every setting with its live value, with the persistent ones marked ·saved" width="880">
+  <img src="media/screenshots/03-tools-and-permissions.png" alt="The /tools panel: permission level and subagent isolation for every tool" width="430">
+  <img src="media/screenshots/14-settings.png" alt="The /settings panel: every setting with its live value" width="430">
 </p>
-
-<p align="center">
-  <img src="docs/tools.png" alt="The /tools panel: all eight tools, their current permission, and which run in an isolated subagent context" width="880">
-</p>
-
-<p align="center"><sub><code>/tools</code> also marks which tools run in an isolated subagent context rather than in the orchestrator's — that column is the delegation policy, visible.</sub></p>
 
 Defaults out of the box: **Flash** for the orchestrator and subagents, thinking
 on at **high** effort, verbosity **low**, auto-compaction **on** at 85% of the
-window, acting tools set to **ask**, and **vision disabled**.
-
-`/status` puts the whole session on one screen when you want the summary rather
-than the knobs:
-
-<p align="center">
-  <img src="docs/status.png" alt="The /status dashboard: model, session counters, vision, project, cache size, context and spend on one screen" width="880">
-</p>
+window, acting tools set to **ask**, and **vision disabled**. Nothing that
+writes, runs, or leaves your machine happens without a prompt.
 
 ## Architecture
 
@@ -267,13 +260,14 @@ so they are checked rather than remembered:
 | `ReadFile`, Python under 12k chars, no focus | 0 — summarised from the local AST |
 | `ReadFile`, same bytes again (cache hit) | 0 |
 | `ReadFile` with `start_line`/`end_line` | 0 — returns verbatim source |
+| `ReadFile` with `raw=true` | 0 — returns the whole file verbatim (the FileReader never needs the API for this) |
 | `ReadFile`, first read of a non-Python file, a file over 12k chars, or any focused read | 1 |
 
 **Arithmetic, given assumptions.** A 40 KB file is roughly 10k tokens. Inlined
 into the orchestrator, it is re-sent on every subsequent turn — cheaply, if it
-stays in the cached prefix, at $0.0028/M. Summarising it costs one Flash call
-(~10k in, ~300 out ≈ $0.0023 at miss rates) and leaves ~300 tokens in context
-instead of 10k. Which wins depends on how many turns follow and whether the
+stays in the cached prefix, at $0.007/M (regular rate). Summarising it costs one
+Flash call (~10k in, ~300 out ≈ $0.0024 at regular miss rates) and leaves ~300
+tokens in context instead of 10k. Which wins depends on how many turns follow and whether the
 prefix survives them, and those depend on your session. **Delegation is not
 unconditionally cheaper**; it is unconditionally *smaller*, and smaller context
 is what keeps the model on task and the window from filling.
@@ -305,6 +299,18 @@ verbatim text and costs no API call. That turns "the summary was too thin" from
 a re-read of the whole file into a precise second look. It does not turn it into
 something the orchestrator notices automatically — that detector does not exist.
 
+**For editing, a summary is never enough.** A summary omits code bodies, and
+`WriteFile` *replaces the entire file* — so a write reconstructed from a summary
+silently truncates the file. That is exactly how `config.py` got truncated once.
+Two safeguards now cover it:
+
+- `ReadFile raw=true` returns the **whole file verbatim** (capped at 200k chars),
+  so the orchestrator can hold the exact bytes it is about to replace. The tool
+  schema and the system prompt both say to use it before every edit.
+- Every `WriteFile` overwrite first snapshots the previous version to
+  `.g023/backups/<path-to-file>/<timestamp>-<hash>.bak`, keeping the newest few
+  per file, so even a bad write is one copy away.
+
 ## Drift signals
 
 The client does not validate responses on purpose: an unknown field has to reach
@@ -313,11 +319,7 @@ quietly — `output_text` returns `""`, the model looks silent, and nothing
 raises. Silent degradation, not a crash, is the realistic worst case here.
 
 `/signals` (alias `/drift`) shows the three cheapest observations that would move
-first — what the loop noticed but nobody raised an error about:
-
-<p align="center">
-  <img src="docs/signals.png" alt="The /signals panel: prefix cache hit-rate drift, unrecognised response item types, and unexplained empty responses" width="880">
-</p>
+first:
 
 | Signal | What it catches | What it cannot tell you |
 |---|---|---|
@@ -339,12 +341,7 @@ separate the causes.
 
 Commands that take a fixed set of options **open a picker when typed bare**, so
 `/vision` is as usable as `/vision qwen3.5:2b` — there is nothing to memorise.
-`/help <command>` explains any one of them in full, and bare `/help` puts the
-whole command surface on one screen, grouped by what it touches:
-
-<p align="center">
-  <img src="docs/help.png" alt="The /help panel: every slash command on one screen, grouped by what it touches" width="880">
-</p>
+`/help <command>` explains any one of them in full.
 
 <details open>
 <summary><b>Session</b></summary>
@@ -355,6 +352,7 @@ whole command surface on one screen, grouped by what it touches:
 | `/status` | One-screen dashboard: model, context, cost, vision, cache |
 | `/clear` | Reset the conversation and usage counters |
 | `/exit` | Quit |
+| `/config [status\|save\|global\|project\|clear]` *(alias `/cfg`)* | Show or manage the global vs per-project config scopes |
 
 </details>
 
@@ -397,10 +395,6 @@ whole command surface on one screen, grouped by what it touches:
 
 </details>
 
-<p align="center">
-  <img src="docs/cache.png" alt="The /cache panel: entry counts for each local SQLite cache, plus the database's size and path" width="880">
-</p>
-
 <details>
 <summary><b>Vision</b></summary>
 
@@ -414,6 +408,8 @@ whole command surface on one screen, grouped by what it touches:
 | `/ollama ps` | What the daemon currently holds in VRAM |
 | `/vision` | Interactive picker of installed vision models |
 | `/vision <model>` · `/vision off` | Enable a specific model, or disable |
+| `/surge` | DeepSeek surge pricing — status, notify, auto-pause around peak |
+| `/or` | OpenRouter vision — key, models, rate-limit tier, usage |
 
 </details>
 
@@ -437,45 +433,11 @@ whole command surface on one screen, grouped by what it touches:
 | `high` | ↑ plus the orchestrator's reasoning excerpts and per-iteration token counts |
 
 `/context` answers the question `/cost` cannot: *what* is filling the window.
-It breaks the history down by role and size, and the hint under the table names
-the cheapest fix:
-
-<p align="center">
-  <img src="docs/context.png" alt="The /context breakdown: tool results are 76% of a ~1,752-token history, with a hint naming the cheapest fix" width="880">
-</p>
-
 If tool results dominate, `/compact micro` clears the stale ones for free; if
 it is real conversation, `/compact` summarises it with the cheap model in an
 isolated context. The command tells you which of the two applies. Compaction
 also runs automatically once the context passes `compact_threshold` (85%) —
 turn that off with `/compact auto off`.
-
-The four frames below are one continuous run — three read-heavy turns, then
-`/context`, `/compact micro`, `/compact`, `/context`:
-
-<p align="center">
-  <img src="docs/compact-before.png" alt="Before compacting: 33 items, about 3,922 tokens, tool results 46% of it" width="880">
-</p>
-
-<p align="center"><sub><b>Before</b> — 33 items, ~3,922 tokens, tool results 46% of it.</sub></p>
-
-<p align="center">
-  <img src="docs/compact-micro.png" alt="/compact micro clearing old tool results: about 949 tokens reclaimed at no API cost" width="880">
-</p>
-
-<p align="center"><sub><b><code>/compact micro</code></b> — <code>cleared old tool results (~949 tokens, no API cost)</code>. This layer is local string surgery, so the session cost on the status bar does not move.</sub></p>
-
-<p align="center">
-  <img src="docs/compact-summary.png" alt="/compact summarising 33 items down to 2, reclaiming about 1,448 tokens for a summary cost of $0.00086" width="880">
-</p>
-
-<p align="center"><sub><b><code>/compact</code></b> — <code>Compacted 33 items → 2 (~1,448 tokens reclaimed · summary cost $0.00086)</code>. The summarising layer pays the cheap model and reports both sides of the trade.</sub></p>
-
-<p align="center">
-  <img src="docs/compact-after.png" alt="/context after compaction: two items totalling about 1,348 tokens" width="880">
-</p>
-
-<p align="center"><sub><b>After</b> — two items, ~1,348 tokens: one user item holding the summary, plus one assistant acknowledgement.</sub></p>
 
 Every API call — orchestrator *and* subagents — reports its token usage to a
 single tracker, so `/cost` and `/settings` show the cache-hit / cache-miss /
@@ -525,35 +487,85 @@ A few consequences are worth stating plainly:
 Just ask — `what changed in the DeepSeek Responses API this month?` — and it
 searches when it decides it needs to.
 
-## Vision (via Ollama)
+## Vision
 
-DeepSeek V4 Flash is text-only, so image analysis is delegated to an
-[Ollama](https://ollama.com) vision model. **Vision is disabled by default** —
-enable it once and the choice persists.
+DeepSeek V4 Flash is text-only, so image analysis is delegated to a *vision
+backend*. Three are supported, toggled with `/vision backend`:
+
+| Backend | Key | Default model | Notes |
+|---|---|---|---|
+| `deepseek` | `K.dat` | `deepseek-v4-flash-vision-exp` | DeepSeek's own multimodal model; billed at text prices. Default. |
+| `openrouter` | `OK.dat` | `google/gemma-4-26b-a4b-it:free` | Models from `./OR_VISION.json`, rotated on rate limits. |
+| `ollama` | — | local daemon | A local/remote Ollama vision model (`/ollama host` points at it). |
+
+**Vision is disabled by default** — enable it once and the choice persists.
 
 ```
-/vision              # interactive: lists installed models, pick one or disable
-/vision qwen3.5:2b   # enable a specific model directly
-/vision off          # disable (the default)
-/vision status       # show the current setting
+/vision                      # configure the active backend (or pick an Ollama model)
+/vision backend deepseek     # DeepSeek's deepseek-v4-flash-vision-exp (K.dat key)
+/vision backend openrouter   # OpenRouter (OK.dat key)
+/vision backend ollama       # local/remote daemon
+/vision endpoint responses   # deepseek wire format: responses | chat_completions
+/vision off                  # disable (the default)
+/vision status               # show the current setting
 ```
 
-<p align="center">
-  <img src="docs/vision.png" alt="/vision with no argument, opening a numbered picker of the vision models the daemon actually reports" width="880">
-</p>
-
-- Only models Ollama reports as `vision`-capable are listed (if none are, every
-  model is listed so you can force a choice). Sizes are shown so you can stay
-  inside your VRAM budget — on a 12 GB GPU anything up to ~8 GB is comfortable.
+- **DeepSeek backend** — `deepseek-v4-flash-vision-exp` is an experimental
+  multimodal model that runs on the same `K.dat` key and bills at exactly the
+  token rates of `deepseek-v4-flash`. The wire format is chosen per endpoint:
+  `/responses` (the program's native format, default) or `/chat/completions`.
+- **OpenRouter backend** — the key lives in `OK.dat` next to `K.dat`. Put a
+  JSON array of model ids in `./OR_VISION.json` (project folder) to set the
+  failover list; when one model returns HTTP 429 the next is tried. Free
+  `:free` models are capped at **50 requests/24h** for accounts under $10 of
+  lifetime credits, and up to **1000/24h** once you've bought $10+ credits —
+  tell g023 which tier you're on with `/or tier free|credits`.
+- **Ollama backend** — only models the daemon reports as `vision`-capable are
+  listed; sizes are shown so you can stay inside your VRAM budget. The daemon
+  may be local or on another machine (`/ollama host`).
 - While vision is disabled the `AnalyzeImage` tool is not even offered to the
   orchestrator, so it never proposes a call it cannot fulfil.
 - Images are downscaled to 1024 px on the longest edge (needs `pillow`; skipped
-  if not installed) and answers are cached by image hash + question, so re-asking
-  the *same* question about the same image is a local SQLite lookup rather than
-  another inference. A different question about the same image is a new
-  inference — the question is part of the key.
+  if not installed) and answers are cached by image hash + question + backend +
+  model, so re-asking the *same* question about the same image is a local SQLite
+  lookup rather than another inference.
 
 Once enabled, just ask: `analyze screenshot.png — what's the error?`
+
+### OpenRouter specifics
+
+```
+/or               status: key, tier, model list, today's usage
+/or model <id>    set the vision model (or `default` to reset)
+/or models        reload ./OR_VISION.json
+/or tier free|credits   50/24h vs 1000/24h ceiling
+/or usage         requests used today vs the ceiling
+```
+
+### Surge pricing (peak/off-peak)
+
+DeepSeek moved to tidal pricing on 2026-08-17: peak hours are **09:00–12:00 and
+14:00–18:00 Beijing time (UTC+8)**, off-peak is exactly half of peak. g023
+converts the windows to **your local clock**, shows every time in **both
+AM/PM and 24-hour format**, and can notify you and/or pause usage around them.
+`/surge status` also counts down — **how many minutes to the next surge** and
+**how long that surge will last** — and shows the regular vs surge (2×) prices
+for each model, straight from `ds_pricing.json` / `ds_times.json`.
+
+```
+/surge               status: current state, local peak windows (AM/PM + 24h),
+                     countdown to the next surge and its duration, prices
+/surge notify on|off banner when surge pricing starts/ends (default on)
+/surge on            pause usage from 5 min before peak until 5 min after it
+                     ends, then resume automatically
+/surge buffer <min>  widen the pause (default 5 min each side)
+```
+
+While a pause window is active the CLI waits it out instead of reading input, so
+no requests are sent at double price; `Ctrl-C` bypasses it for that pass. The
+toolbar shows `SURGE 2×` while peak hours are active.
+
+### Running Ollama on another machine
 
 ### Running the model on another machine
 
@@ -583,10 +595,6 @@ Three commands make a remote setup diagnosable rather than a guessing game:
 | `/ollama` | Is anything listening, what version, how far away (latency), how many models |
 | `/ollama models` | What that machine actually has — names, sizes, quantisation, vision capability |
 | `/ollama test` | A real inference round-trip: g023 sends a generated image and checks the answer. This proves the whole path — encoding, transport, and the model genuinely being image-capable — rather than just that the port is open. |
-
-<p align="center">
-  <img src="docs/ollama.png" alt="The /ollama panel: which daemon vision is pointed at, whether it answers, its version and latency" width="880">
-</p>
 
 > [!WARNING]
 > For a remote daemon to accept connections it must be bound to the network
@@ -719,6 +727,8 @@ Environment overrides:
 | `OLLAMA_HOST` | Vision daemon, when `vision_host` is unset |
 | `G023_ASCII=1` | Force plain-ASCII output on terminals that mangle box drawing |
 | `G023_READFILE_RAW=1` | `ReadFile` returns raw content instead of delegating — the A/B baseline described in [What delegation costs](#what-delegation-costs) |
+| `G023_WRITE_BACKUP=0` | Disable the automatic `.g023/backups/` snapshot before `WriteFile` overwrites |
+| `G023_WRITE_BACKUP_KEEP=5` | How many backup versions to retain per file (minimum 1) |
 
 ## License
 

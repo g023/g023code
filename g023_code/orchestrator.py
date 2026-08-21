@@ -59,7 +59,8 @@ Core philosophy: Context is Currency. Subagents are the Treasury.
 
 You NEVER dump raw file contents or large search results into your own context.
 Instead you always use the provided tools:
-- ReadFile → returns a compact structural summary + metadata (use this instead of asking for full files)
+- ReadFile → returns a compact structural summary + metadata (use this instead of asking for full files);
+  pass raw=true to get the FULL file verbatim when you need exact bytes
 - SearchContent → returns metadata-first match list
 - Agent → spawn Explore or Plan subagents for complex work
 - web_search → your own built-in web search. Use it whenever the answer depends on
@@ -71,6 +72,14 @@ Instead you always use the provided tools:
 - Bash / WriteFile / ListDir for direct actions
 
 When you need information, call the appropriate tool. After receiving the compact result, reason and continue.
+
+Editing files safely:
+- WriteFile REPLACES THE ENTIRE FILE. Never rewrite a file from a ReadFile summary
+  or from memory — summaries omit code bodies, and a summary-based rewrite silently
+  truncates the file. Before writing, ReadFile with raw=true (or read every range
+  you will touch) so you hold the complete current content.
+- Every WriteFile overwrite automatically backs up the previous version to
+  .g023/backups/ (newest few kept per file), so a bad write is one copy away.
 Prefer multiple precise tool calls over one giant request.
 Be concise in final answers unless the user asks for detail.
 You are operating inside a real project directory. Respect the user's codebase.
@@ -358,7 +367,7 @@ class Orchestrator:
         """
         if settings.vision_enabled:
             return ORCHESTRATOR_SYSTEM + VISION_SYSTEM_ADDENDUM.format(
-                model=settings.vision_model or settings.vision_backend
+                model=settings.effective_vision_model
             )
         return ORCHESTRATOR_SYSTEM + VISION_DISABLED_ADDENDUM
 
@@ -771,8 +780,18 @@ class Orchestrator:
             if settings.show_answer_detail:
                 self.printer.tool_end(event, show_timing=settings.show_tool_timing)
 
-            # Micro-compact very long results before they enter context.
-            if len(result) > 6000:
+            # Micro-compact very long results before they enter context. The one
+            # exception is an explicit full-file read (ReadFile raw=true): the
+            # model asked for the exact bytes, and truncating them would make a
+            # follow-up WriteFile edit unsafe again. The FileReader subagent
+            # already caps these at FULL_READ_MAX_CHARS.
+            full_read = (
+                tc.name == "ReadFile"
+                and bool(args.get("raw"))
+                and not args.get("start_line")
+                and not args.get("end_line")
+            )
+            if len(result) > 6000 and not full_read:
                 result = (
                     result[:5500]
                     + f"\n{Glyph.ELLIPSIS}[truncated for orchestrator context; "

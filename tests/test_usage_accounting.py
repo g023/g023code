@@ -1,9 +1,9 @@
 """
-Cost accounting, and the price ratio the documentation quotes.
+Cost accounting, and the price relationships the documentation quotes.
 
-The 50x figure in the docs is DeepSeek's published price sheet, not a result
+The relationships below are DeepSeek's published price sheet, not a result
 this project produced. The only thing this project can be held to is arithmetic:
-that it applies those two rates to the right token counts, derives the hit/miss
+that it applies those rates to the right token counts, derives the hit/miss
 split the same way whichever endpoint reported it, and does not quietly assume a
 cache hit when the provider did not report one.
 """
@@ -14,11 +14,27 @@ from g023_code.usage import PRICING, ModelUsage, UsageTracker, pricing_for
 from g023_code.commands import COMMANDS, check_handlers
 
 
-def test_the_published_ratio_is_the_price_sheet():
-    """Where 50x comes from: two numbers DeepSeek publishes, divided."""
-    p = PRICING["deepseek-v4-flash"]
-    assert round(p.cache_miss / p.cache_hit, 6) == 50.0
-    # It is a property of the pricing, not of anything the harness does.
+def test_prices_are_the_published_price_sheet():
+    """Flash and Pro off-peak (regular) rates, USD per 1M — DeepSeek's sheet."""
+    flash = PRICING["deepseek-v4-flash"]
+    assert (flash.cache_hit, flash.cache_miss, flash.output) == (0.007, 0.22, 0.66)
+    pro = PRICING["deepseek-v4-pro"]
+    assert (pro.cache_hit, pro.cache_miss, pro.output) == (0.022, 0.66, 1.98)
+
+
+def test_off_peak_is_exactly_half_of_peak():
+    """The tidal sheet's headline rule: surge = 2x off-peak, every line, every model."""
+    for p in PRICING.values():
+        assert (p.surge_cache_hit, p.surge_cache_miss, p.surge_output) == (
+            round(2 * p.cache_hit, 6),
+            round(2 * p.cache_miss, 6),
+            round(2 * p.output, 6),
+        )
+
+
+def test_surge_multiplier_is_two():
+    assert PRICING["deepseek-v4-flash"].surge_multiplier == 2.0
+    assert PRICING["deepseek-v4-pro"].surge_multiplier == 2.0
 
 
 def test_responses_api_spelling_is_understood():
@@ -68,6 +84,15 @@ def test_cost_is_the_two_rates_applied_to_their_own_token_counts():
     p = PRICING["deepseek-v4-flash"]
     assert round(usage.cost("deepseek-v4-flash"), 6) == round(
         p.cache_hit + p.cache_miss + p.output, 6
+    )
+
+
+def test_surge_cost_is_exactly_double_the_regular_cost():
+    usage = ModelUsage(
+        calls=1, cache_hit_tokens=1_000_000, cache_miss_tokens=1_000_000, output_tokens=1_000_000
+    )
+    assert round(usage.cost("deepseek-v4-flash", surge=True), 6) == round(
+        2 * usage.cost("deepseek-v4-flash"), 6
     )
 
 

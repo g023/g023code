@@ -5,6 +5,7 @@ Tool registry: permission checks + dispatch to local executors or subagents.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -63,6 +64,66 @@ def default_policy() -> Dict[str, str]:
 
 # Kept for callers that want the shape of the table without the live setting.
 DEFAULT_POLICY: Dict[str, str] = default_policy()
+
+
+# ---------------------------------------------------------------------------
+# WriteFile backups
+# ---------------------------------------------------------------------------
+# Before overwriting a file, keep the previous version under .g023/backups/
+# so a bad write is one copy away. The layout mirrors the file tree (one
+# folder per file, timestamped copies inside), and only the newest few copies
+# per file are kept, so the folder stays browsable instead of accumulating
+# junk. Backups are never taken for .g023/ itself.
+BACKUP_DIR = "backups"
+BACKUP_SUFFIX = ".bak"
+BACKUP_KEEP_DEFAULT = 5
+
+
+def backup_before_write(path: Path, root: Path) -> Optional[dict]:
+    """Snapshot ``path`` into ``root/.g023/backups/`` before it is overwritten.
+
+    Returns ``None`` when there is nothing worth preserving (a brand-new file,
+    a path inside ``.g023/`` itself, backups disabled), else a dict describing
+    the backup that was taken. Older backups for the same file are pruned down
+    to the newest ``settings.write_backup_keep`` (default 5).
+    """
+    if not settings.write_backup:
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        path.relative_to(root / ".g023")
+        return None
+    except ValueError:
+        pass
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return None
+
+    parent_rel = "" if rel.parent == Path(".") else str(rel.parent)
+    backup_dir = root / ".g023" / BACKUP_DIR / parent_rel / path.name
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    old = path.read_bytes()
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    digest = hashlib.sha256(old).hexdigest()[:8]
+    backup_path = backup_dir / f"{stamp}-{digest}{BACKUP_SUFFIX}"
+    backup_path.write_bytes(old)
+
+    keep = max(1, getattr(settings, "write_backup_keep", BACKUP_KEEP_DEFAULT))
+    versions = sorted(backup_dir.glob(f"*{BACKUP_SUFFIX}"), key=lambda v: v.name, reverse=True)
+    for stale in versions[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    return {
+        "backup": str(backup_path.relative_to(root)),
+        "backup_count": min(len(versions), keep),
+        "previous_bytes": len(old),
+    }
 
 
 class ToolRegistry:
@@ -259,13 +320,34 @@ class ToolRegistry:
         except ValueError:
             return json.dumps({"error": "Refusing to write outside project root"})
 
+        # A write with identical bytes changes nothing and would only burn a
+        # pointless backup slot; report it as the no-op it is.
+        if p.exists() and p.is_file():
+            previous = p.read_text(encoding="utf-8", errors="replace")
+            if previous == content:
+                return json.dumps({
+                    "ok": True,
+                    "unchanged": True,
+                    "path": str(p),
+                    "bytes": len(content.encode("utf-8")),
+                })
+
+        # WriteFile REPLACES THE WHOLE FILE, so before touching it snapshot the
+        # previous version under .g023/backups/ — a write based on a ReadFile
+        # *summary* (not raw content) is how files get silently truncated.
+        backup = backup_before_write(p, root)
+
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         # Drop the stale summaries for this path. Writing a placeholder row here
         # instead (as this used to) invalidated nothing — summaries are keyed by
         # content hash, so the junk row could never be hit or evicted.
         get_cache().invalidate_file(p)
-        return json.dumps({"ok": True, "path": str(p), "bytes": len(content.encode("utf-8"))})
+
+        payload = {"ok": True, "path": str(p), "bytes": len(content.encode("utf-8"))}
+        if backup:
+            payload.update(backup)
+        return json.dumps(payload, ensure_ascii=False)
 
     async def _exec_list_dir(self, path: str = ".", recursive: bool = False) -> str:
         root = get_project_root()

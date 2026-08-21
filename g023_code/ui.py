@@ -277,6 +277,9 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         return truncate(str(data["error"]), 70), False
 
     if name == "ReadFile":
+        if data.get("mode") == "raw_full":
+            body = data.get("content") or ""
+            return f"full file, {len(body):,} chars", bool(data.get("verbatim"))
         if data.get("start_line"):
             span = data["end_line"] - data["start_line"] + 1
             return f"lines {data['start_line']}-{data['end_line']} of {data['total_lines']:,} ({span} lines)", True
@@ -317,7 +320,13 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         return phrase, code == 0
 
     if name == "WriteFile":
-        return f"wrote {human_bytes(int(data.get('bytes') or 0))}", bool(data.get("ok"))
+        size = human_bytes(int(data.get("bytes") or 0))
+        if data.get("unchanged"):
+            return f"unchanged ({size})", True
+        phrase = f"wrote {size}"
+        if data.get("backup"):
+            phrase += f" \u2022 backup \u2192 {data['backup']}"
+        return phrase, bool(data.get("ok"))
 
     if name == "ListDir":
         return f"{len(data.get('entries') or [])} entries", True

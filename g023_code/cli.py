@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Optional
 
 from rich.markdown import Markdown
 from rich.markup import escape
@@ -20,6 +21,8 @@ from rich.text import Text
 from . import __version__
 from . import commands as registry
 from . import ollama_client
+from . import openrouter_client as or_client
+from . import surge
 from . import ui
 from .commands import Command
 from .config import (
@@ -36,11 +39,13 @@ from .config import (
     describe_steps,
     get_config_file,
     get_home,
+    get_project_config_file,
     get_project_root,
     get_scratch_dir,
     save_config,
     settings,
     load_api_key,
+    load_openrouter_key,
 )
 from .orchestrator import Orchestrator
 from .cache import get_cache
@@ -71,11 +76,12 @@ class CLI:
         """Bottom status bar (prompt_toolkit only) — plain text with HTML tags."""
         usage = get_usage()
         frac = self.orch.context_fraction()
-        vision = settings.vision_model if settings.vision_enabled else "off"
+        vision = settings.effective_vision_model if settings.vision_enabled else "off"
+        surge_badge = " · SURGE 2×" if surge.is_surge() else ""
         return (
             f" {settings.orchestrator_model} · think {settings.reasoning_effort} "
             f"· ctx {frac:.0%} of {settings.max_context_tokens // 1000}k "
-            f"· {format_cost(usage.cost())} · vision {vision} · /help "
+            f"· {format_cost(usage.cost())} · vision {vision}{surge_badge} · /help "
         )
 
     def print_banner(self):
@@ -715,14 +721,32 @@ class CLI:
         row("vision_num_ctx", f"{settings.vision_num_ctx:,}")
         row("vision_timeout", f"{settings.vision_timeout}s")
         row("vision_keep_alive", settings.vision_keep_alive, "how long the model stays in VRAM")
+        row("vision_endpoint", settings.vision_endpoint, "/vision endpoint (deepseek backend)")
+        row("deepseek_vision_model", settings.deepseek_vision_model, "deepseek backend default")
+        row("or_default_model", settings.or_default_model, "openrouter backend default")
+        row("or_credits", settings.or_credits, "$10+ lifetime credits → 1000/24h · /or tier")
+        row("surge_notify", settings.surge_notify, "/surge notify on|off")
+        row("surge_pause", settings.surge_pause, "/surge on|off")
+        row(
+            "surge_pause_buffer_minutes",
+            f"{settings.surge_pause_buffer_minutes} min",
+            "pause starts/ends around peak · /surge buffer",
+        )
         row("base_url", settings.base_url)
         row("project_root", settings.project_root)
         row("home", settings.home)
-        row("config_file", get_config_file())
+        project_cfg = get_project_config_file()
+        cfg_line = str(get_config_file())
+        if project_cfg.exists():
+            cfg_line += f" + project override {project_cfg}"
+        row("config_file", cfg_line)
 
         console.print()
         console.print(panel(table, "Settings", subtitle="·saved keys persist to config.json"))
-        console.print("[muted]/settings save to persist now · /settings reset for defaults[/muted]")
+        console.print(
+            "[muted]/settings save to persist now · /settings reset for defaults · "
+            "/config to manage global vs project scope[/muted]"
+        )
 
     def usage_table(self) -> Table:
         usage = get_usage()
@@ -772,11 +796,16 @@ class CLI:
         # /model refuses to select reads as a menu, not a footnote.
         parts = [
             f"{model}: ${p.cache_hit}/1M hit {Glyph.DOT} ${p.cache_miss}/1M miss "
-            f"{Glyph.DOT} ${p.output}/1M out"
+            f"{Glyph.DOT} ${p.output}/1M out (surge {p.surge_output}/1M, 2×)"
             for model, p in PRICING.items()
             if model in AVAILABLE_MODELS
         ]
-        return "[muted]" + "\n".join(parts) + "\nEstimates only — actual billing is DeepSeek's.[/muted]"
+        return (
+            "[muted]"
+            + "\n".join(parts)
+            + "\nPrices are off-peak (regular); peak is 2× during surge hours. "
+            + "Estimates only — actual billing is DeepSeek's.[/muted]"
+        )
 
     # ------------------------------------------------------------------
     # Tool permissions
@@ -1247,8 +1276,11 @@ class CLI:
     def vision_status(self) -> str:
         if not settings.vision_enabled:
             return "[muted]disabled[/muted]"
-        model = settings.vision_model or "(backend default)"
-        return f"[ok]on[/ok] {Glyph.DOT} {settings.vision_backend} {Glyph.DOT} [heading]{model}[/heading]"
+        model = settings.effective_vision_model or "(backend default)"
+        label = f"[ok]on[/ok] {Glyph.DOT} {settings.vision_backend} {Glyph.DOT} [heading]{model}[/heading]"
+        if settings.vision_backend == "deepseek":
+            label += f" [muted]({settings.vision_endpoint})[/muted]"
+        return label
 
     def _disable_vision(self):
         settings.vision_backend = "none"
@@ -1256,37 +1288,48 @@ class CLI:
         save_config()
         console.print(f"[warn]Vision disabled.[/warn] [muted]·saved[/muted]")
 
-    def _enable_vision(self, model: str, warn_no_vision: bool = False):
-        settings.vision_backend = "ollama"
-        settings.vision_model = model
+    def _enable_vision(self, model: str, warn_no_vision: bool = False, backend: Optional[str] = None):
+        """Turn vision on for a backend+model and persist it."""
+        if backend is not None:
+            settings.vision_backend = backend
+        elif settings.vision_backend in ("", "none"):
+            settings.vision_backend = "deepseek"  # the sensible default backend
+        settings.vision_model = model or None
         path = save_config()
         if warn_no_vision:
             console.print(
                 f"[warn]Note:[/warn] {model} does not advertise image support — "
-                "AnalyzeImage may fail. [bold]/ollama test[/bold] settles it."
+                "AnalyzeImage may fail at runtime."
             )
-        host = ollama_client.resolve_host()
         console.print(
-            f"[ok]{Glyph.CHECK} Vision enabled {Glyph.ARROW}[/ok] [heading]{model}[/heading] "
-            f"[muted]{Glyph.DOT} {host}[/muted]"
+            f"[ok]{Glyph.CHECK} Vision {Glyph.ARROW} {settings.vision_backend} "
+            f"{Glyph.DOT} [heading]{settings.effective_vision_model}[/heading][/ok] "
+            f"[muted]·saved to {path}[/muted]"
         )
-        console.print(f"[muted]Saved to {path}. AnalyzeImage is now offered to the orchestrator.[/muted]")
 
     def cmd_vision(self, arg: str = "") -> None:
         low = arg.lower().strip()
 
         if low in ("status", "show"):
             console.print(f"Vision: {self.vision_status()}")
-            console.print(f"[muted]host: {ollama_client.resolve_host()} · config: {get_config_file()}[/muted]")
+            console.print(f"[muted]endpoint: {settings.vision_endpoint} · config: {get_config_file()}[/muted]")
             return
         if low in ("off", "none", "disable", "disabled", "0", "false"):
             self._disable_vision()
+            return
+        if low in ("default", "reset"):
+            settings.vision_model = None
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} Vision model reset to backend default "
+                f"([heading]{settings.effective_vision_model}[/heading])[/ok] [muted]·saved[/muted]"
+            )
             return
         if low.startswith("backend"):
             backend = low[len("backend"):].strip()
             if not backend:
                 console.print(f"[muted]Current backend:[/muted] {settings.vision_backend}")
-                console.print("[muted]Usage: /vision backend none|ollama|glm|openai|local[/muted]")
+                console.print("[muted]Usage: /vision backend none|ollama|deepseek|openrouter[/muted]")
                 return
             if backend not in registry.BACKEND_CHOICES:
                 console.print(
@@ -1299,10 +1342,91 @@ class CLI:
             console.print(f"[ok]{Glyph.CHECK} Vision backend {Glyph.ARROW} {backend}[/ok] [muted]·saved[/muted]")
             if backend == "ollama" and not settings.vision_model:
                 console.print("[muted]No model selected — run [bold]/vision[/bold] to pick one.[/muted]")
-            elif backend not in ("none", "ollama"):
-                console.print(f"[warn]'{backend}' has no implementation yet; only ollama works today.[/warn]")
+            elif backend == "deepseek":
+                console.print(
+                    f"[muted]Model [heading]{settings.effective_vision_model}[/heading] · "
+                    f"endpoint {settings.vision_endpoint} · /vision endpoint to change[/muted]"
+                )
+            elif backend == "openrouter":
+                console.print(
+                    f"[muted]Model [heading]{settings.effective_vision_model}[/heading] · "
+                    f"list {or_client.load_or_models()} · /or for key/tier/usage[/muted]"
+                )
+            return
+        if low.startswith("endpoint"):
+            endpoint = low[len("endpoint"):].strip()
+            if not endpoint:
+                console.print(f"[muted]Current endpoint:[/muted] {settings.vision_endpoint}")
+                console.print("[muted]Usage: /vision endpoint responses|chat_completions[/muted]")
+                return
+            if endpoint not in registry.ENDPOINT_CHOICES:
+                console.print(
+                    f"[warn]Unknown endpoint:[/warn] {endpoint}  "
+                    f"[muted]({' | '.join(registry.ENDPOINT_CHOICES)})[/muted]"
+                )
+                return
+            settings.vision_endpoint = endpoint
+            save_config()
+            console.print(f"[ok]{Glyph.CHECK} Vision endpoint {Glyph.ARROW} {endpoint}[/ok] [muted]·saved[/muted]")
+            if settings.vision_backend == "openrouter":
+                console.print(
+                    "[muted]OpenRouter always speaks chat_completions; the endpoint "
+                    "setting applies to the deepseek backend.[/muted]"
+                )
             return
 
+        # --- backend-specific model selection ---------------------------------
+        # With no backend chosen yet, a bare model name belongs to the default
+        # backend (deepseek) rather than requiring an Ollama daemon to exist.
+        if settings.vision_backend in ("", "none"):
+            settings.vision_backend = "deepseek"
+            if not arg:
+                save_config()
+        if settings.vision_backend == "deepseek":
+            if arg:
+                self._enable_vision(arg)
+                return
+            console.print()
+            console.print(
+                panel(
+                    kv_table(
+                        [
+                            ("backend", "[ok]deepseek[/ok] (K.dat key)"),
+                            ("model", settings.effective_vision_model),
+                            ("endpoint", settings.vision_endpoint),
+                        ]
+                    ),
+                    "Configure Vision",
+                )
+            )
+            console.print(
+                "[muted]/vision <model> to override · /vision default to reset · "
+                "/vision endpoint chat_completions for the OpenAI wire format[/muted]"
+            )
+            return
+
+        if settings.vision_backend == "openrouter":
+            models = or_client.load_or_models()
+            if arg:
+                self._enable_vision(arg)
+                return
+            options = [(m, "OR_VISION.json") for m in models]
+            options.append(("[muted]Disable vision[/muted]", "the default"))
+            default = 1
+            for i, m in enumerate(models, start=1):
+                if m == settings.effective_vision_model:
+                    default = i
+            picked = choose("OpenRouter vision model", options, default=default)
+            if picked is None:
+                console.print("[muted]Vision setting unchanged.[/muted]")
+                return
+            if picked == len(options):
+                self._disable_vision()
+                return
+            self._enable_vision(models[picked - 1])
+            return
+
+        # --- ollama (local/remote daemon) -------------------------------------
         host = ollama_client.resolve_host()
         with console.status(f"[accent]Contacting {host}…[/accent]", spinner="dots"):
             probe = ollama_client.probe(host, count_models=False)
@@ -1330,7 +1454,7 @@ class CLI:
                 console.print(f"[bad]Model not found on {host}:[/bad] {arg}")
                 console.print("[muted]/ollama models lists them · /vision alone opens a picker.[/muted]")
                 return
-            self._enable_vision(match.name, warn_no_vision=not match.supports_vision)
+            self._enable_vision(match.name, warn_no_vision=not match.supports_vision, backend="ollama")
             return
 
         vision_models = [m for m in models if m.supports_vision]
@@ -1376,7 +1500,267 @@ class CLI:
             self._disable_vision()
             return
         chosen = listed[picked - 1]
-        self._enable_vision(chosen.name, warn_no_vision=not chosen.supports_vision)
+        self._enable_vision(chosen.name, warn_no_vision=not chosen.supports_vision, backend="ollama")
+
+    # ------------------------------------------------------------------
+    # /surge
+    # ------------------------------------------------------------------
+
+    def cmd_surge(self, arg: str = "") -> None:
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower() if parts else "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("status", ""):
+            self._surge_status()
+        elif sub == "on":
+            settings.surge_pause = True
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} Surge pause ON[/ok] [muted]— usage pauses "
+                f"{settings.surge_pause_buffer_minutes} min before peak and resumes "
+                f"{settings.surge_pause_buffer_minutes} min after it ends ·saved[/muted]"
+            )
+        elif sub == "off":
+            settings.surge_pause = False
+            save_config()
+            console.print("[warn]Surge pause OFF.[/warn] [muted]Notifications still fire if /surge notify is on ·saved[/muted]")
+        elif sub == "buffer":
+            try:
+                minutes = int(rest)
+            except ValueError:
+                minutes = -1
+            if not (0 <= minutes <= 120):
+                console.print("[warn]Buffer must be a whole number of minutes, 0-120.[/warn]")
+                return
+            settings.surge_pause_buffer_minutes = minutes
+            save_config()
+            console.print(f"[ok]{Glyph.CHECK} Surge pause buffer {Glyph.ARROW} {minutes} min[/ok] [muted]·saved[/muted]")
+        elif sub == "notify":
+            on = rest.lower() in ("on", "1", "yes", "true")
+            off = rest.lower() in ("off", "0", "no", "false")
+            if not rest or (not on and not off):
+                console.print(
+                    f"[muted]Surge notifications are {'on' if settings.surge_notify else 'off'} — "
+                    "usage: /surge notify on|off[/muted]"
+                )
+                return
+            settings.surge_notify = on
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} Surge notifications {'ON' if on else 'OFF'}[/ok] [muted]·saved[/muted]"
+            )
+        else:
+            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
+            console.print("[muted]/surge [status|on|off|buffer <min>|notify on|off] · /help surge[/muted]")
+
+    def _surge_status(self) -> None:
+        from datetime import datetime
+
+        now = datetime.now().astimezone()
+        active = surge.is_surge()
+        next_start, next_end = surge.next_peak_window(now)
+        until = surge.format_duration(next_start - now)
+        lasts = surge.format_duration(next_end - next_start)
+        kind, when = surge.next_transition(now)
+        local_peak = " · ".join(
+            surge.clock_range(s, e) for s, e in surge.peak_windows_local(now)[:2]
+        )
+        pause_windows = " · ".join(
+            surge.clock_range(s, e) for s, e in surge.pause_ranges(now)[:2]
+        )
+        rows = [
+            (
+                "state",
+                f"[{'bad' if active else 'ok'}]{'SURGE ACTIVE — prices 2× off-peak' if active else 'off-peak (half of peak)'}[/]",
+            ),
+            ("peak hours", "09:00–12:00 & 14:00–18:00 Beijing (UTC+8)"),
+            ("peak (local)", local_peak),
+            (
+                "next surge",
+                f"in {until} · lasts {lasts} ({surge.clock_range(next_start, next_end)})",
+            ),
+            (
+                "pause window",
+                f"{pause_windows} (buffer {settings.surge_pause_buffer_minutes} min)",
+            ),
+            ("pause", "on" if settings.surge_pause else "off"),
+            ("notify", "on" if settings.surge_notify else "off"),
+            ("next event", f"{kind.replace('_', ' ')} {surge.clock(when)}"),
+        ]
+        console.print()
+        console.print(panel(kv_table(rows), "DeepSeek surge pricing"))
+        console.print(
+            "[muted]Times shown AM/PM and 24-hour, in your local clock · "
+            "/surge on to auto-pause around peak · /surge buffer <min> · "
+            "/surge notify on|off[/muted]"
+        )
+
+    # ------------------------------------------------------------------
+    # /or — OpenRouter vision
+    # ------------------------------------------------------------------
+
+    def cmd_or(self, arg: str = "") -> None:
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower() if parts else "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("status", ""):
+            self._or_status()
+        elif sub == "model":
+            if not rest:
+                console.print(f"[muted]Current OpenRouter model:[/muted] {settings.effective_vision_model}")
+                console.print("[muted]Usage: /or model <model-id> | default[/muted]")
+                return
+            if rest.lower() in ("default", "reset"):
+                settings.vision_model = None
+            else:
+                settings.vision_model = rest
+            settings.vision_backend = "openrouter"
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} OpenRouter vision model {Glyph.ARROW} "
+                f"[heading]{settings.effective_vision_model}[/heading][/ok] [muted]·saved[/muted]"
+            )
+        elif sub in ("models", "list", "reload"):
+            models = or_client.load_or_models()
+            settings.or_vision_models = models
+            save_config()
+            console.print(f"[ok]{Glyph.CHECK} OpenRouter model list ({len(models)}):[/ok]")
+            for i, m in enumerate(models, 1):
+                mark = "  [ok]← in use[/ok]" if m == settings.effective_vision_model else ""
+                console.print(f"  {i}. {m}{mark}")
+            console.print(f"[muted]source: {or_client.or_models_file()}[/muted]")
+        elif sub == "tier":
+            if not rest:
+                console.print(
+                    f"[muted]Current tier:[/muted] {'credits ($10+ bought)' if settings.or_credits else 'free'} "
+                    f"[muted]· usage: /or tier free|credits[/muted]"
+                )
+                return
+            if rest not in ("free", "credits"):
+                console.print("[warn]Tier must be 'free' or 'credits'.[/warn]")
+                return
+            settings.or_credits = rest == "credits"
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} OpenRouter tier {Glyph.ARROW} {rest}[/ok] "
+                f"[muted]· ceiling {or_client.active_daily_limit()}/24h ·saved[/muted]"
+            )
+        elif sub in ("usage", "quota"):
+            usage = or_client.get_or_usage()
+            limit = or_client.active_daily_limit()
+            console.print(
+                f"[muted]Today ({usage.date}):[/muted] {usage.requests}/{limit} requests "
+                f"{Glyph.DOT} {usage.remaining()} left {Glyph.DOT} {usage.rate_limits} rate-limit hits"
+            )
+        else:
+            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
+            console.print("[muted]/or [status|model <id>|models|tier free|credits|usage] · /help or[/muted]")
+
+    def _or_status(self) -> None:
+        key_ok = (get_home() / "OK.dat").exists()
+        models = or_client.load_or_models()
+        usage = or_client.get_or_usage()
+        limit = or_client.active_daily_limit()
+        free, credits = or_client.rate_limit_tier()
+        rows = [
+            ("key", f"[ok]{Glyph.CHECK} OK.dat present[/ok]" if key_ok else "[bad]OK.dat missing[/bad]"),
+            ("tier", f"{'credits' if settings.or_credits else 'free'} [muted]({usage.requests}/{limit} used today)[/muted]"),
+            ("ceiling", f"free accounts: {free}/24h · with $10+ credits: {credits}/24h"),
+            (
+                "model",
+                f"[heading]{settings.vision_model or settings.or_default_model}[/heading]",
+            ),
+            (
+                "models",
+                f"{len(models)} in OR_VISION.json: " + ", ".join(models[:3]) + (" …" if len(models) > 3 else ""),
+            ),
+            ("rate limits today", str(usage.rate_limits)),
+            ("vision backend", settings.vision_backend),
+        ]
+        console.print()
+        console.print(panel(kv_table(rows), "OpenRouter vision"))
+        console.print(
+            "[muted]/or model <id> · /or models (reload OR_VISION.json) · "
+            "/or tier credits if you bought $10+ · /or usage[/muted]"
+        )
+
+    # ------------------------------------------------------------------
+    # /config — global vs per-project
+    # ------------------------------------------------------------------
+
+    def cmd_config(self, arg: str = "") -> None:
+        sub = arg.strip().lower()
+
+        if sub in ("global", "save-global", "save global"):
+            path = save_config(scope="global")
+            console.print(
+                f"[ok]{Glyph.CHECK} Current settings saved as the global default[/ok] "
+                f"[muted]{Glyph.ARROW} {path}[/muted]"
+            )
+            console.print("[muted]New projects inherit these settings unless they carry their own .g023/config.json.[/muted]")
+            return
+        if sub in ("project", "save-project", "save project"):
+            path = save_config(scope="project")
+            console.print(
+                f"[ok]{Glyph.CHECK} Settings pinned to this project[/ok] [muted]{Glyph.ARROW} {path}[/muted]"
+            )
+            return
+        if sub == "save":
+            path = save_config()
+            scope = "project" if path == get_project_config_file() else "global"
+            console.print(
+                f"[ok]{Glyph.CHECK} Settings saved ({scope})[/ok] [muted]{Glyph.ARROW} {path}[/muted]"
+            )
+            return
+        if sub == "clear":
+            project = get_project_config_file()
+            if not project.exists():
+                console.print("[muted]No project config to clear — the global config applies.[/muted]")
+                return
+            if not confirm("Drop this project's .g023/config.json? Global defaults will apply.", default=False):
+                return
+            project.unlink(missing_ok=True)
+            defaults = Settings()
+            for key in PERSISTED_KEYS:
+                setattr(settings, key, getattr(defaults, key))
+            load_config(settings)
+            console.print(
+                f"[ok]{Glyph.CHECK} Project override removed[/ok] [muted]{Glyph.ARROW} "
+                f"{get_config_file()} now applies[/muted]"
+            )
+            return
+        if sub:
+            console.print("[muted]Usage: /config [status|save|save global|save project|global|project|clear][/muted]")
+            return
+        self._config_status()
+
+    def _config_status(self) -> None:
+        global_path = get_config_file()
+        project_path = get_project_config_file()
+        active = "project" if project_path.exists() else "global"
+        rows = [
+            ("active scope", f"[heading]{active}[/heading]"),
+            (
+                "global",
+                str(global_path) + (" [ok]· exists[/ok]" if global_path.exists() else " [muted]· missing[/muted]"),
+            ),
+            (
+                "project",
+                str(project_path)
+                + (" [ok]· overrides global[/ok]" if project_path.exists() else " [muted]· none — global applies[/muted]"),
+            ),
+            ("orchestrator", settings.orchestrator_model),
+            ("vision", f"{settings.vision_backend} {Glyph.DOT} {settings.effective_vision_model}"),
+            ("surge pause", f"{'on' if settings.surge_pause else 'off'} (buffer {settings.surge_pause_buffer_minutes} min)"),
+        ]
+        console.print()
+        console.print(panel(kv_table(rows), "Config scopes"))
+        console.print(
+            "[muted]/config global — promote current settings to global default · "
+            "/config save project · /config clear[/muted]"
+        )
 
     # ------------------------------------------------------------------
     # /goal
@@ -1443,6 +1827,43 @@ class CLI:
         if settings.show_context_bar:
             console.print(self.orch.status_line())
 
+    def _surge_tick(self) -> None:
+        """Fire the surge notification on state transitions (once per change)."""
+        active = surge.is_surge()
+        if self._surge_was_active is None:
+            self._surge_was_active = active
+            if active:
+                console.print()
+                console.print(
+                    panel(
+                        "[warn]DeepSeek is at surge pricing (peak hours) — prices are 2x off-peak.[/warn]\n"
+                        "[muted]/surge to check the windows · /surge on to auto-pause around peak.[/muted]",
+                        "Surge pricing",
+                    )
+                )
+            return
+        if active == self._surge_was_active:
+            return
+        self._surge_was_active = active
+        if active:
+            _, when = surge.next_transition()
+            console.print()
+            console.print(
+                panel(
+                    f"[warn]DeepSeek surge pricing just started — prices doubled.[/warn]\n"
+                    f"[muted]Peak until {when:%H:%M} local · /surge on to pause usage around peak.[/muted]",
+                    "Surge pricing",
+                )
+            )
+        else:
+            console.print()
+            console.print(
+                panel(
+                    "[ok]DeepSeek surge pricing ended — back to off-peak (half price).[/ok]",
+                    "Surge pricing",
+                )
+            )
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -1455,7 +1876,43 @@ class CLI:
             console.print(f"[bad]{e}[/bad]")
             return
 
+        # Surge monitor state: notify once per transition, pause around peak.
+        self._surge_was_active: Optional[bool] = None
+        self._surge_pause_announced = False
+        self._surge_bypass = False
+
         while self.running:
+            if settings.surge_notify:
+                self._surge_tick()
+
+            if settings.surge_pause and not self._surge_bypass:
+                remaining = surge.seconds_until_pause_ends()
+                if remaining > 0:
+                    if not self._surge_pause_announced:
+                        _, when = surge.next_transition()
+                        console.print()
+                        console.print(
+                            panel(
+                                "[warn]DeepSeek surge pricing — usage paused[/warn]\n"
+                                "[muted]Peak hours bill at 2x off-peak. Input is paused "
+                                f"for {remaining // 60} min {remaining % 60}s, until the "
+                                f"window (+ buffer) ends around {when:%H:%M} local.[/muted]\n"
+                                "[muted]Ctrl-C to bypass the pause and work at peak prices.[/muted]",
+                                "Surge pause",
+                            )
+                        )
+                        self._surge_pause_announced = True
+                    try:
+                        await asyncio.sleep(5)
+                        continue
+                    except KeyboardInterrupt:
+                        console.print(
+                            "\n[warn]Bypassing surge pause — commands will run at peak prices.[/warn]"
+                        )
+                        self._surge_pause_announced = False
+                        self._surge_bypass = True
+            self._surge_bypass = False
+
             try:
                 console.print()
                 user = await self.reader.ask_async()

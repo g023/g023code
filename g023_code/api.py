@@ -144,6 +144,97 @@ class ResponsesClient:
                 if isinstance(event, dict):
                     yield event
 
+    # -- vision ----------------------------------------------------------
+    #
+    # The deepseek backend sends the same image three different ways depending
+    # on the configured endpoint: the native Responses format (``input_image``
+    # content parts, POST /responses) or the OpenAI-style chat completions
+    # format (``image_url`` with a data: URI, POST /chat/completions). Both
+    # share the K.dat key; only the wire shape differs.
+
+    async def vision_responses(
+        self,
+        model: str,
+        prompt: str,
+        image_b64: str,
+        system: str = "",
+        timeout: float = 180.0,
+        max_output_tokens: int = 2048,
+    ) -> Dict[str, Any]:
+        """One image analysis over the Responses API (POST /responses)."""
+        body = {
+            "model": model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_b64}"},
+                    ],
+                }
+            ],
+            "max_output_tokens": max_output_tokens,
+        }
+        if system:
+            body["instructions"] = system
+        old_timeout = self._timeout
+        self._timeout = timeout
+        try:
+            return await self.create(**body)
+        finally:
+            self._timeout = old_timeout
+
+    async def vision_chat(
+        self,
+        model: str,
+        prompt: str,
+        image_b64: str,
+        system: str = "",
+        timeout: float = 180.0,
+        max_tokens: int = 2048,
+    ) -> Dict[str, Any]:
+        """One image analysis over Chat Completions (POST /chat/completions)."""
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
+                    ],
+                },
+            ],
+            "max_tokens": max_tokens,
+        }
+        old_timeout = self._timeout
+        self._timeout = timeout
+        try:
+            r = await self._http().post(
+                f"{self._base_url}/chat/completions",
+                headers=self._headers(),
+                json=body,
+            )
+        finally:
+            self._timeout = old_timeout
+        if r.status_code != 200:
+            raise DeepSeekError.from_response(r.status_code, r.text)
+        return r.json()
+
+
+def chat_answer(response: Dict[str, Any]) -> str:
+    """Pull the assistant text out of a chat/completions response."""
+    try:
+        return str(response["choices"][0]["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+
 
 # ---------------------------------------------------------------------------
 # Request helpers

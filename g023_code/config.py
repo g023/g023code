@@ -14,6 +14,7 @@ from typing import Any, Literal, Optional
 # Paths
 # ---------------------------------------------------------------------------
 
+
 def get_home() -> Path:
     """Directory containing the g023-code installation (where K.dat lives)."""
     env = os.environ.get("G023_HOME")
@@ -50,9 +51,20 @@ def get_config_file() -> Path:
     return get_home() / "config.json"
 
 
+def get_project_config_file() -> Path:
+    """Per-project config (inside the project's .g023/ folder).
+
+    When it exists it overrides the machine-level config.json, so a project
+    can pin its own model / vision / surge settings while the machine-level
+    file keeps the global defaults. ``/config`` manages the split.
+    """
+    return get_project_root() / ".g023" / "config.json"
+
+
 # ---------------------------------------------------------------------------
-# API Key
+# API Keys
 # ---------------------------------------------------------------------------
+
 
 def load_api_key() -> str:
     """Load DeepSeek API key from K.dat inside the program folder."""
@@ -69,6 +81,26 @@ def load_api_key() -> str:
         raise ValueError(
             f"Please put a valid DeepSeek API key into {key_file}\n"
             "Get one at https://platform.deepseek.com/"
+        )
+    return key
+
+
+def load_openrouter_key() -> str:
+    """Load OpenRouter API key from OK.dat inside the program folder."""
+    key_file = get_home() / "OK.dat"
+    if not key_file.exists():
+        raise FileNotFoundError(
+            f"OpenRouter API key file not found: {key_file}\n"
+            "Create OK.dat in the g023-code folder and put your OpenRouter API key on the first line."
+        )
+    key = key_file.read_text(encoding="utf-8").strip()
+    if not key or key in (
+        "YOUR_OPENROUTER_API_KEY_HERE",
+        "sk-or-v1-REPLACE-WITH-YOUR-OPENROUTER-KEY",
+    ):
+        raise ValueError(
+            f"Please put a valid OpenRouter API key into {key_file}\n"
+            "Get one at https://openrouter.ai/keys"
         )
     return key
 
@@ -123,6 +155,77 @@ UNLIMITED_OUTPUT_TOKENS = 0
 # any verbosity, so a turn that is 60 steps deep says so on its own.
 ITERATION_NOTICE_EVERY = 10
 
+# OpenRouter fallback when no model is configured for the openrouter backend.
+OPENROUTER_DEFAULT_MODEL = "google/gemma-4-26b-a4b-it:free"
+# OpenRouter free-tier daily ceiling for :free models. Free accounts get 50
+# requests/day; buying $10+ lifetime credits raises the ceiling to 1000/day.
+# (Both tiers still share the 20 req/min cap.)
+OPENROUTER_FREE_DAILY_LIMIT = 50
+OPENROUTER_CREDITS_DAILY_LIMIT = 1000
+
+# Vision endpoints for the deepseek backend. The Responses format is the
+# program's native format; chat_completions is offered because the vision model
+# also speaks it (OpenRouter only speaks chat_completions, which is fine — it
+# pins its own endpoint internally).
+VISION_ENDPOINTS: tuple[str, ...] = ("responses", "chat_completions")
+
+
+def _load_ds_times() -> tuple[tuple[tuple[int, int], ...], int]:
+    """Surge windows + UTC offset from ds_times.json (home, then project root).
+
+    Falls back to DeepSeek's published sheet when the file is absent or
+    unreadable. Windows are parsed from ``HH:MM`` strings into Beijing
+    wall-clock hours; ``surge.py`` converts them to the machine's local time.
+    """
+    default_windows: tuple[tuple[int, int], ...] = ((9, 12), (14, 18))
+    default_offset = 8
+    for path in (
+        get_home() / "ds_times.json",
+        get_project_root() / "ds_times.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        windows = data.get("peak_windows", {}).get("beijing")
+        if not windows:
+            continue
+        try:
+            parsed = tuple(
+                (int(start.split(":")[0]), int(end.split(":")[0]))
+                for start, end in windows
+            )
+        except (AttributeError, TypeError, ValueError):
+            continue
+        offset = data.get("utc_offset_hours", default_offset)
+        if not isinstance(offset, int):
+            offset = default_offset
+        return parsed, offset
+    return default_windows, default_offset
+
+
+# Surge pricing windows, DeepSeek peak/off-peak (tidal) pricing effective
+# 2026-08-17. Peak hours are 09:00-12:00 and 14:00-18:00 Beijing time (UTC+8),
+# and off-peak prices are half of peak. The windows below are stored in
+# *Beijing* wall-clock hours and converted to the machine's local time by
+# ``surge.py``, so notifications always match the user's clock. The values come
+# from ds_times.json when present (see ``_load_ds_times`` above).
+SURGE_PEAK_WINDOWS_BEIJING: tuple[tuple[int, int], ...]
+SURGE_UTC_OFFSET: int
+SURGE_PEAK_WINDOWS_BEIJING, SURGE_UTC_OFFSET = _load_ds_times()
+
+
+
+def _env_int(name: str, default: int) -> int:
+    """Integer from the environment; falls back to ``default`` when absent or invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
 
 @dataclass
 class Settings:
@@ -170,8 +273,20 @@ class Settings:
         in ("1", "true", "yes", "on")
     )
 
+    # WriteFile safety net: before overwriting a file, keep a timestamped copy
+    # of the previous version in .g023/backups/ (mirroring the file tree, with
+    # only the newest few versions retained per file). Skipped for files inside
+    # .g023/ itself, for brand-new files, and when the content is unchanged.
+    # Disable with G023_WRITE_BACKUP=0|false|no|off; tune retention with
+    # G023_WRITE_BACKUP_KEEP (minimum 1).
+    write_backup: bool = field(
+        default_factory=lambda: os.environ.get("G023_WRITE_BACKUP", "").lower()
+        not in ("0", "false", "no", "off")
+    )
+    write_backup_keep: int = field(default_factory=lambda: _env_int("G023_WRITE_BACKUP_KEEP", 5))
+
     # Vision (external — DeepSeek V4 Flash is text-only)
-    vision_backend: str = "none"  # none | ollama | glm | openai | local
+    vision_backend: str = "none"  # none | ollama | deepseek | openrouter
     vision_api_key: Optional[str] = None
     vision_model: Optional[str] = None  # e.g. "qwen3.5:2b" for the ollama backend
     # Ollama daemon. None = fall back to OLLAMA_HOST, then localhost. Set it to
@@ -181,6 +296,25 @@ class Settings:
     vision_timeout: int = 180
     vision_num_ctx: int = 4096  # context window asked of the local model
     vision_keep_alive: str = "5m"  # how long the daemon holds the model in VRAM
+
+    # Wire shape for the deepseek backend: the native Responses format vs the
+    # OpenAI-style chat_completions format (see VISION_ENDPOINTS).
+    vision_endpoint: str = VISION_ENDPOINTS[0]
+    # Backend defaults used when no explicit vision_model is set.
+    deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
+    or_default_model: str = OPENROUTER_DEFAULT_MODEL
+    # Explicit model list, usually set by /or models from OR_VISION.json.
+    or_vision_models: Optional[list[str]] = None
+    # True once the user bought $10+ lifetime credits → 1000 req/day ceiling.
+    or_credits: bool = False
+
+    # Surge pricing (DeepSeek peak/off-peak, Beijing 09-12 & 14-18)
+    # Notify when the API is at surge pricing; optionally pause usage from
+    # ``surge_pause_buffer_minutes`` before peak starts until that long after
+    # the last peak ends.
+    surge_notify: bool = True
+    surge_pause: bool = False
+    surge_pause_buffer_minutes: int = 5
 
     # Runtime
     stream: bool = True
@@ -211,7 +345,19 @@ class Settings:
             return False
         if self.vision_backend == "ollama":
             return bool(self.vision_model)
-        return True
+        if self.vision_backend == "openrouter":
+            return (self.home / "OK.dat").exists()
+        # deepseek is billed through K.dat; without the key it cannot be enabled.
+        return (self.home / "K.dat").exists()
+
+    @property
+    def effective_vision_model(self) -> Optional[str]:
+        """The model a vision call will actually use, for the current backend."""
+        if self.vision_backend == "deepseek":
+            return self.vision_model or self.deepseek_vision_model
+        if self.vision_backend == "openrouter":
+            return self.vision_model or self.or_default_model
+        return self.vision_model
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +384,16 @@ PERSISTED_KEYS = (
     "vision_timeout",
     "vision_num_ctx",
     "vision_keep_alive",
+    "vision_endpoint",
+    "deepseek_vision_model",
+    "or_default_model",
+    "or_vision_models",
+    "or_credits",
+    "surge_notify",
+    "surge_pause",
+    "surge_pause_buffer_minutes",
+    "write_backup",
+    "write_backup_keep",
 )
 
 # Values a saved config is allowed to take. A key missing from here accepts
@@ -249,7 +405,8 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     "subagent_model": AVAILABLE_MODELS,
     "reasoning_effort": ("low", "high", "max"),
     "verbose": VERBOSE_LEVELS,
-    "vision_backend": ("none", "ollama", "glm", "openai", "local"),
+    "vision_backend": ("none", "ollama", "deepseek", "openrouter"),
+    "vision_endpoint": VISION_ENDPOINTS,
     "permission_default": ("allow", "ask", "block"),
 }
 
@@ -311,38 +468,55 @@ def _coerce(key: str, value: Any, default: Any) -> Any:
 
 
 def load_config(target: Optional["Settings"] = None) -> dict[str, Any]:
-    """Apply config.json onto the settings object. Missing/broken file is a no-op."""
+    """Apply config.json onto the settings object; a project file overrides.
+
+    The machine-level file (next to K.dat) holds the global defaults; when the
+    project's ``.g023/config.json`` exists it is applied afterwards, so a
+    project pins its own settings while the machine file keeps the defaults.
+    Missing/broken files are a no-op. Returns the dict of applied keys.
+    """
     target = target if target is not None else settings
-    path = get_config_file()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    applied = {}
-    for key in PERSISTED_KEYS:
-        if key not in data:
+    applied: dict[str, Any] = {}
+    for path in (get_config_file(), get_project_config_file()):
+        if not path.exists():
             continue
-        current = getattr(target, key, None)
-        value = _coerce(key, data[key], current)
-        if value is None and current is not None:
-            # Either _coerce rejected the value, or the file holds an explicit
-            # null for a key that has no meaningful null (only the optional
-            # vision keys default to None, and those still accept one). Keep the
-            # built-in default rather than writing None into a typed field.
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
             continue
-        setattr(target, key, value)
-        applied[key] = value
+        if not isinstance(data, dict):
+            continue
+        for key in PERSISTED_KEYS:
+            if key not in data:
+                continue
+            current = getattr(target, key, None)
+            value = _coerce(key, data[key], current)
+            if value is None and current is not None:
+                # Either _coerce rejected the value, or the file holds an explicit
+                # null for a key that has no meaningful null (only the optional
+                # vision keys default to None, and those still accept one). Keep
+                # the built-in default rather than writing None into a typed field.
+                continue
+            setattr(target, key, value)
+            applied[key] = value
     return applied
 
 
-def save_config(target: Optional["Settings"] = None) -> Path:
-    """Write the persisted subset of settings to config.json."""
+def save_config(target: Optional["Settings"] = None, scope: str = "auto") -> Path:
+    """Write the persisted subset of settings to config.json.
+
+    ``scope`` is "auto" (the project's .g023/config.json when it exists, else
+    the machine file next to K.dat), "global" (the machine file — what new
+    projects inherit), or "project" (pin to this project only). ``/config``
+    manages the split.
+    """
     target = target if target is not None else settings
-    path = get_config_file()
+    if scope == "global":
+        path = get_config_file()
+    elif scope == "project":
+        path = get_project_config_file()
+    else:  # auto
+        path = get_project_config_file() if get_project_config_file().exists() else get_config_file()
     existing: dict[str, Any] = {}
     if path.exists():
         try:
