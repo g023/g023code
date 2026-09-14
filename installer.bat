@@ -116,7 +116,6 @@ call :step "Installing dependencies"
 REM ---------------------------------------------------------------------------
 call :need rich        "rich>=13.7.0"        required
 call :need httpx       "httpx>=0.27.0"       required
-call :need tiktoken    "tiktoken>=0.7.0"     required
 call :need pygments    "pygments>=2.17.0"    required
 if defined FATAL goto abort
 
@@ -217,20 +216,35 @@ if not exist "%CFG%" (
         echo {
         echo   "verbose": "low",
         echo   "auto_compact": true,
-        echo   "vision_backend": "none",
-        echo   "vision_model": null,
-        echo   "vision_host": null,
-        echo   "vision_max_image_dim": 1024,
-        echo   "vision_timeout": 180,
-        echo   "orchestrator_model": "deepseek-v4-flash",
-        echo   "subagent_model": "deepseek-v4-flash",
-        echo   "reasoning_effort": "high",
-        echo   "thinking_enabled": true,
         echo   "show_tool_timing": true,
         echo   "show_context_bar": true,
         echo   "permission_default": "ask",
+        echo   "max_iterations": 255,
+        echo   "max_tokens": 0,
+        echo   "max_context_tokens": 256000,
+        echo   "compact_threshold": 0.85,
+        echo   "orchestrator_model": "deepseek-flash",
+        echo   "subagent_model": "deepseek-flash",
+        echo   "reasoning_effort": 75,
+        echo   "thinking_enabled": true,
+        echo   "vision_backend": "none",
+        echo   "vision_model": null,
+        echo   "vision_host": null,
+        echo   "vision_max_image_dim": 800,
+        echo   "vision_timeout": 180,
         echo   "vision_num_ctx": 4096,
-        echo   "vision_keep_alive": "5m"
+        echo   "vision_keep_alive": "5m",
+        echo   "vision_endpoint": "responses",
+        echo   "deepseek_vision_model": "deepseek-flash",
+        echo   "or_default_model": "google/gemma-4-26b-a4b-it:free",
+        echo   "or_vision_models": null,
+        echo   "or_credits": false,
+        echo   "or_sub_enabled": false,
+        echo   "surge_notify": true,
+        echo   "surge_pause": false,
+        echo   "surge_pause_buffer_minutes": 5,
+        echo   "write_backup": true,
+        echo   "write_backup_keep": 5
         echo }
     )
     call :ok "wrote default config.json"

@@ -10,6 +10,7 @@ usable as ``/model pro``.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from typing import Optional
 
@@ -22,12 +23,20 @@ from . import __version__
 from . import commands as registry
 from . import ollama_client
 from . import openrouter_client as or_client
+from . import or_subagents
+from . import project_instructions
 from . import surge
 from . import ui
 from .commands import Command
+from .effort import MAX_EFFORT, parse_effort_value
 from .config import (
     AVAILABLE_MODELS,
     ITERATION_NOTICE_EVERY,
+    MODEL_ALIASES,
+    MAX_COMPACT_THRESHOLD,
+    MAX_CONTEXT_TOKENS,
+    MIN_COMPACT_THRESHOLD,
+    MIN_CONTEXT_TOKENS,
     MIN_ITERATIONS,
     MIN_OUTPUT_TOKENS,
     PERSISTED_KEYS,
@@ -35,6 +44,8 @@ from .config import (
     UNAVAILABLE_MODELS,
     UNLIMITED_ITERATIONS,
     UNLIMITED_OUTPUT_TOKENS,
+    describe_compact_threshold,
+    describe_context_window,
     describe_max_tokens,
     describe_steps,
     get_config_file,
@@ -42,6 +53,7 @@ from .config import (
     get_project_config_file,
     get_project_root,
     get_scratch_dir,
+    load_config,
     save_config,
     settings,
     load_api_key,
@@ -49,9 +61,15 @@ from .config import (
 )
 from .orchestrator import Orchestrator
 from .cache import get_cache
+from .working_set import (
+    judge_goal_completion,
+    load as load_working_set,
+    mirror_working_set,
+    set_goal,
+)
 from .signals import get_signals, hit_rate_verdict
 from .prompt import Reader, choose, confirm, install_hint
-from .tools.registry import ALLOW, ASK, BLOCK, get_registry, _describe_age
+from .tools.registry import ALLOW, ASK, BLOCK, get_registry, restore_newest_backup, _describe_age
 from .ui import Glyph, console, gauge, human_bytes, human_ms, kv_table, panel
 from .usage import PRICING, format_cost, get_usage
 
@@ -67,6 +85,7 @@ class CLI:
         missing = registry.check_handlers(self)
         if missing:  # a wiring mistake, not a user error — fail loudly at startup
             raise RuntimeError(f"Commands without handlers: {', '.join(missing)}")
+        self.last_goal_judgment: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Chrome
@@ -78,10 +97,11 @@ class CLI:
         frac = self.orch.context_fraction()
         vision = settings.effective_vision_model if settings.vision_enabled else "off"
         surge_badge = " · SURGE 2×" if surge.is_surge() else ""
+        or_sub_badge = " · or-sub" if settings.or_sub_enabled else ""
         return (
             f" {settings.orchestrator_model} · think {settings.reasoning_effort} "
             f"· ctx {frac:.0%} of {settings.max_context_tokens // 1000}k "
-            f"· {format_cost(usage.cost())} · vision {vision}{surge_badge} · /help "
+            f"· {format_cost(usage.cost())} · vision {vision}{surge_badge}{or_sub_badge} · /help "
         )
 
     def print_banner(self):
@@ -98,7 +118,7 @@ class CLI:
                 project=str(get_project_root()),
                 home=str(get_home()),
                 model=settings.orchestrator_model,
-                effort=settings.reasoning_effort if settings.thinking_enabled else "off",
+                effort=str(settings.reasoning_effort) if settings.thinking_enabled else "off",
                 verbose=settings.verbose,
                 vision=self.vision_status(),
                 ollama=ollama_line,
@@ -226,10 +246,17 @@ class CLI:
                 ),
                 ("vision", self.vision_status()),
                 (
+                    "or-sub",
+                    f"{'on' if settings.or_sub_enabled else 'off'} {Glyph.DOT} "
+                    f"primary {or_subagents.or_sub_primary() or 'none'} {Glyph.DOT} "
+                    f"/orsub to manage",
+                ),
+                (
                     "ollama",
                     f"{ollama_client.resolve_host()} [muted]({ollama_client.host_source()})[/muted]",
                 ),
                 ("project", str(get_project_root())),
+                ("instructions", self._g023_status_line()),
                 ("cache", self._cache_size_line()),
             ]
         )
@@ -265,6 +292,160 @@ class CLI:
         self.orch.reset()
         console.print(f"[ok]{Glyph.CHECK} Conversation and counters cleared.[/ok]")
 
+    def cmd_resume(self, arg: str = "") -> None:
+        token = (arg or "").strip().lower()
+        if token in ("log", "logs", "handoff"):
+            self._resume_objective_log()
+            return
+        items, ws, path = self.orch.resume_from_latest()
+        if path is None:
+            # Same-session JSONL missing: fall back to the last objective handoff.
+            if self._resume_objective_log(quiet_if_missing=True):
+                return
+            console.print("[muted]No session log under .g023/sessions/.[/muted]")
+            return
+        n = len(items)
+        console.print(
+            f"[ok]{Glyph.CHECK} Resumed {n} item(s) from [muted]{path}[/muted][/ok]"
+        )
+        mismatch = getattr(self.orch, "prefix_mismatch", None)
+        if mismatch:
+            console.print(f"[warn]{mismatch}[/warn]")
+
+    def _resume_objective_log(self, quiet_if_missing: bool = False) -> bool:
+        items, ws, path = self.orch.seed_from_objective_log()
+        if path is None:
+            if not quiet_if_missing:
+                console.print("[muted]No objective handoff under .g023/logs/.[/muted]")
+            return False
+        n = len(items)
+        console.print(
+            f"[ok]{Glyph.CHECK} New orchestration from handoff "
+            f"[muted]{path}[/muted] ({n} item(s))[/ok]"
+        )
+        return True
+
+    def cmd_learn(self, arg: str = "") -> None:
+        from . import learn
+
+        raw = (arg or "").strip()
+        if not raw:
+            st = learn.status()
+            console.print(
+                f"learn [muted]home {st['home']} ({st['home_index']} index) "
+                f"{Glyph.DOT} project {st['project']} ({st['project_index']} index) "
+                f"{Glyph.DOT} puts left {st['session_puts_remaining']}[/muted]"
+            )
+            return
+        parts = raw.split(None, 1)
+        action = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if action == "search":
+            if not rest:
+                console.print("[muted]Usage: /learn search <query>[/muted]")
+                return
+            hits = learn.search(rest)
+            if not hits:
+                console.print("[muted]No catalog hits.[/muted]")
+                return
+            for hit in hits:
+                console.print(hit.get("line") or hit.get("id"))
+            return
+        if action == "get":
+            gid = rest.split()[0] if rest else ""
+            if not gid:
+                console.print("[muted]Usage: /learn get <id>[/muted]")
+                return
+            result = learn.get(gid, count_turn=False)
+            if not result.get("ok"):
+                console.print(f"[warn]{result.get('error')}[/warn]")
+                return
+            console.print(result.get("body") or "")
+            return
+        if action == "save":
+            # /learn save <id> <scope> <when> | <title>
+            if "|" in rest:
+                left, _, title = rest.partition("|")
+            else:
+                left, title = rest, ""
+            bits = left.split()
+            if len(bits) < 2:
+                console.print(
+                    "[muted]Usage: /learn save <id> <scope> <when> | <title>[/muted]"
+                )
+                return
+            gid, scope = bits[0], bits[1]
+            when = ",".join(bits[2:]) if len(bits) > 2 else gid
+            title = title.strip() or gid
+            body = (
+                f"# When\n\n{title}\n\n# Do\n\n(see title)\n\n"
+                f"# Do not\n\n-\n\n# Why (observed)\n\nSaved by the user on "
+                f"{learn._today()}.\n"
+            )
+            result = learn.put(
+                {
+                    "id": gid,
+                    "kind": "procedure",
+                    "scope": scope,
+                    "title": title,
+                    "when": when,
+                    "created": learn._today(),
+                    "evidence": "user:explicit",
+                },
+                body,
+                evidence="user:explicit",
+                source="user:explicit",
+            )
+            if result.get("ok"):
+                console.print(f"[ok]{Glyph.CHECK} saved {result.get('id')} ({result.get('scope')})[/ok]")
+            else:
+                console.print(f"[warn]{result.get('error')}[/warn]")
+            return
+        if action == "forget":
+            gid = rest.split()[0] if rest else ""
+            if not gid:
+                console.print("[muted]Usage: /learn forget <id>[/muted]")
+                return
+            result = learn.forget(gid)
+            if result.get("ok"):
+                console.print(f"[ok]{Glyph.CHECK} forgot {gid}[/ok]")
+            else:
+                console.print(f"[warn]{result.get('error')}[/warn]")
+            return
+        if action == "outcome":
+            bits = rest.split()
+            if len(bits) < 2:
+                console.print("[muted]Usage: /learn outcome <id> helped|harmed[/muted]")
+                return
+            result = learn.outcome(bits[0], bits[1])
+            if result.get("ok"):
+                console.print(
+                    f"[ok]{Glyph.CHECK} {bits[0]} {bits[1]} "
+                    f"(helpful {result.get('helpful')} harmful {result.get('harmful')})[/ok]"
+                )
+            else:
+                console.print(f"[warn]{result.get('error')}[/warn]")
+            return
+        console.print("[muted]Usage: /learn [search|get|save|forget|outcome][/muted]")
+
+    def cmd_undo(self, arg: str = "") -> None:
+        path = arg.strip()
+        if not path:
+            files = load_working_set().get("files") or []
+            if files:
+                path = str(files[-1].get("path") or "")
+        if not path:
+            console.print("[muted]Usage: /undo <path>[/muted]")
+            return
+        result = restore_newest_backup(path)
+        if result.get("error"):
+            console.print(f"[bad]{result['error']}[/bad]")
+            return
+        console.print(
+            f"[ok]{Glyph.CHECK} Restored [key]{result['path']}[/key] "
+            f"from [muted]{result['restored_from']}[/muted][/ok]"
+        )
+
     def cmd_exit(self, arg: str = "") -> None:
         self.running = False
 
@@ -273,7 +454,11 @@ class CLI:
     # ------------------------------------------------------------------
 
     def cmd_model(self, arg: str = "") -> None:
-        aliases = {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"}
+        aliases = {
+            "flash": "deepseek-flash",
+            "pro": "deepseek-v4-pro",
+            **MODEL_ALIASES,
+        }
         raw = arg.strip().lower()
         target = aliases.get(raw, raw) if raw else None
 
@@ -324,18 +509,27 @@ class CLI:
 
     def cmd_thinking(self, arg: str = "") -> None:
         value = arg.strip().lower()
-        aliases = {"none": "off", "disabled": "off", "medium": "high", "mid": "high"}
+        aliases = {"none": "off", "disabled": "off", "mid": "medium"}
         value = aliases.get(value, value)
 
         if not value:
             options = [
-                ("low", "quick answers, fewest reasoning tokens"),
-                ("high", "the default — good reasoning without excess"),
-                ("max", "hardest problems; noticeably more output tokens"),
+                ("low", "light reasoning (effort 50)"),
+                ("high", "sweetspot (effort 75) — default and ceiling"),
                 ("off", "no thinking block at all"),
             ]
-            current = settings.reasoning_effort if settings.thinking_enabled else "off"
-            default = [o[0] for o in options].index(current) + 1
+            if not settings.thinking_enabled:
+                current = "off"
+            else:
+                n = parse_effort_value(settings.reasoning_effort)
+                if n is None or n <= 0:
+                    current = "off"
+                elif n >= 75:
+                    current = "high"
+                else:
+                    current = "low"
+            labels = [o[0] for o in options]
+            default = labels.index(current) + 1 if current in labels else 2
             picked = choose("Reasoning effort", options, default=default)
             if picked is None:
                 return
@@ -344,16 +538,42 @@ class CLI:
         if value == "off":
             settings.thinking_enabled = False
             save_config()
+            self.orch.release_prefix_effort()
             console.print(f"[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
             return
-        if value not in ("low", "high", "max"):
-            console.print(f"[warn]Unknown effort:[/warn] {arg}  [muted](low | high | max | off)[/muted]")
-            return
+        named = {"low": 50, "high": 75, "max": MAX_EFFORT}
+        if value in named:
+            n = named[value]
+        else:
+            n = parse_effort_value(value)
+            if n is None:
+                console.print(
+                    f"[warn]Unknown effort:[/warn] {arg}  "
+                    f"[muted](1-100 | low | high | max | off; 75 is the ceiling)[/muted]"
+                )
+                return
+            if n == 0:
+                settings.thinking_enabled = False
+                save_config()
+                self.orch.release_prefix_effort()
+                console.print(f"[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
+                return
 
-        settings.reasoning_effort = value  # type: ignore[assignment]
+        settings.reasoning_effort = n
         settings.thinking_enabled = True
         save_config()
-        console.print(f"[ok]{Glyph.CHECK} Reasoning effort {Glyph.ARROW} {value}[/ok] [muted]·saved[/muted]")
+        self.orch.release_prefix_effort()
+        asked_above = value in ("max", "xhigh")
+        if not asked_above:
+            try:
+                asked_above = int(value) > MAX_EFFORT
+            except ValueError:
+                asked_above = False
+        cap_note = f" (capped; {MAX_EFFORT} is the ceiling)" if asked_above else ""
+        console.print(
+            f"[ok]{Glyph.CHECK} Reasoning effort {Glyph.ARROW} {n}{cap_note}[/ok] "
+            f"[muted]·saved[/muted]"
+        )
 
     VERBOSE_HELP = {
         "low": "the answer, plus one line per tool call",
@@ -488,6 +708,95 @@ class CLI:
             f"[muted]{Glyph.DOT} replies longer than this are cut off ·saved[/muted]"
         )
 
+    def cmd_max_ctx(self, arg: str = "") -> None:
+        value = arg.strip().lower()
+
+        if not value:
+            console.print(
+                f"[key]Context window[/key] {Glyph.ARROW} "
+                f"{describe_context_window(settings.max_context_tokens)}  "
+                f"[muted]{Glyph.DOT} auto-compact fires at "
+                f"{describe_compact_threshold(settings.compact_threshold)} "
+                f"(/max-ctx <n> to change, /max-ctx default to restore the "
+                f"shipped setting)[/muted]"
+            )
+            return
+
+        if value in ("default", "reset"):
+            count = Settings.max_context_tokens
+        else:
+            try:
+                count = int(value.replace(",", "").replace("_", ""))
+            except ValueError:
+                console.print(
+                    f"[warn]Not a number:[/warn] {escape(arg.strip())}  "
+                    f"[muted](a token count, or 'default')[/muted]"
+                )
+                return
+
+        if not MIN_CONTEXT_TOKENS <= count <= MAX_CONTEXT_TOKENS:
+            console.print(
+                f"[warn]Out of range:[/warn] {count:,}  "
+                f"[muted]({MIN_CONTEXT_TOKENS:,}–{MAX_CONTEXT_TOKENS:,}; "
+                f"DeepSeek's real ceiling is 1M, the shipped default is "
+                f"{Settings.max_context_tokens // 1000}k)[/muted]"
+            )
+            return
+
+        settings.max_context_tokens = count
+        save_config()
+        console.print(
+            f"[ok]{Glyph.CHECK} Context window {Glyph.ARROW} "
+            f"{describe_context_window(count)}[/ok] "
+            f"[muted]{Glyph.DOT} auto-compact now fires at "
+            f"{describe_compact_threshold(settings.compact_threshold)} ·saved[/muted]"
+        )
+
+    def cmd_compact_threshold(self, arg: str = "") -> None:
+        value = arg.strip().lower()
+
+        if not value:
+            console.print(
+                f"[key]Auto-compact trigger[/key] {Glyph.ARROW} "
+                f"{describe_compact_threshold(settings.compact_threshold)} "
+                f"[muted]{Glyph.DOT} = "
+                f"{settings.compact_threshold * settings.max_context_tokens:,.0f} tokens "
+                f"(/compact-threshold <0.01–1.0> to change, "
+                f"/compact-threshold default to restore the shipped setting)[/muted]"
+            )
+            return
+
+        if value in ("default", "reset"):
+            fraction = Settings.compact_threshold
+        else:
+            try:
+                fraction = float(value.rstrip("%"))
+                if value.endswith("%"):
+                    fraction /= 100.0
+            except ValueError:
+                console.print(
+                    f"[warn]Not a fraction:[/warn] {escape(arg.strip())}  "
+                    f"[muted](0.01–1.0, e.g. 0.9 or 90%, or 'default')[/muted]"
+                )
+                return
+
+        if not MIN_COMPACT_THRESHOLD <= fraction <= MAX_COMPACT_THRESHOLD:
+            console.print(
+                f"[warn]Out of range:[/warn] {escape(arg.strip())}  "
+                f"[muted]({MIN_COMPACT_THRESHOLD}–{MAX_COMPACT_THRESHOLD}; "
+                f"0 would compact every turn, >1 never fires)[/muted]"
+            )
+            return
+
+        settings.compact_threshold = fraction
+        save_config()
+        console.print(
+            f"[ok]{Glyph.CHECK} Auto-compact trigger {Glyph.ARROW} "
+            f"{describe_compact_threshold(fraction)} "
+            f"[muted]{Glyph.DOT} = {fraction * settings.max_context_tokens:,.0f} tokens "
+            f"· compacts once the window passes it ·saved[/muted]"
+        )
+
     # ------------------------------------------------------------------
     # Context commands
     # ------------------------------------------------------------------
@@ -509,8 +818,10 @@ class CLI:
             save_config()
             console.print(
                 f"[ok]{Glyph.CHECK} Auto-compact {'on' if settings.auto_compact else 'off'}[/ok] "
-                f"[muted]{Glyph.DOT} triggers at {settings.compact_threshold:.0%} of "
-                f"{settings.max_context_tokens:,} tokens ·saved[/muted]"
+                f"[muted]{Glyph.DOT} triggers at "
+                f"{describe_compact_threshold(settings.compact_threshold)} "
+                f"({settings.max_context_tokens:,} tokens) "
+                f"· /max-ctx /compact-threshold to move it ·saved[/muted]"
             )
             return
 
@@ -530,6 +841,56 @@ class CLI:
 
         report = await self.orch.compact(instructions=arg)
         console.print(f"[ok]{report}[/ok]")
+
+    async def cmd_g023_compact(self, arg: str = "") -> None:
+        if arg.strip():
+            console.print("[muted]Usage: /g023-compact[/muted]")
+            return
+
+        source = project_instructions.full_path()
+        dest = project_instructions.compact_path()
+        if not source.is_file():
+            console.print(
+                f"[warn]No {project_instructions.FULL_NAME} in the project root.[/warn] "
+                f"[muted]Create it (same role as AGENTS.md) then run /g023-compact.[/muted]"
+            )
+            return
+        if dest.is_file() and not confirm(
+            f"Overwrite existing {project_instructions.COMPACT_NAME} "
+            f"from {project_instructions.FULL_NAME}?",
+            default=True,
+        ):
+            return
+
+        report = await project_instructions.compact(self.orch.client, overwrite=True)
+        style = "ok" if report.ok else "warn"
+        console.print(f"[{style}]{report.message}[/{style}]")
+
+    @staticmethod
+    def _g023_status_line() -> str:
+        from . import memory_notes
+
+        active = project_instructions.active_file()
+        mem = memory_notes.status_line()
+        if active is None:
+            return (
+                f"none [muted]{Glyph.DOT} add {project_instructions.FULL_NAME} "
+                f"for standing project instructions {Glyph.DOT} memory {mem}[/muted]"
+            )
+        freeze = "frozen for this process; file edits apply next process"
+        if active.name == project_instructions.COMPACT_NAME:
+            return (
+                f"{active.name} [muted]{Glyph.DOT} {freeze} "
+                f"{Glyph.DOT} memory {mem} "
+                f"{Glyph.DOT} /g023-compact to refresh from "
+                f"{project_instructions.FULL_NAME}[/muted]"
+            )
+        return (
+            f"{active.name} [muted]{Glyph.DOT} {freeze} "
+            f"{Glyph.DOT} memory {mem} "
+            f"{Glyph.DOT} /g023-compact to write "
+            f"{project_instructions.COMPACT_NAME}[/muted]"
+        )
 
     def cmd_context(self, arg: str = "") -> None:
         breakdown = self.orch.state.role_breakdown()
@@ -703,8 +1064,16 @@ class CLI:
             "output per response · /max-tokens",
         )
         row("temperature", settings.temperature)
-        row("max_context_tokens", f"{settings.max_context_tokens:,}")
-        row("compact_threshold", f"{settings.compact_threshold:.0%}", "auto-compact trigger")
+        row(
+            "max_context_tokens",
+            describe_context_window(settings.max_context_tokens),
+            "/max-ctx",
+        )
+        row(
+            "compact_threshold",
+            describe_compact_threshold(settings.compact_threshold),
+            "auto-compact trigger · /compact-threshold",
+        )
         row("auto_compact", settings.auto_compact, "/compact auto on|off")
         row(
             "max_iterations",
@@ -717,7 +1086,7 @@ class CLI:
         row("vision_backend", settings.vision_backend, "/vision")
         row("vision_model", settings.vision_model or "—")
         row("vision_host", settings.vision_host or f"(auto: {ollama_client.resolve_host()})", "/ollama host")
-        row("vision_max_image_dim", settings.vision_max_image_dim, "px on the longest edge")
+        row("vision_max_image_dim", settings.vision_max_image_dim, "legacy; vision send is 800px")
         row("vision_num_ctx", f"{settings.vision_num_ctx:,}")
         row("vision_timeout", f"{settings.vision_timeout}s")
         row("vision_keep_alive", settings.vision_keep_alive, "how long the model stays in VRAM")
@@ -889,6 +1258,7 @@ class CLI:
                     ("file summaries", f"{stats['files']:,}"),
                     ("vision answers", f"{stats['vision']:,}"),
                     ("cached URLs", f"{stats['web']:,}"),
+                    ("tool vault", f"{stats.get('vault', 0):,}"),
                     ("database", self._cache_size_line()),
                 ]
             )
@@ -1550,9 +1920,16 @@ class CLI:
             console.print(
                 f"[ok]{Glyph.CHECK} Surge notifications {'ON' if on else 'OFF'}[/ok] [muted]·saved[/muted]"
             )
+        elif sub == "now":
+            active = surge.is_surge()
+            console.print(
+                f"[heading]now[/heading] "
+                f"{'[bad]SURGE ACTIVE — prices 2× off-peak[/bad]' if active else '[ok]off-peak (half of peak)[/ok]'}"
+            )
+            self._surge_status()
         else:
             console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
-            console.print("[muted]/surge [status|on|off|buffer <min>|notify on|off] · /help surge[/muted]")
+            console.print("[muted]/surge [status|on|off|buffer <min>|notify on|off|now] · /help surge[/muted]")
 
     def _surge_status(self) -> None:
         from datetime import datetime
@@ -1687,6 +2064,256 @@ class CLI:
         )
 
     # ------------------------------------------------------------------
+    # /orsub — OpenRouter subagent offload
+    # ------------------------------------------------------------------
+
+    async def cmd_orsub(self, arg: str = "") -> None:
+        parts = arg.split(maxsplit=2)
+        sub = parts[0].lower() if parts else "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        extra = parts[2].strip() if len(parts) > 2 else ""
+
+        if sub in ("status", ""):
+            self._orsub_status()
+        elif sub in ("on", "enable"):
+            settings.or_sub_enabled = True
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} OpenRouter subagent offload {Glyph.ARROW} on[/ok] "
+                f"[muted]·saved[/muted]"
+            )
+            primary = or_subagents.or_sub_primary()
+            if primary:
+                console.print(f"[muted]Agent turns will start on [heading]{primary}[/heading].[/muted]")
+            else:
+                console.print("[muted]No models yet — /orsub add <model> to configure one.[/muted]")
+        elif sub in ("off", "disable"):
+            settings.or_sub_enabled = False
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} OpenRouter subagent offload {Glyph.ARROW} off[/ok] "
+                f"[muted]·saved · Agent turns return to {settings.subagent_model}[/muted]"
+            )
+        elif sub == "primary":
+            if not rest:
+                console.print(f"[muted]Current primary:[/muted] {or_subagents.or_sub_primary() or 'none'}")
+                console.print("[muted]Usage: /orsub primary <model-id>[/muted]")
+                return
+            models = or_subagents.load_or_sub_config()["models"]
+            ids = {m["id"] for m in models}
+            if rest not in ids:
+                console.print(f"[warn]Unknown model:[/warn] {rest}")
+                console.print(f"[muted]Known: {', '.join(sorted(ids)) or 'none — add one with /orsub add'}[/muted]")
+                return
+            or_subagents.save_or_sub_config({"primary": rest, "models": models})
+            console.print(
+                f"[ok]{Glyph.CHECK} OpenRouter subagent primary {Glyph.ARROW} "
+                f"[heading]{rest}[/heading][/ok] [muted]· both OR_SUB_MODELS.json files[/muted]"
+            )
+        elif sub == "add":
+            if not rest:
+                console.print("[muted]Usage: /orsub add <model-id> (e.g. openai/gpt-5.2)[/muted]")
+                return
+            models = or_subagents.load_or_sub_config()["models"]
+            if any(m["id"] == rest for m in models):
+                console.print(f"[warn]{rest} is already in the list.[/warn]")
+                return
+            console.print(f"[muted]Looking up {rest} in the OpenRouter catalogue…[/muted]")
+            info = or_subagents.fetch_model_info(rest)
+            if info is None:
+                console.print(
+                    f"[warn]Could not verify {rest} against the OpenRouter catalogue.[/warn]"
+                )
+                console.print(
+                    "[muted]The id may be wrong, or the catalogue is unreachable. "
+                    "Adding with default limits anyway.[/muted]"
+                )
+                info = {
+                    "context_window": 200_000,
+                    "max_output_tokens": 32_768,
+                    "reasoning_levels": ["none", "low", "medium", "high"],
+                    "default_reasoning": "high",
+                }
+            entry = {"id": rest, **info, "notes": ""}
+            models.append(entry)
+            primary = or_subagents.load_or_sub_config().get("primary")
+            or_subagents.save_or_sub_config({"primary": primary, "models": models})
+            console.print(
+                f"[ok]{Glyph.CHECK} Added [heading]{rest}[/heading][/ok] "
+                f"[muted]· ctx {entry['context_window']:,} · max out {entry['max_output_tokens']:,} · "
+                f"reasoning {'/'.join(entry['reasoning_levels'])}[/muted]"
+            )
+            console.print(
+                "[muted]Written to this project's OR_SUB_MODELS.json and the main copy "
+                "next to OK.dat — every project can use it now.[/muted]"
+            )
+            if not settings.or_sub_enabled:
+                console.print("[muted]Enable the offload with [bold]/orsub on[/bold].[/muted]")
+        elif sub == "remove":
+            if not rest:
+                console.print("[muted]Usage: /orsub remove <model-id>[/muted]")
+                return
+            config = or_subagents.load_or_sub_config()
+            models = [m for m in config["models"] if m["id"] != rest]
+            if len(models) == len(config["models"]):
+                console.print(f"[warn]{rest} is not in the list.[/warn]")
+                return
+            primary = config["primary"]
+            if primary == rest:
+                primary = models[0]["id"] if models else None
+            or_subagents.save_or_sub_config({"primary": primary, "models": models})
+            console.print(
+                f"[ok]{Glyph.CHECK} Removed {rest}[/ok] [muted]· from both OR_SUB_MODELS.json files[/muted]"
+            )
+            if primary and primary != rest:
+                console.print(f"[muted]Primary is now [heading]{primary}[/heading].[/muted]")
+        elif sub in ("models", "list"):
+            self._orsub_status(detail=True)
+        elif sub == "priority":
+            if not rest or not extra:
+                console.print("[muted]Usage: /orsub priority <model-id> <rank>[/muted]")
+                return
+            try:
+                rank = int(extra)
+            except ValueError:
+                console.print(f"[warn]Priority must be a number, got:[/warn] {extra}")
+                return
+            config = or_subagents.load_or_sub_config()
+            models = list(config["models"])
+            ids = [m["id"] for m in models]
+            if rest not in ids:
+                console.print(f"[warn]Unknown model:[/warn] {rest}")
+                return
+            if rank < 1 or rank > len(models):
+                console.print(f"[warn]Priority must be 1–{len(models)}.[/warn]")
+                return
+            entry = next(m for m in models if m["id"] == rest)
+            models.remove(entry)
+            models.insert(rank - 1, entry)
+            or_subagents.save_or_sub_config({"primary": config["primary"], "models": models})
+            console.print(
+                f"[ok]{Glyph.CHECK} [heading]{rest}[/heading] priority {Glyph.ARROW} {rank}[/ok] "
+                f"[muted]· both OR_SUB_MODELS.json files[/muted]"
+            )
+        elif sub == "reasoning":
+            model_entry = or_subagents.get_model(rest)
+            if model_entry is None:
+                if not rest:
+                    console.print("[muted]Usage: /orsub reasoning <model-id> <level>[/muted]")
+                else:
+                    console.print(f"[warn]Unknown model:[/warn] {rest}")
+                return
+            if not extra:
+                console.print(
+                    f"[muted]{rest}: default reasoning[/muted] "
+                    f"[heading]{model_entry['default_reasoning']}[/heading] "
+                    f"[muted]· accepts {'/'.join(model_entry['reasoning_levels'])}[/muted]"
+                )
+                return
+            levels = model_entry["reasoning_levels"]
+            if extra not in levels:
+                console.print(
+                    f"[warn]{extra} is not a level {rest} accepts.[/warn] "
+                    f"[muted]({'/'.join(levels)})[/muted]"
+                )
+                return
+            config = or_subagents.load_or_sub_config()
+            models = list(config["models"])
+            for m in models:
+                if m["id"] == rest:
+                    m["default_reasoning"] = extra
+            or_subagents.save_or_sub_config({"primary": config["primary"], "models": models})
+            console.print(
+                f"[ok]{Glyph.CHECK} {rest} default reasoning {Glyph.ARROW} "
+                f"[heading]{extra}[/heading][/ok] [muted]· both OR_SUB_MODELS.json files[/muted]"
+            )
+        elif sub == "test":
+            await self._orsub_test(rest or None)
+        else:
+            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
+            console.print(
+                "[muted]/orsub [status|on|off|primary <id>|add <id>|remove <id>|models|"
+                "priority <id> <n>|reasoning <id> <level>|test] · /help orsub[/muted]"
+            )
+
+    def _orsub_status(self, detail: bool = False) -> None:
+        key_ok = (get_home() / "OK.dat").exists()
+        config = or_subagents.load_or_sub_config()
+        models = config["models"]
+        primary = config["primary"]
+        usage = or_subagents.get_or_sub_usage()
+        rows = [
+            ("backend", f"{'[ok]on[/ok]' if settings.or_sub_enabled else '[muted]off[/muted]'} · /orsub on"),
+            ("key", f"[ok]{Glyph.CHECK} OK.dat present[/ok]" if key_ok else "[bad]OK.dat missing[/bad]"),
+            ("primary", f"[heading]{primary}[/heading]" if primary else "[muted]none[/muted]"),
+            ("models", f"{len(models)} in OR_SUB_MODELS.json"),
+            ("requests today", str(usage.requests)),
+            ("rate limits today", str(usage.rate_limits)),
+            ("hops today", str(usage.hops)),
+        ]
+        console.print()
+        console.print(panel(kv_table(rows), "OpenRouter subagents"))
+        table = Table(show_header=True, box=None, padding=(0, 2, 0, 0))
+        table.add_column("", width=2, no_wrap=True)
+        table.add_column("model", style="heading", overflow="fold")
+        table.add_column("prio", justify="right", no_wrap=True)
+        table.add_column("ctx", justify="right", no_wrap=True)
+        table.add_column("max out", justify="right", no_wrap=True)
+        table.add_column("reasoning", overflow="fold")
+        for i, m in enumerate(models, start=1):
+            mark = "[accent]★[/accent]" if m["id"] == primary else ""
+            table.add_row(
+                mark,
+                m["id"],
+                str(m.get("priority", i)),
+                f"{int(m.get('context_window', 0)):,}",
+                f"{int(m.get('max_output_tokens', 0)):,}",
+                f"{'/'.join(m.get('reasoning_levels') or [])} · default {m.get('default_reasoning')}",
+            )
+        console.print(table)
+        console.print(
+            "[muted]/orsub on · primary <id> · add <id> · remove <id> · priority <id> <n> · "
+            "reasoning <id> <level> · test[/muted]"
+        )
+
+    async def _orsub_test(self, model_id: Optional[str] = None) -> None:
+        """Run one real offload, on a specific model or through the failover."""
+        if model_id:
+            console.print(f"[muted]Testing {model_id} directly…[/muted]")
+            try:
+                result = await or_subagents.or_sub_chat(
+                    model_id=model_id,
+                    system="You are a connectivity test. Reply with exactly: OK",
+                    prompt="Reply with exactly: OK",
+                    reasoning=None,
+                )
+                console.print(
+                    f"[ok]{Glyph.CHECK} {model_id} answered in {human_ms(result.elapsed_ms)}:[/ok] "
+                    f"{result.answer[:200]}"
+                )
+            except Exception as e:
+                console.print(f"[bad]✗ {model_id} failed:[/bad] {e}")
+            return
+        if not or_subagents.load_or_sub_models():
+            console.print("[warn]No models configured — /orsub add <model> first.[/warn]")
+            return
+        console.print(f"[muted]Testing offload (primary first, failover on rate limits)…[/muted]")
+        try:
+            result, attempts = await or_subagents.or_sub_with_failover(
+                system="You are a connectivity test. Reply with exactly: OK",
+                prompt="Reply with exactly: OK",
+                reasoning=None,
+            )
+            hop = f" after {len(attempts) - 1} hop(s)" if len(attempts) > 1 else ""
+            console.print(
+                f"[ok]{Glyph.CHECK} [heading]{result.model}[/heading] answered{hop} in "
+                f"{human_ms(result.elapsed_ms)}: {result.answer[:200]}[/ok]"
+            )
+            console.print(f"[muted]tried: {', '.join(attempts)}[/muted]")
+        except Exception as e:
+            console.print(f"[bad]✗ Offload failed:[/bad] {e}")
+
+    # ------------------------------------------------------------------
     # /config — global vs per-project
     # ------------------------------------------------------------------
 
@@ -1731,10 +2358,10 @@ class CLI:
                 f"{get_config_file()} now applies[/muted]"
             )
             return
-        if sub:
-            console.print("[muted]Usage: /config [status|save|save global|save project|global|project|clear][/muted]")
+        if sub in ("", "status", "show"):
+            self._config_status()
             return
-        self._config_status()
+        console.print("[muted]Usage: /config [status|save|save global|save project|global|project|clear][/muted]")
 
     def _config_status(self) -> None:
         global_path = get_config_file()
@@ -1780,13 +2407,25 @@ class CLI:
         # so the turn runs uncapped and the loop's progress line plus Ctrl-C are
         # what keep it watched. The saved /steps setting is untouched — this is
         # for the duration of this turn only, and is not written to config.
+        # Effort is the harness ceiling (75 / high), not the API's max: max
+        # burns the output budget on thinking. A same-response [next_effort]
+        # on the final answer is kept for the next user request; only an
+        # omitted trailer restores the pre-goal dial.
         previous_iterations = settings.max_iterations
-        settings.reasoning_effort = "max"  # type: ignore[assignment]
+        settings.reasoning_effort = MAX_EFFORT
         settings.thinking_enabled = True
         settings.max_iterations = UNLIMITED_ITERATIONS
+        self.orch.release_prefix_effort()
+        try:
+            set_goal(arg)
+            mirror_working_set(
+                self.orch.state.items, load_working_set(), self.orch._sticky_goal_item()
+            )
+        except Exception:
+            pass
         console.print(
-            f"[accent]Goal[/accent] [muted]{Glyph.DOT} max reasoning effort, "
-            f"no step limit for this turn[/muted]\n{arg}"
+            f"[accent]Goal[/accent] [muted]{Glyph.DOT} ceiling reasoning effort "
+            f"({MAX_EFFORT}), no step limit for this turn[/muted]\n{arg}"
         )
         try:
             await self.run_prompt(
@@ -1794,9 +2433,35 @@ class CLI:
                 title=f"g023 {Glyph.DOT} goal",
             )
         finally:
-            settings.reasoning_effort = previous  # type: ignore[assignment]
-            settings.thinking_enabled = previous_enabled
+            if not getattr(self.orch, "_next_effort_applied", False):
+                settings.reasoning_effort = previous  # type: ignore[assignment]
+                settings.thinking_enabled = previous_enabled
             settings.max_iterations = previous_iterations
+            self.orch.release_prefix_effort()
+            self._emit_goal_judgment()
+
+    def _emit_goal_judgment(self) -> None:
+        """One completed/not-completed judgment after a /goal turn returns."""
+        try:
+            judgment = judge_goal_completion()
+        except Exception as e:
+            judgment = {
+                "completed": False,
+                "status": "not completed",
+                "reason": f"goal judgment failed: {e}",
+                "pending": [],
+                "done_without_evidence": [],
+            }
+        self.last_goal_judgment = judgment
+        status = judgment.get("status") or (
+            "completed" if judgment.get("completed") else "not completed"
+        )
+        reason = str(judgment.get("reason") or "")
+        style = "good" if judgment.get("completed") else "warn"
+        line = f"[{style}]Goal {status}[/{style}]"
+        if reason:
+            line += f" [muted]{escape(reason)}[/muted]"
+        console.print(line)
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -1940,9 +2605,80 @@ class CLI:
             await self.run_prompt(line)
 
 
-def main():
+def parse_cli_argv(argv: Optional[list[str]] = None) -> dict:
+    """Split process args into a mode the entry point can act on.
+
+    Launchers (`g023.sh`, `g023.bat`) already forward unused tokens to
+    ``python -m g023_code``. Empty argv is the interactive REPL. A leading
+    ``--help``/``-h`` or ``--version``/``-V`` is non-interactive. ``--continue``
+    seeds from the latest ``.g023/logs/`` handoff (else JSONL). Anything
+    else is one prompt, run once, then exit.
+    """
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    continue_flag = False
+    if tokens and tokens[0] in ("--continue", "-c"):
+        continue_flag = True
+        tokens = tokens[1:]
+    if tokens and tokens[0] in ("-h", "--help"):
+        return {"mode": "help", "prompt": "", "continue": False}
+    if tokens and tokens[0] in ("-V", "--version"):
+        return {"mode": "version", "prompt": "", "continue": False}
+    if tokens:
+        return {"mode": "oneshot", "prompt": " ".join(tokens), "continue": continue_flag}
+    return {"mode": "repl", "prompt": "", "continue": continue_flag}
+
+
+def print_flag_help() -> None:
+    """Non-interactive help: program name, usage, and the slash-command list."""
+    console.print(f"g023 Code {__version__}")
+    # Square brackets are rich markup; this line must print as literal usage.
+    console.print(
+        "Usage: python -m g023_code [--help] [--version] [--continue] [prompt ...]",
+        markup=False,
+    )
+    console.print()
+    console.print("With no prompt, starts the interactive REPL.")
+    console.print("A prompt runs one turn and exits.")
+    console.print(
+        "--continue seeds from the latest .g023/logs/ handoff (system + summary)."
+    )
+    console.print()
+    for group, commands in registry.by_group():
+        console.print(f"{group}:")
+        for c in commands:
+            console.print(f"  {c.name}  {c.summary}")
+        console.print()
+    console.print("Type /help inside the REPL for the same catalogue with detail.")
+
+
+async def _run_oneshot(cli: "CLI", prompt: str) -> None:
+    try:
+        load_api_key()
+    except Exception as e:
+        console.print(f"[bad]{e}[/bad]")
+        return
+    await cli.run_prompt(prompt)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parsed = parse_cli_argv(argv)
+    if parsed["mode"] == "help":
+        print_flag_help()
+        return 0
+    if parsed["mode"] == "version":
+        console.print(f"g023 Code {__version__}")
+        return 0
+
     cli = CLI()
     try:
-        asyncio.run(cli.loop())
+        if parsed.get("continue"):
+            seeded = cli._resume_objective_log(quiet_if_missing=True)
+            if not seeded:
+                cli.cmd_resume()
+        if parsed["mode"] == "oneshot":
+            asyncio.run(_run_oneshot(cli, parsed["prompt"]))
+        else:
+            asyncio.run(cli.loop())
     except KeyboardInterrupt:
         console.print(f"\n[muted]Bye.[/muted]")
+    return 0

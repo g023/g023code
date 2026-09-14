@@ -35,9 +35,10 @@ the two vision chat calls.
   original/payload bytes; `bytes_sent` reports how much goes over the
   wire). Loads local files or downloads URLs.
 - `_dimensions(data)` / `_maybe_downscale(data, max_dim)` — Pillow reads
-  the image and downscales the longest edge to `settings.vision_max_image_dim`
-  (0 = off). **This is the difference between a fast pass and an
-  out-of-VRAM error** on small local models.
+  the image and downscales. Vision **send** always uses
+  `VISION_SEND_MAX_SIDE = 800` on each edge (`load_image_for_vision`).
+  `settings.vision_max_image_dim` is a legacy display knob and does not
+  change the bytes sent (`tests/test_vision_resize.py`).
 - `load_image_b64(path_or_url, max_dim, timeout)` — convenience wrapper.
 
 ## Vision chat

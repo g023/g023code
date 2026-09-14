@@ -1,10 +1,11 @@
 {
   "$schema": "g023-code ds_times.json — DeepSeek surge pricing times (loaded by g023_code/config.py)",
   "source": "https://api-docs.deepseek.com/quick_start/pricing/",
-  "effective": "2026-08-17",
+  "effective": "2026-09-10",
   "timezone_anchor": "Asia/Shanghai (Beijing time)",
   "utc_offset_hours": 8,
-  "note": "Off-peak (regular) prices apply in all other hours and are exactly half of the peak (surge) price. Peak windows are anchored to Beijing wall-clock time and reported by the CLI in the machine's local timezone.",
+  "peak_weekdays": [0, 1, 2, 3, 4],
+  "note": "Off-peak (regular) prices apply in all other hours and are exactly half of the peak (surge) price. Peak windows are Monday-Friday only (Python weekday(): Monday=0); weekends are off-peak. Windows are anchored to Beijing wall-clock time and reported by the CLI in the machine's local timezone.",
   "peak_windows": {
     "beijing": [
       ["09:00", "12:00"],

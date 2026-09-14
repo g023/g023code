@@ -8,7 +8,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -109,22 +109,35 @@ def load_openrouter_key() -> str:
 # Model & Runtime Settings
 # ---------------------------------------------------------------------------
 
-ModelId = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
-ReasoningEffort = Literal["low", "high", "max"]
+ModelId = Literal["deepseek-flash", "deepseek-v4-pro"]
+# Stored as int 0–75 (0 = off; 75 is default and ceiling). String aliases
+# coerce on load / ``/thinking``; ``max`` / 100 cap to 75.
+ReasoningEffort = Union[int, str]
 
 # Models the Responses API will actually serve. Everything here runs on
 # ``/responses`` — that is the only endpoint exposing DeepSeek's server-side
-# web_search — and as of 2026-08 it answers a v4-pro request with "Codex
-# integration with deepseek-v4-pro will be available starting early August 2026.
-# Please use deepseek-v4-flash instead for now." Offering pro would just hand the
-# user a model every call fails on, so the choice is withheld until it works.
-AVAILABLE_MODELS: tuple[str, ...] = ("deepseek-v4-flash",)
+# web_search. The configured/sent identity is ``deepseek-flash`` (orchestrator
+# and DeepSeek vision both use it). ``deepseek-v4-pro`` is withheld: the
+# endpoint still reports it is not enabled for this integration.
+AVAILABLE_MODELS: tuple[str, ...] = ("deepseek-flash",)
 UNAVAILABLE_MODELS: dict[str, str] = {
     "deepseek-v4-pro": (
         "DeepSeek has not enabled deepseek-v4-pro on the Responses API yet "
         "(it reports availability from early August 2026)."
     ),
 }
+# Retired ids still found in older config.json files. Mapped onto the live
+# identity on load so an old file never sends a name the API no longer serves.
+MODEL_ALIASES: dict[str, str] = {
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+}
+_MODEL_ALIAS_KEYS = (
+    "orchestrator_model",
+    "subagent_model",
+    "deepseek_vision_model",
+    "vision_model",
+)
 
 # low  — final answer only (default)
 # mid  — answer + per-turn token/cost line + tool result previews
@@ -150,10 +163,28 @@ UNLIMITED_ITERATIONS = 0
 MIN_OUTPUT_TOKENS = 1
 UNLIMITED_OUTPUT_TOKENS = 0
 
+# Bounds on the context window and the auto-compact trigger. The window is the
+# ceiling the conversation may grow into before the cheap model summarises it:
+# ``max_context_tokens`` is that ceiling in tokens (DeepSeek's real limit is
+# 1M; the shipped default is 256k so compaction stays continuation-safe),
+# ``compact_threshold`` the fraction of it at which auto-compaction fires. A
+# 0-token window is meaningless, a threshold of 0 would compact every turn, and
+# one >1 would never fire.
+MIN_CONTEXT_TOKENS = 1_000
+MAX_CONTEXT_TOKENS = 1_000_000
+DEFAULT_CONTEXT_TOKENS = 256_000
+MIN_COMPACT_THRESHOLD = 0.01
+MAX_COMPACT_THRESHOLD = 1.0
+
 # How often the loop prints a progress line, in steps. Every step already updates
 # the spinner, but that line is transient; this one stays in the scrollback, at
 # any verbosity, so a turn that is 60 steps deep says so on its own.
 ITERATION_NOTICE_EVERY = 10
+
+# When a reply is cut off at max_output_tokens with no tool calls, the turn used
+# to end mid-thought — fatal for a long /goal. Nudge and keep going this many
+# times in one turn, then stop so a model that cannot finish still surfaces.
+MAX_OUTPUT_CONTINUES = 3
 
 # OpenRouter fallback when no model is configured for the openrouter backend.
 OPENROUTER_DEFAULT_MODEL = "google/gemma-4-26b-a4b-it:free"
@@ -170,15 +201,18 @@ OPENROUTER_CREDITS_DAILY_LIMIT = 1000
 VISION_ENDPOINTS: tuple[str, ...] = ("responses", "chat_completions")
 
 
-def _load_ds_times() -> tuple[tuple[tuple[int, int], ...], int]:
-    """Surge windows + UTC offset from ds_times.json (home, then project root).
+def _load_ds_times() -> tuple[tuple[tuple[int, int], ...], int, tuple[int, ...]]:
+    """Surge windows + UTC offset + weekdays from ds_times.json.
 
     Falls back to DeepSeek's published sheet when the file is absent or
     unreadable. Windows are parsed from ``HH:MM`` strings into Beijing
     wall-clock hours; ``surge.py`` converts them to the machine's local time.
+    ``peak_weekdays`` uses Python ``datetime.weekday()`` (Monday=0). An empty
+    or missing list means Monday–Friday, matching the published sheet.
     """
     default_windows: tuple[tuple[int, int], ...] = ((9, 12), (14, 18))
     default_offset = 8
+    default_weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
     for path in (
         get_home() / "ds_times.json",
         get_project_root() / "ds_times.json",
@@ -200,19 +234,27 @@ def _load_ds_times() -> tuple[tuple[tuple[int, int], ...], int]:
         offset = data.get("utc_offset_hours", default_offset)
         if not isinstance(offset, int):
             offset = default_offset
-        return parsed, offset
-    return default_windows, default_offset
+        raw_days = data.get("peak_weekdays", default_weekdays)
+        try:
+            weekdays = tuple(int(d) for d in raw_days)
+        except (TypeError, ValueError):
+            weekdays = default_weekdays
+        if not weekdays:
+            weekdays = default_weekdays
+        return parsed, offset, weekdays
+    return default_windows, default_offset, default_weekdays
 
 
 # Surge pricing windows, DeepSeek peak/off-peak (tidal) pricing effective
-# 2026-08-17. Peak hours are 09:00-12:00 and 14:00-18:00 Beijing time (UTC+8),
-# and off-peak prices are half of peak. The windows below are stored in
-# *Beijing* wall-clock hours and converted to the machine's local time by
-# ``surge.py``, so notifications always match the user's clock. The values come
-# from ds_times.json when present (see ``_load_ds_times`` above).
+# 2026-09-10. Peak hours are 09:00-12:00 and 14:00-18:00 Beijing time (UTC+8),
+# Monday–Friday; weekends are off-peak. Off-peak prices are half of peak. The
+# windows below are stored in *Beijing* wall-clock hours and converted to the
+# machine's local time by ``surge.py``, so notifications always match the
+# user's clock. The values come from ds_times.json when present.
 SURGE_PEAK_WINDOWS_BEIJING: tuple[tuple[int, int], ...]
 SURGE_UTC_OFFSET: int
-SURGE_PEAK_WINDOWS_BEIJING, SURGE_UTC_OFFSET = _load_ds_times()
+SURGE_PEAK_WEEKDAYS: tuple[int, ...]
+SURGE_PEAK_WINDOWS_BEIJING, SURGE_UTC_OFFSET, SURGE_PEAK_WEEKDAYS = _load_ds_times()
 
 
 
@@ -230,9 +272,9 @@ def _env_int(name: str, default: int) -> int:
 @dataclass
 class Settings:
     # Models
-    orchestrator_model: ModelId = "deepseek-v4-flash"
-    subagent_model: ModelId = "deepseek-v4-flash"
-    reasoning_effort: ReasoningEffort = "high"
+    orchestrator_model: ModelId = "deepseek-flash"
+    subagent_model: ModelId = "deepseek-flash"
+    reasoning_effort: ReasoningEffort = 75
     thinking_enabled: bool = True
 
     # API
@@ -251,7 +293,7 @@ class Settings:
     # client timeout in api.py is generous.
 
     # Context
-    max_context_tokens: int = 900_000  # leave headroom under 1M
+    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS  # DeepSeek allows up to 1M
     compact_threshold: float = 0.85
 
     # Agent loop: how many model calls one user turn may spend before the loop
@@ -285,14 +327,14 @@ class Settings:
     )
     write_backup_keep: int = field(default_factory=lambda: _env_int("G023_WRITE_BACKUP_KEEP", 5))
 
-    # Vision (external — DeepSeek V4 Flash is text-only)
+    # Vision (optional backends; deepseek reuses deepseek-flash on K.dat)
     vision_backend: str = "none"  # none | ollama | deepseek | openrouter
     vision_api_key: Optional[str] = None
     vision_model: Optional[str] = None  # e.g. "qwen3.5:2b" for the ollama backend
     # Ollama daemon. None = fall back to OLLAMA_HOST, then localhost. Set it to
     # anything reachable over HTTP — the daemon does not have to be local.
     vision_host: Optional[str] = None
-    vision_max_image_dim: int = 1024  # downscale longest edge before inference (0 = off)
+    vision_max_image_dim: int = 800  # display/legacy; vision send is always 800px constrained
     vision_timeout: int = 180
     vision_num_ctx: int = 4096  # context window asked of the local model
     vision_keep_alive: str = "5m"  # how long the daemon holds the model in VRAM
@@ -301,12 +343,17 @@ class Settings:
     # OpenAI-style chat_completions format (see VISION_ENDPOINTS).
     vision_endpoint: str = VISION_ENDPOINTS[0]
     # Backend defaults used when no explicit vision_model is set.
-    deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
+    deepseek_vision_model: str = "deepseek-flash"
     or_default_model: str = OPENROUTER_DEFAULT_MODEL
     # Explicit model list, usually set by /or models from OR_VISION.json.
     or_vision_models: Optional[list[str]] = None
     # True once the user bought $10+ lifetime credits → 1000 req/day ceiling.
     or_credits: bool = False
+
+    # OpenRouter subagent offload (/orsub on): the Agent tool's Explore/Plan
+    # turns run on the OR_SUB_MODELS.json list (primary first, hopping through
+    # the rest on rate limits) instead of the DeepSeek subagent model.
+    or_sub_enabled: bool = False
 
     # Surge pricing (DeepSeek peak/off-peak, Beijing 09-12 & 14-18)
     # Notify when the API is at surge pricing; optionally pause usage from
@@ -377,6 +424,8 @@ PERSISTED_KEYS = (
     "permission_default",
     "max_iterations",
     "max_tokens",
+    "max_context_tokens",
+    "compact_threshold",
     "vision_backend",
     "vision_model",
     "vision_host",
@@ -389,6 +438,7 @@ PERSISTED_KEYS = (
     "or_default_model",
     "or_vision_models",
     "or_credits",
+    "or_sub_enabled",
     "surge_notify",
     "surge_pause",
     "surge_pause_buffer_minutes",
@@ -399,11 +449,10 @@ PERSISTED_KEYS = (
 # Values a saved config is allowed to take. A key missing from here accepts
 # anything of the right Python type; a key present is rejected unless it matches.
 _ALLOWED: dict[str, tuple[str, ...]] = {
-    # A config naming a model the API won't serve is dropped rather than obeyed,
-    # so an old file that still says deepseek-v4-pro falls back to the default.
+    # A config naming a model the API won't serve is remapped (retired flash
+    # ids via MODEL_ALIASES) or dropped (deepseek-v4-pro) rather than obeyed.
     "orchestrator_model": AVAILABLE_MODELS,
     "subagent_model": AVAILABLE_MODELS,
-    "reasoning_effort": ("low", "high", "max"),
     "verbose": VERBOSE_LEVELS,
     "vision_backend": ("none", "ollama", "deepseek", "openrouter"),
     "vision_endpoint": VISION_ENDPOINTS,
@@ -423,6 +472,16 @@ def describe_max_tokens(count: int) -> str:
     return f"{count:,}"
 
 
+def describe_context_window(count: int) -> str:
+    """How the context ceiling reads to the user — one wording, used everywhere."""
+    return f"{count:,} tokens"
+
+
+def describe_compact_threshold(fraction: float) -> str:
+    """How the auto-compact trigger reads — one wording, used everywhere."""
+    return f"{fraction:.0%} of the window"
+
+
 def _coerce(key: str, value: Any, default: Any) -> Any:
     """
     Validate one persisted value, returning ``None`` to mean "ignore this key".
@@ -433,6 +492,17 @@ def _coerce(key: str, value: Any, default: Any) -> Any:
     if key == "verbose" and isinstance(value, bool):
         # Older configs stored a bool; map it onto the three-level scale.
         return "high" if value else "low"
+
+    if key in _MODEL_ALIAS_KEYS and isinstance(value, str):
+        value = MODEL_ALIASES.get(value, value)
+
+    if key == "reasoning_effort":
+        # 0–100 on the user/model scale, or an alias (including old "high"
+        # / "max" configs). Values above 75 cap to 75. Invalid values keep
+        # the built-in default (75).
+        from .effort import parse_effort_value
+
+        return parse_effort_value(value)
 
     if key == "max_iterations":
         # Any positive step count is honoured, however large, and 0 means "no
@@ -451,6 +521,21 @@ def _coerce(key: str, value: Any, default: Any) -> Any:
             return None
         value = int(value)
         return value if value >= UNLIMITED_OUTPUT_TOKENS else None
+
+    if key == "max_context_tokens":
+        # The window is a ceiling in tokens: anything within the model's real
+        # range is honoured, and a broken value keeps the built-in default.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = int(value)
+        return value if MIN_CONTEXT_TOKENS <= value <= MAX_CONTEXT_TOKENS else None
+
+    if key == "compact_threshold":
+        # The fraction of the window that trips auto-compaction. Anything in
+        # (0, 1] is honoured; 0 would compact every turn and >1 never fires.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value if MIN_COMPACT_THRESHOLD <= value <= MAX_COMPACT_THRESHOLD else None
 
     allowed = _ALLOWED.get(key)
     if allowed is not None:

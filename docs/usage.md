@@ -1,19 +1,25 @@
 # `usage.py` — token & cost accounting
 
-`g023_code/usage.py` turns every API response into numbers the user can
-trust: tokens, cache hit/miss split, and USD cost at DeepSeek's published
-(tidal) rates.
+`g023_code/usage.py` (~325 lines) turns every API response into numbers
+the user can trust: tokens, cache hit/miss split, and USD cost at
+DeepSeek's published (tidal) rates.
 
 ## Pricing (`ds_pricing.json` → `PRICING`)
 
-- `_load_ds_pricing()` reads `ds_pricing.json` from the project root
-  (falling back to a built-in table) and builds
+- `_load_ds_pricing()` reads `ds_pricing.json` from the home dir, then
+  the project root (falling back to a built-in table) and builds
   `PRICING: dict[model, ModelPricing]`.
 - `ModelPricing` holds `regular` and `surge` rate sets, each with
   `cache_hit`, `cache_miss`, `output` (per 1M tokens) and a
   `surge_multiplier()` (2× today).
 - `pricing_for(model)` — lookup, defaulting to the flash table for
-  unknown models.
+  unknown models. Canonical key is `deepseek-flash`. Aliases
+  `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` share the same
+  object. `deepseek-v4-pro` has its own (higher) table even though the
+  model is withheld from `/model`.
+
+Regular flash rates (effective 2026-09-10): hit $0.003/M, miss $0.15/M,
+output $0.60/M. Surge is exactly 2×. Peak windows are Monday–Friday only.
 
 ## Accumulators
 
@@ -46,5 +52,6 @@ counts API calls per operation (the delegation cost table).
 
 - `docs/data_files.md` — `ds_pricing.json` on disk.
 - `docs/orchestrator.md` — records usage every iteration.
+- `docs/cost_policy.md` — the keep-vs-compact break-even that consumes these rates.
 - `docs/surge.md` — where the surge flag comes from.
 - `docs/cli.md` — `/cost`, `/status`, per-turn lines.

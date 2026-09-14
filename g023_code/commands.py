@@ -19,6 +19,10 @@ from typing import Any, Optional
 
 from .config import (
     ITERATION_NOTICE_EVERY,
+    MAX_COMPACT_THRESHOLD,
+    MAX_CONTEXT_TOKENS,
+    MIN_COMPACT_THRESHOLD,
+    MIN_CONTEXT_TOKENS,
     MIN_ITERATIONS,
     MIN_OUTPUT_TOKENS,
     Settings,
@@ -27,6 +31,8 @@ from .config import (
 # The help text quotes the default rather than restating it, so the two cannot
 # drift apart.
 DEFAULT_MAX_ITERATIONS = Settings.max_iterations
+DEFAULT_CONTEXT_WINDOW = Settings.max_context_tokens
+DEFAULT_COMPACT_THRESHOLD = Settings.compact_threshold
 
 
 @dataclass(frozen=True)
@@ -75,7 +81,9 @@ PERMISSION_CHOICES = ("allow", "ask", "block")
 BACKEND_CHOICES = ("none", "ollama", "deepseek", "openrouter")
 ENDPOINT_CHOICES = ("responses", "chat_completions")
 OR_TIER_CHOICES = ("free", "credits")
+OR_SUB_CHOICES = ("status", "on", "off", "primary", "add", "remove", "models", "priority", "reasoning", "test")
 SURGE_SUB_CHOICES = ("status", "on", "off", "buffer", "notify", "now")
+LEARN_SUB_CHOICES = ("search", "get", "save", "forget", "outcome")
 
 
 COMMANDS: tuple[Command, ...] = (
@@ -113,6 +121,76 @@ COMMANDS: tuple[Command, ...] = (
         detail="Drops the message history and zeroes the session's token/cost counters. Settings are untouched.",
     ),
     Command(
+        name="/resume",
+        aliases=("/continue",),
+        summary="Load the latest JSONL session view, or /resume log for a handoff",
+        handler="cmd_resume",
+        group="Session",
+        args=(
+            Argument(
+                "source",
+                ("log",),
+                "log = latest .g023/logs/ handoff; omit to load the JSONL session",
+            ),
+        ),
+        detail=(
+            "Bare /resume reads .g023/sessions/ (the CURRENT pointer, else the newest\n"
+            "jsonl) and replaces the in-memory item list with the latest view. Pairing\n"
+            "is repaired. The working-set item is restored from the log / session_facts.\n"
+            "Large write bodies were stored as hashes, not 200k-character contents.\n"
+            "/resume log (also --continue at launch) seeds a new orchestration from\n"
+            "the latest .g023/logs/{dstamp_tstamp}.log: standing system prompt plus the\n"
+            "compact summary written when the last objective finished."
+        ),
+        examples=("/resume", "/resume log"),
+    ),
+    Command(
+        name="/learn",
+        summary="Search, save, or forget reusable procedures across sessions",
+        handler="cmd_learn",
+        group="Session",
+        args=(
+            Argument(
+                "action",
+                LEARN_SUB_CHOICES,
+                "search, get, save, forget, outcome; bare prints status",
+            ),
+        ),
+        detail=(
+            "The learn store holds procedures that travel across projects\n"
+            "(~/.g023/learn for env/user, <project>/.g023/learn for this repo).\n"
+            "Guides are not in the system prompt. /learn with no argument prints\n"
+            "index counts and remaining write budget.\n\n"
+            "/learn search <query>  routing lines only\n"
+            "/learn get <id>        one guide body\n"
+            "/learn save <id> <scope> <when> | <title>\n"
+            "                       user-explicit write; bypasses the session cap\n"
+            "/learn forget <id>     tombstone; the id cannot be reused\n"
+            "/learn outcome <id> helped|harmed"
+        ),
+        examples=(
+            "/learn",
+            "/learn search browser snapshot",
+            "/learn get chrome-devtools-snapshot",
+            "/learn save fetchurl-cache env FetchUrl,cache | Prefer cache vs live",
+            "/learn forget fetchurl-cache",
+            "/learn outcome fetchurl-cache helped",
+        ),
+    ),
+    Command(
+        name="/undo",
+        aliases=("/restore",),
+        summary="Restore a file from its newest .g023/backups/ copy",
+        handler="cmd_undo",
+        group="Session",
+        args=(Argument("path", description="File to restore; defaults to the last written path"),),
+        detail=(
+            "Copies the newest timestamped backup under .g023/backups/ back onto the\n"
+            "file. WriteFile and Edit take those backups before overwriting."
+        ),
+        examples=("/undo", "/undo src/app.py"),
+    ),
+    Command(
         name="/exit",
         aliases=("/quit", "/q"),
         summary="Quit g023",
@@ -128,9 +206,10 @@ COMMANDS: tuple[Command, ...] = (
         interactive=True,
         args=(Argument("model", MODEL_CHOICES, "flash is the only model available today"),),
         detail=(
-            "flash — deepseek-v4-flash. The default, and currently the only choice.\n\n"
+            "flash — deepseek-flash. The default, and currently the only choice.\n\n"
             "Everything runs on DeepSeek's Responses API, which is where the built-in\n"
-            "web_search tool lives. deepseek-v4-pro is not enabled on that endpoint yet\n"
+            "web_search tool lives. Orchestrator and DeepSeek vision both send\n"
+            "deepseek-flash. deepseek-v4-pro is not enabled on that endpoint yet\n"
             "(DeepSeek reports availability from early August 2026), so it is withheld\n"
             "rather than offered as a model every call would fail on."
         ),
@@ -143,13 +222,22 @@ COMMANDS: tuple[Command, ...] = (
         handler="cmd_thinking",
         group="Model",
         interactive=True,
-        args=(Argument("effort", EFFORT_CHOICES, "higher effort spends more output tokens"),),
+        args=(Argument("effort", EFFORT_CHOICES, "1-100 or low/high/max/off; 75 is default and ceiling"),),
         detail=(
             "Reasoning tokens are billed as output, so effort is a cost dial as much as\n"
-            "a quality one. /goal temporarily forces max regardless of this setting,\n"
-            "and also runs its turn with no step cap."
+            "a quality one. The scale is 1-100 but 75 is both the default sweetspot and\n"
+            "the ceiling — 76-100, max, and xhigh all store and send as 75 (wire high).\n"
+            "low/high/max map to 50/75/75. The API accepts named aliases, not integers,\n"
+            "so those numbers are mapped onto none/minimal/low/medium/high on the wire.\n"
+            "/goal temporarily forces the ceiling (75) regardless of this setting, and\n"
+            "also runs its turn with no step cap. The model may also set the next *user\n"
+            "request's* effort by attaching [next_effort: N] at the end of a final answer\n"
+            "(after an optional [handoff]...[/handoff] compact summary on that same reply).\n"
+            "A trailer on a tool-call step is stripped, not applied — it is not this turn's\n"
+            "remaining steps. N should match the next request (25-50 routine, 75 when the\n"
+            "remaining work is still hard), not copy 75 by habit. Values above 75 cap."
         ),
-        examples=("/thinking", "/thinking max", "/thinking off"),
+        examples=("/thinking", "/thinking 75", "/thinking max", "/thinking off"),
     ),
     Command(
         name="/verbose",
@@ -240,9 +328,73 @@ COMMANDS: tuple[Command, ...] = (
             "/compact <focus>      summarise, keeping the named topic in most detail\n"
             "/compact micro        free local pass — blanks stale tool results, no API call\n"
             "/compact auto on|off  toggle automatic compaction at the threshold\n\n"
-            "Automatic compaction fires once the context passes compact_threshold."
+            "With auto on, stale tool-result text is blanked in place each turn\n"
+            "(no API call, prefix behind the moving boundary stays still). A full\n"
+            "summary replace still waits until the context passes compact_threshold —\n"
+            "set that trigger with /compact-threshold, the window with /max-ctx.\n"
+            "If the last final answer already attached a [handoff] block, /compact\n"
+            "reuses it (no second model call). A focused /compact <topic> still asks\n"
+            "the cheap model so the summary can follow that topic."
         ),
         examples=("/compact", "/compact micro", "/compact the auth refactor", "/compact auto off"),
+    ),
+    Command(
+        name="/g023-compact",
+        aliases=("/g023compact",),
+        summary="Compact g023.md into g023_compact.md (leaves the original)",
+        handler="cmd_g023_compact",
+        group="Context",
+        detail=(
+            "g023.md is this project's standing instructions for the assistant —\n"
+            "the same role AGENTS.md plays in other agentic CLIs. When present it\n"
+            "is appended to the system prompt.\n\n"
+            "If g023_compact.md also exists, that file is used instead (the original\n"
+            "g023.md is left in place). /g023-compact rewrites the compact file from\n"
+            "the current g023.md using deepseek-flash with reasoning off.\n\n"
+            "Delete g023_compact.md to fall back to the full file."
+        ),
+        examples=("/g023-compact",),
+    ),
+    Command(
+        name="/max-ctx",
+        aliases=("/max-context", "/ctx"),
+        summary="Set the context window ceiling",
+        handler="cmd_max_ctx",
+        group="Context",
+        args=(Argument("tokens", (), f"{MIN_CONTEXT_TOKENS:,}–{MAX_CONTEXT_TOKENS:,}, or 'default'"),),
+        detail=(
+            "The ceiling the conversation may grow into, in tokens. The status bar,\n"
+            "/context and /cost all read against it, and auto-compact fires at\n"
+            "compact_threshold of it — so this is what actually decides how long a\n"
+            "session runs before the cheap model summarises it.\n\n"
+            f"DeepSeek's real ceiling is 1M tokens; the shipped default is "
+            f"{DEFAULT_CONTEXT_WINDOW // 1000}k.\n"
+            "With no argument, prints the current window. Saved to config.json."
+        ),
+        examples=("/max-ctx", "/max-ctx 1000000", "/max-ctx default"),
+    ),
+    Command(
+        name="/compact-threshold",
+        aliases=("/compact-at",),
+        summary="Set when auto-compact fires, as a fraction of the window",
+        handler="cmd_compact_threshold",
+        group="Context",
+        args=(Argument("fraction", (), "0.01–1.0 (or 1%–100%), or 'default'"),),
+        detail=(
+            "Auto-compact summarises the history once the context passes this\n"
+            "fraction of the window — 0.85 means 85% full. Raise it to let a session\n"
+            "grow longer before the cheap model steps in; lower it to compact\n"
+            "earlier, keeping the window lighter at the cost of more summaries.\n\n"
+            "Anything in 0.01–1.0 is accepted (a trailing % is fine: '90%' = 0.9);\n"
+            "0 would compact every turn and >1 never fires. With no argument,\n"
+            "prints the current threshold. Saved to config.json."
+        ),
+        examples=(
+            "/compact-threshold",
+            "/compact-threshold 0.9",
+            "/compact-threshold 90%",
+            "/compact-threshold default",
+        ),
     ),
     Command(
         name="/context",
@@ -388,7 +540,11 @@ COMMANDS: tuple[Command, ...] = (
         group="Vision",
         interactive=True,
         args=(
-            Argument("model|off|status|backend", (), "a model name, or a subcommand"),
+            Argument(
+                "model|off|status|backend|endpoint",
+                ("off", "status", "backend", "endpoint"),
+                "a model name, or a subcommand",
+            ),
             Argument("value", BACKEND_CHOICES, "for 'backend'"),
         ),
         detail=(
@@ -402,7 +558,7 @@ COMMANDS: tuple[Command, ...] = (
             "/vision status           show the current setting\n"
             "/vision backend <name>   none | ollama | deepseek | openrouter\n"
             "/vision endpoint <name>  deepseek only: responses | chat_completions\n\n"
-            "deepseek  — deepseek-v4-flash-vision-exp on the K.dat key (default).\n"
+            "deepseek  — deepseek-flash on the K.dat key (default).\n"
             "openrouter — OK.dat key; models from ./OR_VISION.json, rotated on\n"
             "            rate limits. Default model google/gemma-4-26b-a4b-it:free.\n"
             "ollama    — a local/remote daemon; /ollama host points at it."
@@ -421,7 +577,7 @@ COMMANDS: tuple[Command, ...] = (
         handler="cmd_surge",
         group="Vision",
         args=(
-            Argument("status|on|off|buffer|notify", SURGE_SUB_CHOICES, "see /help surge"),
+            Argument("status|on|off|buffer|notify|now", SURGE_SUB_CHOICES, "see /help surge"),
             Argument("value", (), "minutes for 'buffer', on|off for 'notify'"),
         ),
         detail=(
@@ -431,6 +587,7 @@ COMMANDS: tuple[Command, ...] = (
             "Status shows the countdown to the next surge and how long it lasts.\n\n"
             "/surge                 status: state, local windows, countdown +\n"
             "                       duration, reg vs surge prices\n"
+            "/surge now             the same panel, labelled as the current instant\n"
             "/surge notify on|off   show a banner when surge pricing starts/ends\n"
             "/surge on              pause usage from 5 min before peak until 5 min\n"
             "                       after it ends, then resume automatically\n"
@@ -438,7 +595,7 @@ COMMANDS: tuple[Command, ...] = (
             "While paused the CLI waits out the window instead of reading input,"
             "\nso no requests are sent at double price. Ctrl-C always works."
         ),
-        examples=("/surge", "/surge on", "/surge buffer 10", "/surge notify off"),
+        examples=("/surge", "/surge now", "/surge on", "/surge buffer 10", "/surge notify off"),
     ),
     Command(
         name="/or",
@@ -465,6 +622,47 @@ COMMANDS: tuple[Command, ...] = (
             "lifetime raises the daily ceiling from 50 to 1000 requests."
         ),
         examples=("/or", "/or status", "/or model google/gemma-4-26b-a4b-it:free", "/or tier credits"),
+    ),
+    Command(
+        name="/orsub",
+        aliases=("/ors", "/or-sub"),
+        summary="OpenRouter subagent offload — models, primary, failover, reasoning",
+        handler="cmd_orsub",
+        group="Vision",
+        interactive=True,
+        args=(
+            Argument("status|on|off|primary|add|remove|models|priority|reasoning|test", OR_SUB_CHOICES, "subcommand"),
+            Argument("value", (), "model id, 'on|off', or a priority number"),
+            Argument("extra", (), "for 'priority': the new rank; for 'reasoning': a level"),
+        ),
+        detail=(
+            "Offloads the Agent tool's Explore/Plan turns to an OpenRouter model\n"
+            "when enabled — the orchestrator keeps DeepSeek for itself and hands\n"
+            "subagent work to the OK.dat key. Models and their priorities live in\n"
+            "./OR_SUB_MODELS.json (main copy next to OK.dat, shared by all\n"
+            "projects; the project file overrides it). On a rate limit the next\n"
+            "priority model is tried automatically.\n\n"
+            "/orsub                   status: backend, primary, model list\n"
+            "/orsub on|off            enable or disable the offload\n"
+            "/orsub primary <model>   which model the offload starts with\n"
+            "/orsub add <model>       add a model (context limits auto-fetched)\n"
+            "/orsub remove <model>    drop a model\n"
+            "/orsub models            list models, priorities, context, reasoning\n"
+            "/orsub priority <model> <n>   set fallback rank\n"
+            "/orsub reasoning <model> <level>  set default reasoning for a model\n"
+            "/orsub test [model]      run a real offload to check it works\n\n"
+            "Each model records its context window and the reasoning levels it\n"
+            "accepts; the orchestrator may override reasoning per Agent call and\n"
+            "the level is clamped to what the chosen model supports."
+        ),
+        examples=(
+            "/orsub",
+            "/orsub on",
+            "/orsub primary stealth/ox-alpha",
+            "/orsub add openai/gpt-5.2",
+            "/orsub priority z-ai/glm-5.2:free 1",
+            "/orsub test",
+        ),
     ),
     Command(
         name="/config",
@@ -495,16 +693,18 @@ COMMANDS: tuple[Command, ...] = (
     # -- Work -------------------------------------------------------------
     Command(
         name="/goal",
-        summary="State a high-level objective; max effort, no step limit",
+        summary="State a high-level objective; ceiling effort, no step limit",
         handler="cmd_goal",
         group="Work",
         args=(Argument("objective", (), "what you want achieved", required=True),),
         detail=(
-            "Runs one turn with reasoning effort forced to max, the per-turn step cap\n"
-            "lifted, and a prompt that asks the model to break the objective into steps\n"
-            "and use tools freely. A goal runs until the model answers rather than\n"
-            "stopping at /steps; progress prints as it goes and Ctrl-C ends it. Your\n"
-            "usual /thinking and /steps settings are restored afterwards."
+            "Runs one turn with reasoning effort forced to the harness ceiling (75 /\n"
+            "high — not the API's max, which burns the output budget on thinking), the\n"
+            "per-turn step cap lifted, and a prompt that asks the model to break the\n"
+            "objective into steps and use tools freely. A goal runs until the model\n"
+            "answers rather than stopping at /steps; progress prints as it goes and\n"
+            "Ctrl-C ends it. A [next_effort: N] on the final answer is kept for the next\n"
+            "user request; otherwise your usual /thinking and /steps settings are restored."
         ),
         examples=("/goal add retry-with-backoff to every outbound HTTP call",),
     ),

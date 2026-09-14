@@ -5,9 +5,9 @@ Every API call in the process funnels its ``usage`` block through the global
 tracker, so /cost, /settings and the auto-compaction trigger all read from the
 same numbers. DeepSeek reports the prefix-cache split directly
 (``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``), which matters a
-lot here: a cache hit is ~30x cheaper than a miss on the current sheet.
+lot here: a cache hit is ~50x cheaper than a miss on the current sheet.
 
-Pricing follows DeepSeek's tidal sheet (effective 2026-08-17): every model has
+Pricing follows DeepSeek's tidal sheet (effective 2026-09-10): every model has
 a **regular** (off-peak) rate and a **surge** (peak) rate that is exactly 2x
 the regular one. The rates are loaded from ``ds_pricing.json`` when present
 (home dir, then project root) and otherwise fall back to the published USD
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 # ---------------------------------------------------------------------------
-# Pricing (USD per 1M tokens) — DeepSeek tidal sheet, effective 2026-08-17.
+# Pricing (USD per 1M tokens) — DeepSeek tidal sheet, effective 2026-09-10.
 # Regular = off-peak; surge = peak (exactly 2x regular). Mirrors ds_pricing.json.
 # ---------------------------------------------------------------------------
 
@@ -44,15 +44,20 @@ class ModelPricing:
         return self.surge_output / self.output
 
 
+_FLASH_PRICING = ModelPricing(
+    cache_hit=0.003,
+    cache_miss=0.15,
+    output=0.60,
+    surge_cache_hit=0.006,
+    surge_cache_miss=0.30,
+    surge_output=1.20,
+)
+
 _DEFAULT_PRICING: Dict[str, ModelPricing] = {
-    "deepseek-v4-flash": ModelPricing(
-        cache_hit=0.007,
-        cache_miss=0.22,
-        output=0.66,
-        surge_cache_hit=0.014,
-        surge_cache_miss=0.44,
-        surge_output=1.32,
-    ),
+    "deepseek-flash": _FLASH_PRICING,
+    # Aliases for older config/price-sheet names; same rates, same object.
+    "deepseek-v4-flash": _FLASH_PRICING,
+    "deepseek-v4-flash-vision-exp": _FLASH_PRICING,
     "deepseek-v4-pro": ModelPricing(
         cache_hit=0.022,
         cache_miss=0.66,
@@ -60,16 +65,6 @@ _DEFAULT_PRICING: Dict[str, ModelPricing] = {
         surge_cache_hit=0.044,
         surge_cache_miss=1.32,
         surge_output=3.96,
-    ),
-    # The vision model runs the same engine under the hood, so it bills at
-    # Flash rates (per the price sheet).
-    "deepseek-v4-flash-vision-exp": ModelPricing(
-        cache_hit=0.007,
-        cache_miss=0.22,
-        output=0.66,
-        surge_cache_hit=0.014,
-        surge_cache_miss=0.44,
-        surge_output=1.32,
     ),
 }
 
@@ -111,7 +106,7 @@ def _load_ds_pricing() -> Dict[str, ModelPricing]:
 PRICING: Dict[str, ModelPricing] = _load_ds_pricing()
 
 # Anything unknown is priced as Flash so estimates stay in the right ballpark.
-DEFAULT_PRICING = PRICING["deepseek-v4-flash"]
+DEFAULT_PRICING = PRICING["deepseek-flash"]
 
 
 def pricing_for(model: str) -> ModelPricing:
@@ -208,6 +203,9 @@ class UsageTracker:
     context_tokens: int = 0
     context_cache_hit_tokens: int = 0
     context_cache_miss_tokens: int = 0
+    # True after compact writes a char/4 guess into ``context_tokens``. Auto-compact
+    # ignores that guess and waits for the next real orchestrator ``input_tokens``.
+    context_tokens_estimated: bool = False
 
     # Rolling per-turn deltas (reset at the top of each user turn)
     turn: ModelUsage = field(default_factory=ModelUsage)
@@ -268,6 +266,7 @@ class UsageTracker:
             self.context_tokens = prompt
             self.context_cache_hit_tokens = hit
             self.context_cache_miss_tokens = miss
+            self.context_tokens_estimated = False
 
         return delta
 
@@ -303,6 +302,7 @@ class UsageTracker:
         self.context_tokens = 0
         self.context_cache_hit_tokens = 0
         self.context_cache_miss_tokens = 0
+        self.context_tokens_estimated = False
         self.start_turn()
 
 

@@ -1,15 +1,18 @@
 # `ui.py` — the terminal UI layer
 
-`g023_code/ui.py` is the single place pixels get decided. Everything
-rendered goes through here: a shared rich `console`, glyphs, panels,
-tables, gauges, and the activity printer the orchestrator narrates
-through. `_unicode_ok()` detects a non-Unicode terminal and `Glyph`
-falls back to ASCII.
+`g023_code/ui.py` (~641 lines) is the single place pixels get decided.
+Everything rendered goes through here: a shared rich `console`, glyphs,
+panels, tables, gauges, and the activity printer the orchestrator
+narrates through. `_unicode_ok()` detects a non-Unicode terminal and
+`Glyph` falls back to ASCII. `G023_ASCII=1` forces the ASCII set.
 
 ## Primitives
 
 - `Glyph` — the symbol set (arrows, dots, spinners) with ASCII fallbacks.
-- `ToolStyle` / `tool_style(name)` — per-tool colours.
+- `ToolStyle` / `tool_style(name)` — per-tool colours. `TOOL_STYLES`
+  covers ReadFile, SearchContent, AnalyzeImage, Agent, Bash, WriteFile,
+  Edit, ListDir, Glob, TodoWrite, LearnSearch, LearnGet, LearnPut,
+  SessionSearch, FetchUrl, and `web_search`.
 - `human_bytes(n)` / `human_ms(ms)` — sizes and durations for humans.
 - `truncate(text, limit)`, `shorten_path(path, root)`, `short_url(url)` —
   the three common shortenings (paths are shown relative to the project
@@ -25,6 +28,8 @@ falls back to ASCII.
 - `describe_call(name, args, root)` — one human line for a tool call
   (e.g. `ReadFile → docs/foo.md (summary)`); knows each tool's argument
   shapes so it can pick what's worth showing.
+- `unified_change_diff` / `permission_diff` — the WriteFile/Edit preview
+  shown at the permission prompt.
 - `describe_result(name, result)` — the one-line outcome preview after a
   tool runs (per-verbosity).
 - `ToolEvent` / `TurnTrace` — per-turn bookkeeping: events, tool counts

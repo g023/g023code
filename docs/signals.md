@@ -43,6 +43,6 @@ crashed.
 ## Related
 
 - `docs/api.md` — `unknown_item_types`, `silent_degradation`.
-- `docs/cache.py` → `cache.prefix_history` feeds the verdict.
+- `docs/cache.md` — `cache.prefix_history` feeds the verdict.
 - `docs/cli.md` — `/signals` command renders the log and verdict.
 - `tests/test_drift_signals.py` — pins the fire/stay-quiet behaviour.

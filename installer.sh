@@ -270,7 +270,6 @@ step "Installing dependencies"
 REQUIRED=(
     "rich:rich>=13.7.0:the entire terminal UI"
     "httpx:httpx>=0.27.0:the DeepSeek Responses API client"
-    "tiktoken:tiktoken>=0.7.0:token accounting for the context gauge"
     "pygments:pygments>=2.17.0:syntax highlighting"
 )
 RECOMMENDED=(
@@ -418,20 +417,35 @@ if [ ! -f "$CONFIG_FILE" ]; then
 {
   "verbose": "low",
   "auto_compact": true,
-  "vision_backend": "none",
-  "vision_model": null,
-  "vision_host": null,
-  "vision_max_image_dim": 1024,
-  "vision_timeout": 180,
-  "orchestrator_model": "deepseek-v4-flash",
-  "subagent_model": "deepseek-v4-flash",
-  "reasoning_effort": "high",
-  "thinking_enabled": true,
   "show_tool_timing": true,
   "show_context_bar": true,
   "permission_default": "ask",
+  "max_iterations": 255,
+  "max_tokens": 0,
+  "max_context_tokens": 256000,
+  "compact_threshold": 0.85,
+  "orchestrator_model": "deepseek-flash",
+  "subagent_model": "deepseek-flash",
+  "reasoning_effort": 75,
+  "thinking_enabled": true,
+  "vision_backend": "none",
+  "vision_model": null,
+  "vision_host": null,
+  "vision_max_image_dim": 800,
+  "vision_timeout": 180,
   "vision_num_ctx": 4096,
-  "vision_keep_alive": "5m"
+  "vision_keep_alive": "5m",
+  "vision_endpoint": "responses",
+  "deepseek_vision_model": "deepseek-flash",
+  "or_default_model": "google/gemma-4-26b-a4b-it:free",
+  "or_vision_models": null,
+  "or_credits": false,
+  "or_sub_enabled": false,
+  "surge_notify": true,
+  "surge_pause": false,
+  "surge_pause_buffer_minutes": 5,
+  "write_backup": true,
+  "write_backup_keep": 5
 }
 JSON
     ok "wrote default config.json"

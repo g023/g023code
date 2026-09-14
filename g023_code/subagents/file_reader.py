@@ -23,6 +23,7 @@ from ..api import (
 
 from ..config import get_project_root, settings
 from ..cache import get_cache
+from ..paths import confine_or_error
 from ..usage import get_usage
 
 
@@ -64,14 +65,55 @@ RANGE_MAX_CHARS = 20_000
 FULL_READ_MAX_CHARS = 200_000
 
 SYMBOL_MAP_NOTE = (
-    "metadata.symbols maps every top-level symbol (and Class.method) to its exact "
-    "[start_line, end_line]. To see a definition's real source, call ReadFile again "
-    "with those lines — that returns verbatim text, not a summary."
+    "metadata.symbols maps name → [start_line, end_line]. "
+    "Re-read those lines for verbatim source."
 )
 RANGE_NOTE = (
-    "This is a summary, not the source. Call ReadFile with start_line/end_line to "
-    "get verbatim text for any range you need to be sure about."
+    "Summary, not source. Re-read with start_line/end_line for verbatim text."
 )
+# Unfocused reads are indexed locally (no API call). Cap the scan so a huge
+# file cannot stall the process; focused reads still go to the model unless
+# the focus is an exact (or unique-suffix) symbol already in the map.
+LOCAL_INDEX_MAX_CHARS = 400_000
+SYMBOL_MAP_MAX = 80
+# Verbatim body included on an exact-symbol focus only when it stays small
+# enough to sit in history as a cheap tail, not a 20k dump of a whole class.
+LOCAL_SYMBOL_BODY_MAX_CHARS = 2_000
+_FOCUS_KIND_PREFIX = re.compile(
+    r"^(?:class|function|def|method|fn|struct|trait|type|enum|interface)\s+",
+    re.I,
+)
+
+_RE_JS_TYPE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?"
+    r"(class|function|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+    re.M,
+)
+_RE_JS_ARROW = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+    re.M,
+)
+_RE_GO_FUNC = re.compile(r"^func\s+(?:\([^)]+\)\s+)?([A-Za-z_]\w*)", re.M)
+_RE_GO_TYPE = re.compile(r"^type\s+([A-Za-z_]\w*)\s+", re.M)
+_RE_RS_FN = re.compile(
+    r"^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)", re.M
+)
+_RE_RS_TYPE = re.compile(
+    r"^(?:pub(?:\([^)]+\))?\s+)?(?:struct|enum|trait|type|impl)\s+([A-Za-z_]\w*)",
+    re.M,
+)
+_RE_JAVA_TYPE = re.compile(
+    r"^\s*(?:public|protected|private|static|final|abstract|\s)*"
+    r"(class|interface|enum|record)\s+(\w+)",
+    re.M,
+)
+_RE_C_TYPE = re.compile(r"^\s*(?:typedef\s+)?(?:struct|class|enum)\s+(\w+)", re.M)
+_RE_SH_FN = re.compile(r"^(?:function\s+)?([A-Za-z_][\w]*)\s*\(\s*\)\s*\{", re.M)
+_RE_MD_H = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.M)
+_RE_YAML_KEY = re.compile(r"^([A-Za-z_][\w.-]*)\s*:", re.M)
+_RE_HTML_H = re.compile(r"<h[1-6][^>]*>([^<]+)</h[1-6]>", re.I)
+_RE_HTML_TITLE = re.compile(r"<title[^>]*>([^<]+)</title>", re.I)
 
 
 def _parse_summary_json(text: str) -> Optional[dict]:
@@ -203,6 +245,246 @@ def _local_python_metadata(content: str) -> dict:
     return meta
 
 
+def _cap_symbols(meta: dict) -> dict:
+    """Keep the map small enough to sit in orchestrator history as hits."""
+    symbols = meta.get("symbols")
+    if not isinstance(symbols, dict) or len(symbols) <= SYMBOL_MAP_MAX:
+        return meta
+    items = sorted(
+        symbols.items(),
+        key=lambda kv: (str(kv[0]).count("."), len(str(kv[0])), str(kv[0])),
+    )
+    out = dict(meta)
+    out["symbols"] = dict(items[:SYMBOL_MAP_MAX])
+    out["symbols_omitted"] = len(symbols) - SYMBOL_MAP_MAX
+    return out
+
+
+def _empty_meta(language: str, loc: int) -> dict[str, Any]:
+    return {
+        "language": language,
+        "imports": [],
+        "classes": [],
+        "functions": [],
+        "symbols": {},
+        "loc": loc,
+        "parse_error": None,
+        "summary_source": "local_index",
+    }
+
+
+def _add_symbol(meta: dict, name: str, line: int, kind: str) -> None:
+    if not name or name in meta["symbols"]:
+        return
+    span = [line, line]
+    meta["symbols"][name] = span
+    bucket = "classes" if kind == "class" else "functions"
+    meta[bucket].append({"name": name, "lines": span})
+
+
+def _line_at(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
+
+
+def _local_js_metadata(content: str, loc: int, language: str) -> dict:
+    meta = _empty_meta(language, loc)
+    for match in _RE_JS_TYPE.finditer(content):
+        kind = "class" if match.group(1) in {"class", "interface", "enum", "type"} else "function"
+        _add_symbol(meta, match.group(2), _line_at(content, match.start()), kind)
+    for match in _RE_JS_ARROW.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "function")
+    return meta
+
+
+def _local_go_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("go", loc)
+    for match in _RE_GO_TYPE.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "class")
+    for match in _RE_GO_FUNC.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "function")
+    return meta
+
+
+def _local_rust_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("rust", loc)
+    for match in _RE_RS_TYPE.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "class")
+    for match in _RE_RS_FN.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "function")
+    return meta
+
+
+def _local_java_metadata(content: str, loc: int, language: str) -> dict:
+    meta = _empty_meta(language, loc)
+    for match in _RE_JAVA_TYPE.finditer(content):
+        _add_symbol(meta, match.group(2), _line_at(content, match.start()), "class")
+    return meta
+
+
+def _local_c_metadata(content: str, loc: int, language: str) -> dict:
+    meta = _empty_meta(language, loc)
+    for match in _RE_C_TYPE.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "class")
+    return meta
+
+
+def _local_shell_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("bash", loc)
+    for match in _RE_SH_FN.finditer(content):
+        _add_symbol(meta, match.group(1), _line_at(content, match.start()), "function")
+    return meta
+
+
+def _local_markdown_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("markdown", loc)
+    headings: list[str] = []
+    for match in _RE_MD_H.finditer(content):
+        title = match.group(2).strip()
+        if title and title not in headings:
+            headings.append(title)
+        if len(headings) >= 24:
+            break
+    meta["headings"] = headings
+    return meta
+
+
+def _local_json_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("json", loc)
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        meta["parse_error"] = str(e)
+        return meta
+    if isinstance(data, dict):
+        meta["keys"] = list(data.keys())[:40]
+    elif isinstance(data, list):
+        meta["keys"] = [f"array[{len(data)}]"]
+    return meta
+
+
+def _local_yaml_metadata(content: str, loc: int, language: str) -> dict:
+    meta = _empty_meta(language, loc)
+    keys: list[str] = []
+    for match in _RE_YAML_KEY.finditer(content):
+        key = match.group(1)
+        if key not in keys:
+            keys.append(key)
+        if len(keys) >= 40:
+            break
+    meta["keys"] = keys
+    return meta
+
+
+def _local_html_metadata(content: str, loc: int) -> dict:
+    meta = _empty_meta("html", loc)
+    title = _RE_HTML_TITLE.search(content)
+    headings: list[str] = []
+    if title:
+        headings.append(title.group(1).strip())
+    for match in _RE_HTML_H.finditer(content):
+        text = re.sub(r"\s+", " ", match.group(1)).strip()
+        if text and text not in headings:
+            headings.append(text)
+        if len(headings) >= 24:
+            break
+    meta["headings"] = headings
+    return meta
+
+
+def _local_metadata(path: Path, content: str) -> dict:
+    """Language-aware local index. No API call."""
+    language = _detect_language(path)
+    loc = content.count("\n") + 1
+    truncated = len(content) > LOCAL_INDEX_MAX_CHARS
+    body = content if not truncated else content[:LOCAL_INDEX_MAX_CHARS]
+    if language == "python":
+        meta = _local_python_metadata(body)
+        meta["summary_source"] = "local_ast"
+    elif language in {"javascript", "typescript"}:
+        meta = _local_js_metadata(body, loc, language)
+    elif language == "go":
+        meta = _local_go_metadata(body, loc)
+    elif language == "rust":
+        meta = _local_rust_metadata(body, loc)
+    elif language == "java":
+        meta = _local_java_metadata(body, loc, language)
+    elif language in {"c", "cpp"}:
+        meta = _local_c_metadata(body, loc, language)
+    elif language == "bash":
+        meta = _local_shell_metadata(body, loc)
+    elif language == "markdown":
+        meta = _local_markdown_metadata(body, loc)
+    elif language == "json":
+        meta = _local_json_metadata(body, loc)
+    elif language in {"yaml", "toml"}:
+        meta = _local_yaml_metadata(body, loc, language)
+    elif language == "html":
+        meta = _local_html_metadata(body, loc)
+    else:
+        meta = _empty_meta(language, loc)
+    meta["loc"] = loc
+    if truncated:
+        meta["index_truncated"] = True
+    return _cap_symbols(meta)
+
+
+def _resolve_symbol_focus(focus: str, symbols: dict) -> Optional[str]:
+    """Map a focus string onto one local symbol key, or None.
+
+    Exact key, optional ``class Foo`` / ``def foo`` prefix, or a unique
+    dotted suffix (``method_one`` → ``Thing.method_one``). A sentence
+    ("what does method_one do") does not resolve — that hint still goes
+    to the model.
+    """
+    token = (focus or "").strip()
+    if not token or not isinstance(symbols, dict) or not symbols:
+        return None
+    if token in symbols:
+        return token
+    stripped = _FOCUS_KIND_PREFIX.sub("", token).strip()
+    if stripped and stripped in symbols:
+        return stripped
+    needle = stripped or token
+    matches = [k for k in symbols if str(k).rsplit(".", 1)[-1] == needle]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _local_summary(content: str, meta: dict) -> str:
+    lang = meta.get("language") or "text"
+    loc = meta.get("loc") or (content.count("\n") + 1)
+    if meta.get("parse_error"):
+        return (
+            f"{lang} file that does not parse ({meta['parse_error']}) — "
+            "no structure could be extracted. Read a line range to see the source."
+        )
+    bits = [f"{lang} file, {loc} lines"]
+    classes = meta.get("classes") or []
+    funcs = meta.get("functions") or []
+    if classes:
+        names = [c.get("name") for c in classes[:8] if c.get("name")]
+        bits.append(f"{len(classes)} type(s): {', '.join(names)}")
+    if funcs:
+        names = [fn.get("name") for fn in funcs[:10] if fn.get("name")]
+        bits.append(f"{len(funcs)} function(s): {', '.join(names)}")
+    imports = meta.get("imports") or []
+    if imports:
+        bits.append("imports: " + ", ".join(imports[:8]))
+    headings = meta.get("headings") or []
+    if headings:
+        bits.append("headings: " + ", ".join(headings[:10]))
+    keys = meta.get("keys") or []
+    if keys:
+        bits.append("keys: " + ", ".join(str(k) for k in keys[:12]))
+    omitted = meta.get("symbols_omitted")
+    if omitted:
+        bits.append(f"{omitted} more symbols omitted from the map")
+    if meta.get("index_truncated"):
+        bits.append(f"indexed first {LOCAL_INDEX_MAX_CHARS:,} chars only")
+    return ". ".join(bits) + "."
+
+
 def _slice_lines(
     content: str, start_line: Optional[int], end_line: Optional[int]
 ) -> tuple[str, int, int, bool]:
@@ -245,10 +527,9 @@ async def run_file_reader(
     Returns a compact JSON string for the orchestrator.
     """
     root = get_project_root()
-    p = Path(path)
-    if not p.is_absolute():
-        p = root / p
-    p = p.resolve()
+    p, err = confine_or_error(path, root=root)
+    if err or p is None:
+        return json.dumps({"error": err or "Path is outside project root"})
 
     if not p.exists() or not p.is_file():
         return json.dumps({"error": f"File not found: {p}"})
@@ -353,37 +634,74 @@ async def run_file_reader(
             ensure_ascii=False,
         )
 
-    # Local fast path for Python
+    # Unfocused reads are free: a local index (AST for Python, regex/structure
+    # for other languages) plus a symbol map. A focus that already names a
+    # symbol in that map is free too. Semantic hints still go to Flash.
     language = _detect_language(p)
-    metadata = {}
-    if language == "python":
-        metadata = _local_python_metadata(content)
+    metadata = _local_metadata(p, content)
 
-    # For small files or when we have good local metadata, we can skip LLM
-    if language == "python" and len(content) < LOCAL_SUMMARY_MAX_CHARS and not focus:
-        summary = (
-            f"Python module with {len(metadata.get('classes', []))} classes "
-            f"and {len(metadata.get('functions', []))} top-level functions. "
-            f"Imports: {', '.join(metadata.get('imports', [])[:8])}."
-        )
-        if metadata.get("parse_error"):
-            summary = (
-                f"Python file that does not parse ({metadata['parse_error']}) — "
-                "no structure could be extracted. Read a line range to see the source."
-            )
+    if not focus:
+        summary = _local_summary(content, metadata)
         result = {
             "path": str(p),
             "hash": content_hash,
             "from_cache": False,
-            "summary_source": "local_ast",
+            "summary_source": metadata.get("summary_source") or "local_index",
             "metadata": metadata,
             "summary": summary,
             "note": SYMBOL_MAP_NOTE if metadata.get("symbols") else RANGE_NOTE,
         }
+        if metadata.get("index_truncated"):
+            result["summary_covers"] = {
+                "chars_summarised": LOCAL_INDEX_MAX_CHARS,
+                "chars_total": len(content),
+                "complete": False,
+            }
         cache.put_file_summary(str(p), summary, metadata, content, content_hash)
         return json.dumps(result, ensure_ascii=False)
 
-    # LLM compaction for complex / focused cases
+    symbol = _resolve_symbol_focus(focus, metadata.get("symbols") or {})
+    if symbol:
+        span = (metadata.get("symbols") or {}).get(symbol) or [1, 1]
+        start, end = int(span[0]), int(span[1] if len(span) > 1 else span[0])
+        excerpt, start, end, cut_short = _slice_lines(content, start, end)
+        summary = (
+            f"{_local_summary(content, metadata)} Focused on {symbol} "
+            f"(lines {start}-{end})."
+        )
+        result = {
+            "path": str(p),
+            "hash": content_hash,
+            "from_cache": False,
+            "summary_source": "local_symbol",
+            "focus": focus,
+            "symbol": symbol,
+            "metadata": metadata,
+            "summary": summary,
+            "start_line": start,
+            "end_line": end,
+            "note": SYMBOL_MAP_NOTE,
+        }
+        if (
+            excerpt
+            and not cut_short
+            and len(excerpt) <= LOCAL_SYMBOL_BODY_MAX_CHARS
+        ):
+            result["verbatim"] = True
+            result["content"] = excerpt
+        else:
+            result["verbatim"] = False
+            result["note"] = (
+                f"Focused on {symbol} lines {start}-{end} "
+                f"({end - start + 1} lines). Re-read that range for verbatim "
+                "source. " + SYMBOL_MAP_NOTE
+            )
+        cache.put_file_summary(
+            str(p), result["summary"], result["metadata"], content, cache_key
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    # LLM compaction for focused reads only
     if client is None:
         client = get_client()
 
@@ -406,7 +724,7 @@ async def run_file_reader(
             model=settings.subagent_model,
             instructions=FILE_READER_SYSTEM,
             input=[{"role": "user", "content": user_msg}],
-            max_output_tokens=800,
+            max_output_tokens=max(1, int(settings.file_summary_max_tokens or 400)),
             temperature=0.1,
             # Structural extraction needs no deliberation, and "effort: none" is
             # what actually switches thinking off on this endpoint — the old
@@ -448,7 +766,6 @@ async def run_file_reader(
         # behind it are ground truth.
         "metadata": _merge_metadata(metadata, data.get("metadata")),
         "summary": data.get("summary", ""),
-        "key_snippets": data.get("key_snippets", []),
         "note": SYMBOL_MAP_NOTE if metadata.get("symbols") else RANGE_NOTE,
     }
     if truncated_input:

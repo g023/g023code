@@ -1,7 +1,8 @@
 # `api.py` — the DeepSeek Responses API client
 
-`g023_code/api.py` is the only module that talks to the DeepSeek HTTP API.
-Everything above it (orchestrator, subagents, vision) goes through here.
+`g023_code/api.py` (~399 lines) is the only module that talks to the
+DeepSeek HTTP API. Everything above it (orchestrator, subagents, vision)
+goes through here.
 
 ## `ResponsesClient`
 
@@ -18,7 +19,7 @@ so the whole program is built on it.
 - `vision_responses(model, text_parts, images, ...)` /
   `vision_chat(model, ...)` — the two vision wire formats (native
   responses items vs chat-style); used by `subagents/vision.py` for the
-  deepseek backend.
+  deepseek backend. The model id is `deepseek-flash`.
 - `aclose()` — close the shared client.
 
 The client timeout is deliberately generous because DeepSeek's
@@ -37,7 +38,12 @@ schema drift, so the whole program can stay simple:
 
 - `chat_answer(response)` — the plain text answer from a chat-shaped response.
 - `reasoning_param(enabled, effort)` — the `reasoning` object sent to the
-  API (`low`/`high`/`max`).
+  API. Always `{"effort": <alias>}`. `effort: "none"` is what actually
+  turns thinking off (`thinking: {"type": "disabled"}` is accepted and
+  silently ignored). Integer 0–100 is mapped by `effort.effort_to_wire`
+  onto `none`/`minimal`/`low`/`medium`/`high`, capped at 75. This harness
+  never sends `xhigh` or `max`. The thinking-on default (and ceiling) is
+  75 → `"high"`.
 - `output_text(response)` — final assistant text; returns `""` on unknown
   shapes (this is the "silent model" failure the drift signals watch for).
 - `incomplete_reason(response)` — why a response stopped
@@ -63,6 +69,7 @@ rather than a silently empty answer.
 
 ## Related
 
+- `docs/effort.md` — the mapping `reasoning_param` uses.
 - `docs/orchestrator.md` — the consumer of `create`/`stream` and these
   parsers.
 - `docs/subagents.md` — file_reader, router, and vision call

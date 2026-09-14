@@ -360,6 +360,163 @@ class LoadedImage:
         return len(self.raw)
 
 
+VISION_SEND_MAX_SIDE = 800
+
+
+def vision_send_max_side() -> int:
+    """Hard cap for every vision backend. Settings of 1024 or 0 do not raise this."""
+    return VISION_SEND_MAX_SIDE
+
+
+def constrained_size(
+    width: int, height: int, max_side: int = VISION_SEND_MAX_SIDE
+) -> tuple[int, int]:
+    """Fit (width, height) into max_side x max_side. Do not upscale."""
+    if max_side <= 0:
+        max_side = VISION_SEND_MAX_SIDE
+    else:
+        max_side = min(int(max_side), VISION_SEND_MAX_SIDE)
+    if width <= 0 or height <= 0:
+        return width, height
+    if width <= max_side and height <= max_side:
+        return width, height
+    scale = min(max_side / width, max_side / height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if data[12:16] != b"IHDR":
+        return None
+    import struct
+
+    w, h = struct.unpack(">II", data[16:24])
+    if w <= 0 or h <= 0:
+        return None
+    return int(w), int(h)
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    import struct
+
+    i = 2
+    n = len(data)
+    while i + 8 <= n:
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker in (
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        ):
+            h, w = struct.unpack(">HH", data[i + 5 : i + 9])
+            if w <= 0 or h <= 0:
+                return None
+            return int(w), int(h)
+        if marker in (0xD8, 0xD9):
+            i += 2
+            continue
+        length = struct.unpack(">H", data[i + 2 : i + 4])[0]
+        i += 2 + length
+    return None
+
+
+def image_dimensions(data: bytes) -> tuple[int, int]:
+    """Width, height. Pillow first; PNG/JPEG headers if Pillow is missing."""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as img:
+            return img.size
+    except Exception:
+        pass
+    parsed = _png_size(data) or _jpeg_size(data)
+    if parsed is not None:
+        return parsed
+    return (0, 0)
+
+
+def constrain_image_bytes(
+    data: bytes, max_side: int = VISION_SEND_MAX_SIDE
+) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
+    """Fit image bytes into max_side x max_side. Never upscale.
+
+    Returns (bytes_to_send, original_size, final_size). If a side is known to
+    exceed max_side and the image cannot be resized, raises RuntimeError so a
+    vision send cannot ship an oversized raster.
+    """
+    if max_side <= 0:
+        max_side = VISION_SEND_MAX_SIDE
+    else:
+        max_side = min(int(max_side), VISION_SEND_MAX_SIDE)
+    orig = image_dimensions(data)
+    w, h = orig
+    if w > 0 and h > 0 and w <= max_side and h <= max_side:
+        return data, orig, orig
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:
+        Image = None  # type: ignore[assignment]
+        io = None  # type: ignore[assignment]
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                size = img.size
+                orig = size if orig == (0, 0) else orig
+                if max(size) <= max_side:
+                    return data, orig, size
+                img = img.convert("RGB")
+                img.thumbnail((max_side, max_side), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                final = img.size
+                if max(final) > max_side:
+                    raise RuntimeError(
+                        f"resized image still has a side > {max_side}: {final[0]}x{final[1]}"
+                    )
+                return buf.getvalue(), orig, final
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    if w > max_side or h > max_side:
+        raise RuntimeError(
+            f"image {w}x{h} exceeds {max_side}px and cannot be resized "
+            "(install pillow to downscale before a vision send)"
+        )
+    if orig == (0, 0):
+        raise RuntimeError(
+            f"cannot determine image size; refusing to send without a {max_side}px cap "
+            "(install pillow)"
+        )
+    return data, orig, orig
+
+
+async def load_image_for_vision(
+    path_or_url: str, timeout: float = 30.0
+) -> "LoadedImage":
+    """Load an image for AnalyzeImage / ollama / deepseek / openrouter vision."""
+    return await load_image(path_or_url, max_dim=VISION_SEND_MAX_SIDE, timeout=timeout)
+
+
 async def load_image(path_or_url: str, max_dim: int = 0, timeout: float = 30.0) -> LoadedImage:
     """
     Load an image from a local path or http(s) URL, optionally downscaled.
@@ -388,10 +545,13 @@ async def load_image(path_or_url: str, max_dim: int = 0, timeout: float = 30.0) 
         source = str(p)
 
     original = len(data)
-    before = _dimensions(data)
+    before = image_dimensions(data)
     if max_dim > 0:
-        data = _maybe_downscale(data, max_dim)
-    after = _dimensions(data)
+        data, orig, after = constrain_image_bytes(data, max_side=max_dim)
+        if orig != (0, 0):
+            before = orig
+    else:
+        after = before
 
     return LoadedImage(
         b64=base64.b64encode(data).decode("ascii"),
@@ -411,37 +571,13 @@ async def load_image_b64(path_or_url: str, max_dim: int = 0, timeout: float = 30
 
 
 def _dimensions(data: bytes) -> tuple[int, int]:
-    try:
-        import io
-
-        from PIL import Image
-
-        with Image.open(io.BytesIO(data)) as img:
-            return img.size
-    except Exception:
-        return (0, 0)
+    return image_dimensions(data)
 
 
 def _maybe_downscale(data: bytes, max_dim: int) -> bytes:
-    """Downscale with Pillow when available; otherwise return the original."""
-    try:
-        import io
-
-        from PIL import Image
-    except ImportError:
-        return data
-
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            if max(img.size) <= max_dim:
-                return data
-            img = img.convert("RGB")
-            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            return buf.getvalue()
-    except Exception:
-        return data
+    """Constrained resize used by vision send. max_dim <= 0 means the 800 cap."""
+    out, _, _ = constrain_image_bytes(data, max_side=max_dim)
+    return out
 
 
 # ---------------------------------------------------------------------------

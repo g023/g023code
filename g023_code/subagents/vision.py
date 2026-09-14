@@ -7,7 +7,7 @@ questions about the same screenshot cost nothing. Three backends are supported,
 selected with ``settings.vision_backend``:
 
 * ``ollama``     — a local/remote Ollama daemon (``vision_chat_detailed``).
-* ``deepseek``   — DeepSeek's ``deepseek-v4-flash-vision-exp`` over the same
+* ``deepseek``   — DeepSeek's ``deepseek-flash`` over the same
                    K.dat key, on either ``/responses`` or ``/chat/completions``
                    (``settings.vision_endpoint``).
 * ``openrouter`` — OpenRouter's chat/completions with the OK.dat key, cycling
@@ -26,8 +26,9 @@ from ..api import chat_answer, get_client
 from ..cache import get_cache
 from ..config import settings
 from ..ollama_client import (
+    VISION_SEND_MAX_SIDE,
     is_local,
-    load_image,
+    load_image_for_vision,
     probe,
     resolve_host,
     vision_chat_detailed,
@@ -76,11 +77,16 @@ async def run_vision(path_or_url: str, question: str) -> str:
 
 
 async def _load(path_or_url: str):
-    """Load an image once — all three backends share the loader."""
+    """Load an image once — all three backends share the loader.
+
+    Always constrained-resize to VISION_SEND_MAX_SIDE (800) on each edge.
+    ``settings.vision_max_image_dim`` of 1024 or 0 does not change the send size.
+    """
     try:
-        return await load_image(path_or_url, max_dim=settings.vision_max_image_dim)
+        # load_image_for_vision always uses VISION_SEND_MAX_SIDE (800).
+        return await load_image_for_vision(path_or_url)
     except Exception as e:
-        raise RuntimeError(f"Could not load image: {e}")
+        raise RuntimeError(f"Could not load image: {e} (send cap {VISION_SEND_MAX_SIDE}px)")
 
 
 def _cache_key(backend: str, model: str) -> str:

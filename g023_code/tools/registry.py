@@ -8,8 +8,10 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -18,6 +20,7 @@ from rich.prompt import Confirm, Prompt
 
 from ..config import get_project_root, settings
 from ..cache import get_cache
+from ..paths import confine_or_error
 from ..subagents.searcher import IGNORE_DIRS
 from ..ui import console
 from .schemas import TOOL_SCHEMAS, WEB_SEARCH_TOOL
@@ -43,12 +46,22 @@ BLOCK = "block"
 # Web search is absent because it is no longer a tool we execute: DeepSeek
 # runs it server-side inside the model call, so there is no point at which we
 # could interpose a prompt.
-SAFE_TOOLS = ("ReadFile", "SearchContent", "ListDir")
+SAFE_TOOLS = (
+    "ReadFile",
+    "SearchContent",
+    "ListDir",
+    "Glob",
+    "TodoWrite",
+    "LearnSearch",
+    "LearnGet",
+    "LearnPut",
+    "SessionSearch",
+)
 
 # Everything else follows settings.permission_default, except FetchUrl: network
 # fetches leave the machine and touch a third party, so they always surface to
 # the user unless they explicitly relax it with /tools.
-DEFAULT_ASK_TOOLS = ("AnalyzeImage", "Bash", "WriteFile", "Agent")
+DEFAULT_ASK_TOOLS = ("AnalyzeImage", "Bash", "WriteFile", "Edit", "Agent")
 
 
 def default_policy() -> Dict[str, str]:
@@ -64,6 +77,57 @@ def default_policy() -> Dict[str, str]:
 
 # Kept for callers that want the shape of the table without the live setting.
 DEFAULT_POLICY: Dict[str, str] = default_policy()
+
+
+# ---------------------------------------------------------------------------
+# Bash output hygiene (context is currency)
+# ---------------------------------------------------------------------------
+# Raw command dumps are a direct context cost. Strip ANSI, keep pytest
+# failures, cap at the source — then the vault sees a smaller body.
+_ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|].*?(?:\x07|\x1b\\))")
+_BLANK_RUN = re.compile(r"\n{3,}")
+_PYTEST_FAIL_BLOCK = re.compile(r"^={5,}\s*(FAILURES|ERRORS)\s*={5,}", re.M)
+BASH_STDOUT_CAP = 6_000
+BASH_STDERR_CAP = 1_500
+
+
+def strip_ansi(text: str) -> str:
+    if not text or "\x1b" not in text:
+        return text
+    return _ANSI_RE.sub("", text)
+
+
+def compact_command_output(text: str) -> str:
+    """Decision-ready command output: no ANSI, no passing-test chatter."""
+    text = strip_ansi(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _BLANK_RUN.sub("\n\n", text)
+    fail = _PYTEST_FAIL_BLOCK.search(text)
+    if fail:
+        head = text[: min(600, fail.start())].rstrip()
+        tail = text[fail.start() :]
+        if len(head) + len(tail) + 40 < len(text):
+            return head + "\n\n… [passing tests elided] …\n\n" + tail
+        return text
+    if len(text) > 4_000 and re.search(r"\d+ passed", text):
+        lines = text.splitlines()
+        if len(lines) > 40:
+            return "\n".join(lines[:6] + ["… [passing output elided] …"] + lines[-20:])
+    return text
+
+
+def cap_command_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    keep_tail = max(0, limit - 280)
+    return text[:200] + f"\n… [{len(text) - limit} chars elided] …\n" + text[-keep_tail:]
+
+
+def prepare_bash_payload(stdout: str, stderr: str, exit_code: int) -> dict:
+    return {
+        "exit_code": exit_code,
+        "stdout": cap_command_output(compact_command_output(stdout), BASH_STDOUT_CAP),
+        "stderr": cap_command_output(compact_command_output(stderr), BASH_STDERR_CAP),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -126,14 +190,86 @@ def backup_before_write(path: Path, root: Path) -> Optional[dict]:
     }
 
 
+def apply_unique_edit(
+    text: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> tuple[Optional[str], Optional[str], int]:
+    """Return ``(new_text, error, n_replacements)``. Fail closed on 0 or >1 unless replace_all."""
+    if old_string == "":
+        return None, "old_string is empty", 0
+    n = text.count(old_string)
+    if n == 0:
+        return None, "old_string not found in file", 0
+    if n > 1 and not replace_all:
+        return None, f"old_string is not unique ({n} occurrences); refuse to edit", 0
+    if replace_all:
+        return text.replace(old_string, new_string), None, n
+    return text.replace(old_string, new_string, 1), None, 1
+
+
+def backup_dir_for(path: Path, root: Path) -> Optional[Path]:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    parent_rel = "" if rel.parent == Path(".") else str(rel.parent)
+    return root / ".g023" / BACKUP_DIR / parent_rel / path.name
+
+
+def newest_backup_for(path: Path, root: Path) -> Optional[Path]:
+    backup_dir = backup_dir_for(path, root)
+    if backup_dir is None or not backup_dir.is_dir():
+        return None
+    versions = sorted(
+        backup_dir.glob(f"*{BACKUP_SUFFIX}"),
+        key=lambda v: v.name,
+        reverse=True,
+    )
+    return versions[0] if versions else None
+
+
+def restore_newest_backup(path: str) -> dict:
+    """Copy the newest ``.g023/backups/`` snapshot for ``path`` back onto the file."""
+    root = get_project_root()
+    resolved, err = confine_or_error(path, root=root)
+    if err or resolved is None:
+        return {"error": err or "Path is outside project root"}
+    backup = newest_backup_for(resolved, root)
+    if backup is None:
+        return {"error": f"No backup found for {resolved}"}
+    previous_hash = None
+    if resolved.exists() and resolved.is_file():
+        previous_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    data = backup.read_bytes()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_bytes(data)
+    get_cache().invalidate_file(resolved)
+    return {
+        "ok": True,
+        "path": str(resolved),
+        "restored_from": str(backup.relative_to(root)),
+        "bytes": len(data),
+        "previous_hash": previous_hash,
+    }
+
+
 class ToolRegistry:
     def __init__(self):
         self.policy = default_policy()
         self._executors: Dict[str, Callable] = {
             "Bash": self._exec_bash,
             "WriteFile": self._exec_write_file,
+            "Edit": self._exec_edit,
             "ListDir": self._exec_list_dir,
+            "Glob": self._exec_glob,
+            "TodoWrite": self._exec_todo_write,
             "FetchUrl": self._exec_fetch_url,
+            "LearnSearch": self._exec_learn_search,
+            "LearnGet": self._exec_learn_get,
+            "LearnPut": self._exec_learn_put,
+            "SessionSearch": self._exec_session_search,
             # Heavy tools are routed to subagents by the orchestrator
             "ReadFile": None,
             "SearchContent": None,
@@ -182,7 +318,14 @@ class ToolRegistry:
             f"[warn]Permission required[/warn] [{style.color}]{style.icon} {style.verb}[/{style.color}] "
             f"{ui.describe_call(tool_name, args, str(get_project_root()))}"
         )
+        diff_text = ui.permission_diff(tool_name, args, str(get_project_root()))
+        skip_keys: set[str] = set()
+        if diff_text:
+            console.print(diff_text)
+            skip_keys = {"content", "old_string", "new_string"}
         for key, value in (args or {}).items():
+            if key in skip_keys:
+                continue
             console.print(f"  [key]{key}[/key] [muted]{ui.truncate(str(value), 100)}[/muted]")
         try:
             answer = Prompt.ask(
@@ -194,8 +337,21 @@ class ToolRegistry:
         except (EOFError, KeyboardInterrupt):
             # Ctrl-D / Ctrl-C at a permission prompt means "not this one" — it
             # should decline the call, not blow up the turn that asked.
-            console.print("\n[warn]Declined.[/warn]")
+            # One-shot / piped stdin also lands here: there is no operator to
+            # answer, so the call is declined rather than hanging forever.
+            # Unattended project runs must pin permission_default to allow.
+            hint = ""
+            if not sys.stdin.isatty():
+                hint = (
+                    " Non-interactive stdin cannot answer ASK prompts — "
+                    "set permission_default to allow (project .g023/config.json "
+                    "or /tools <name> allow) for unattended runs."
+                )
+            console.print(f"\n[warn]Declined.{hint}[/warn]")
             return False
+        # Piped/default answers can leave the cursor on the prompt line, so the
+        # following tool trace would print on top of "Allow? (y):".
+        console.print()
         if answer == "a":
             self.set_permission(tool_name, ALLOW)
             console.print(f"[ok]{tool_name} will run without asking for the rest of this session.[/ok]")
@@ -227,7 +383,13 @@ class ToolRegistry:
             try:
                 approved = Confirm.ask("Fetch it?", default=True)
             except (EOFError, KeyboardInterrupt):
-                console.print("\n[warn]Declined.[/warn]")
+                hint = ""
+                if not sys.stdin.isatty():
+                    hint = (
+                        " Non-interactive stdin cannot answer ASK prompts — "
+                        "set permission_default to allow for unattended runs."
+                    )
+                console.print(f"\n[warn]Declined.{hint}[/warn]")
                 return False
             if not approved:
                 return False
@@ -248,7 +410,13 @@ class ToolRegistry:
                 default="c" if requested != "fresh" else "f",
             )
         except (EOFError, KeyboardInterrupt):
-            console.print("\n[warn]Declined.[/warn]")
+            hint = ""
+            if not sys.stdin.isatty():
+                hint = (
+                    " Non-interactive stdin cannot answer ASK prompts — "
+                    "set permission_default to allow for unattended runs."
+                )
+            console.print(f"\n[warn]Declined.{hint}[/warn]")
             return False
         if choice == "d":
             return False
@@ -298,11 +466,7 @@ class ToolRegistry:
             out = stdout.decode("utf-8", errors="replace")
             err = stderr.decode("utf-8", errors="replace")
             return json.dumps(
-                {
-                    "exit_code": proc.returncode,
-                    "stdout": out[-8000:] if len(out) > 8000 else out,
-                    "stderr": err[-2000:] if len(err) > 2000 else err,
-                },
+                prepare_bash_payload(out, err, proc.returncode),
                 ensure_ascii=False,
             )
         except Exception as e:
@@ -337,6 +501,13 @@ class ToolRegistry:
         # *summary* (not raw content) is how files get silently truncated.
         backup = backup_before_write(p, root)
 
+        from .. import memory_notes
+
+        if memory_notes.is_memory_index_path(p, root):
+            report = memory_notes.write_index(content)
+            get_cache().invalidate_file(p)
+            return json.dumps(report, ensure_ascii=False)
+
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         # Drop the stale summaries for this path. Writing a placeholder row here
@@ -349,12 +520,137 @@ class ToolRegistry:
             payload.update(backup)
         return json.dumps(payload, ensure_ascii=False)
 
+    async def _exec_edit(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> str:
+        root = get_project_root()
+        p, err = confine_or_error(path, root=root)
+        if err or p is None:
+            return json.dumps({"error": err or "Path is outside project root"})
+        if not p.exists() or not p.is_file():
+            return json.dumps({"error": f"File not found: {p}"})
+        try:
+            previous = p.read_text(encoding="utf-8")
+        except OSError as e:
+            return json.dumps({"error": f"Cannot read file: {e}"})
+        updated, problem, n = apply_unique_edit(
+            previous, old_string, new_string, replace_all=bool(replace_all)
+        )
+        if problem is not None or updated is None:
+            return json.dumps({"error": problem, "path": str(p)})
+        if updated == previous:
+            return json.dumps({
+                "ok": True,
+                "unchanged": True,
+                "path": str(p),
+                "bytes": len(previous.encode("utf-8")),
+                "replacements": 0,
+            })
+        backup = backup_before_write(p, root)
+        p.write_text(updated, encoding="utf-8")
+        get_cache().invalidate_file(p)
+        payload = {
+            "ok": True,
+            "path": str(p),
+            "bytes": len(updated.encode("utf-8")),
+            "replacements": n,
+        }
+        if backup:
+            payload.update(backup)
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def _exec_glob(self, pattern: str, path: str = ".") -> str:
+        from ..subagents.searcher import run_glob
+
+        return await run_glob(pattern, path)
+
+    async def _exec_todo_write(
+        self,
+        leaves: Optional[list] = None,
+        goal: Optional[str] = None,
+        constraints: Optional[list] = None,
+    ) -> str:
+        from ..working_set import (
+            evidence_hint,
+            evidence_satisfies_done,
+            load as load_ws,
+            update_todos,
+        )
+
+        incoming = leaves or []
+        ws = load_ws()
+        for leaf in incoming:
+            if not isinstance(leaf, dict):
+                continue
+            if str(leaf.get("status") or "") != "done":
+                continue
+            if not evidence_satisfies_done(ws, leaf):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "done_requires_evidence",
+                        "id": leaf.get("id"),
+                        "hint": evidence_hint(ws, leaf),
+                        "working_set": ws,
+                    },
+                    ensure_ascii=False,
+                )
+        ws = update_todos(incoming, goal=goal, constraints=constraints)
+        return json.dumps({"ok": True, "working_set": ws}, ensure_ascii=False)
+
+    async def _exec_learn_search(self, query: str, scope: str = "all") -> str:
+        from .. import learn
+
+        hits = learn.search(query, scope=scope)
+        return json.dumps({"ok": True, "hits": hits, "count": len(hits)}, ensure_ascii=False)
+
+    async def _exec_learn_get(self, id: str) -> str:
+        from .. import learn
+
+        return json.dumps(learn.get(id), ensure_ascii=False)
+
+    async def _exec_learn_put(
+        self,
+        id: str,
+        kind: str,
+        scope: str,
+        title: str,
+        when: str,
+        body: str,
+        evidence: str,
+        not_when: str = "",
+        requires: Optional[list] = None,
+    ) -> str:
+        from .. import learn
+
+        meta = {
+            "id": id,
+            "kind": kind,
+            "scope": scope,
+            "title": title,
+            "when": when,
+            "not_when": not_when,
+            "requires": requires or [],
+            "evidence": evidence,
+        }
+        result = learn.put(meta, body, evidence=evidence, source="orchestrator")
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _exec_session_search(self, query: str, max_hits: int = 8) -> str:
+        from ..session_log import search_records
+
+        hits = search_records(query, max_hits=int(max_hits or 8))
+        return json.dumps({"ok": True, "hits": hits, "count": len(hits)}, ensure_ascii=False)
+
     async def _exec_list_dir(self, path: str = ".", recursive: bool = False) -> str:
         root = get_project_root()
-        p = Path(path)
-        if not p.is_absolute():
-            p = root / p
-        p = p.resolve()
+        p, err = confine_or_error(path, root=root)
+        if err or p is None:
+            return json.dumps({"error": err or "Path is outside project root"})
         if not p.exists():
             return json.dumps({"error": f"Path does not exist: {p}"})
         if not p.is_dir():

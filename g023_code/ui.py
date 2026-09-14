@@ -16,6 +16,7 @@ Two rules shape the design:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -96,7 +97,14 @@ TOOL_STYLES: dict[str, ToolStyle] = {
     "Agent": ToolStyle("🧠" if UNICODE else "A", "sub", "delegate", subagent=True),
     "Bash": ToolStyle("⚙" if UNICODE else "$", "tool", "run"),
     "WriteFile": ToolStyle("✎" if UNICODE else "W", "warn", "write"),
+    "Edit": ToolStyle("✂" if UNICODE else "E", "warn", "edit"),
     "ListDir": ToolStyle("📁" if UNICODE else "L", "tool", "list"),
+    "Glob": ToolStyle("⊞" if UNICODE else "G", "tool", "find"),
+    "TodoWrite": ToolStyle("☑" if UNICODE else "T", "tool", "todo"),
+    "LearnSearch": ToolStyle("☰" if UNICODE else "Ls", "tool", "learn-search"),
+    "LearnGet": ToolStyle("☰" if UNICODE else "Lg", "tool", "learn-get"),
+    "LearnPut": ToolStyle("☰" if UNICODE else "Lp", "tool", "learn-put"),
+    "SessionSearch": ToolStyle("▤" if UNICODE else "Ss", "tool", "session-search"),
     "FetchUrl": ToolStyle("🌐" if UNICODE else "F", "tool", "fetch"),
     "web_search": ToolStyle("🔍" if UNICODE else "?", "tool", "web search"),
 }
@@ -238,6 +246,24 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
     if name == "WriteFile":
         size = len(s("content").encode("utf-8"))
         return f"{shorten_path(s('path'), root)} [muted]({human_bytes(size)})[/muted]"
+    if name == "Edit":
+        return f"{shorten_path(s('path'), root)} [muted]({len(s('old_string'))} → {len(s('new_string'))} chars)[/muted]"
+    if name == "Glob":
+        detail = f'"{truncate(s("pattern"), 40)}"'
+        if s("path"):
+            detail += f" [muted]in {shorten_path(s('path'), root)}[/muted]"
+        return detail
+    if name == "TodoWrite":
+        leaves = args.get("leaves") or []
+        return f"{len(leaves)} leaf(s)"
+    if name == "LearnSearch":
+        return truncate(s("query"), 60)
+    if name == "LearnGet":
+        return s("id")
+    if name == "LearnPut":
+        return f"{s('id')} [muted]{s('scope')}[/muted]"
+    if name == "SessionSearch":
+        return truncate(s("query"), 60)
     if name == "ListDir":
         return shorten_path(s("path") or ".", root) + (" [muted](recursive)[/muted]" if args.get("recursive") else "")
     if name == "FetchUrl":
@@ -255,6 +281,58 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
     if name == "Agent":
         return f"{s('kind') or 'explore'} [muted]{truncate(s('objective'), 50)}[/muted]"
     return truncate(json.dumps(args, ensure_ascii=False), 70)
+
+
+MAX_PERMISSION_DIFF_CHARS = 8000
+
+
+def unified_change_diff(path: str, old: str, new: str) -> str:
+    """Unified diff of ``old`` → ``new`` for a permission prompt."""
+    a = old.splitlines(keepends=True)
+    b = new.splitlines(keepends=True)
+    if not a and not old:
+        a = []
+    if a and not a[-1].endswith("\n"):
+        a[-1] = a[-1] + "\n"
+    if b and not b[-1].endswith("\n"):
+        b[-1] = b[-1] + "\n"
+    rendered = "".join(
+        difflib.unified_diff(a, b, fromfile=path or "old", tofile=path or "new", n=3)
+    )
+    if not rendered:
+        rendered = "(no textual difference)"
+    if len(rendered) > MAX_PERMISSION_DIFF_CHARS:
+        rendered = (
+            rendered[:MAX_PERMISSION_DIFF_CHARS]
+            + f"\n{Glyph.ELLIPSIS}[diff truncated at {MAX_PERMISSION_DIFF_CHARS} chars]"
+        )
+    return rendered
+
+
+def permission_diff(name: str, args: dict, root: Optional[str] = None) -> Optional[str]:
+    """Diff shown at the ASK prompt for Edit/WriteFile. None for other tools."""
+    args = args or {}
+    path = str(args.get("path") or "")
+    display = shorten_path(path, root) if path else path
+    if name == "Edit":
+        return unified_change_diff(
+            display, str(args.get("old_string") or ""), str(args.get("new_string") or "")
+        )
+    if name == "WriteFile":
+        new = str(args.get("content") or "")
+        old = ""
+        if path:
+            try:
+                from .config import get_project_root
+                from .paths import confine_or_error
+
+                p, err = confine_or_error(path, root=get_project_root())
+                if err is None and p is not None and p.is_file():
+                    old = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                old = ""
+        return unified_change_diff(display, old, new)
+    return None
 
 
 def describe_result(name: str, result: str) -> tuple[str, bool]:
@@ -296,9 +374,12 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         return (", ".join(bits) or f"{size:,} chars"), True
 
     if name == "SearchContent":
-        matches = data.get("matches") or []
-        files = len({m.get("file") for m in matches if isinstance(m, dict)})
-        return f"{len(matches)} matches in {files} file(s)", True
+        samples = data.get("samples") or data.get("matches") or []
+        total = data.get("total")
+        if not isinstance(total, int):
+            total = len(samples)
+        files = data.get("files") or list({m.get("file") for m in samples if isinstance(m, dict)})
+        return f"{total} matches ({len(samples)} shown) in {len(files)} file(s)", True
 
     if name == "AnalyzeImage":
         bits = [f"{len(data.get('answer') or '')} chars"]
@@ -327,6 +408,33 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         if data.get("backup"):
             phrase += f" \u2022 backup \u2192 {data['backup']}"
         return phrase, bool(data.get("ok"))
+
+    if name == "Edit":
+        size = human_bytes(int(data.get("bytes") or 0))
+        n = int(data.get("replacements") or 0)
+        phrase = f"{n} replacement(s), {size}"
+        if data.get("backup"):
+            phrase += f" \u2022 backup \u2192 {data['backup']}"
+        return phrase, bool(data.get("ok"))
+
+    if name == "Glob":
+        total = int(data.get("total") or 0)
+        shown = len(data.get("files") or [])
+        return f"{total} file(s) ({shown} listed)", True
+
+    if name == "TodoWrite":
+        open_n = len((data.get("working_set") or {}).get("open") or [])
+        return f"{open_n} open leaf(s)", bool(data.get("ok"))
+
+    if name in ("LearnSearch", "SessionSearch"):
+        n = int(data.get("count") or len(data.get("hits") or []))
+        return f"{n} hit(s)", bool(data.get("ok", True))
+
+    if name == "LearnGet":
+        return str(data.get("id") or data.get("error") or "guide"), bool(data.get("ok"))
+
+    if name == "LearnPut":
+        return str(data.get("id") or data.get("error") or "put"), bool(data.get("ok"))
 
     if name == "ListDir":
         return f"{len(data.get('entries') or [])} entries", True

@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 
 from .config import load_api_key, settings
+from .effort import effort_to_wire
 
 # The API is strict about tool-call bookkeeping in both directions: a
 # ``function_call`` with no matching ``function_call_output`` is a 400, and so is
@@ -242,7 +243,7 @@ def chat_answer(response: Dict[str, Any]) -> str:
 
 
 def reasoning_param(
-    enabled: Optional[bool] = None, effort: Optional[str] = None
+    enabled: Optional[bool] = None, effort: Optional[Any] = None
 ) -> Dict[str, str]:
     """The ``reasoning`` block for a request.
 
@@ -250,12 +251,17 @@ def reasoning_param(
     ``thinking: {"type": "disabled"}`` — that field is accepted and silently
     ignored, and the model reasons anyway. ``effort: "none"`` is what actually
     turns thinking off, so that is what "thinking disabled" maps to here.
+
+    Integer ``1``–``100`` is a user/model scale, not a wire value: the live
+    API rejects numbers. :func:`g023_code.effort.effort_to_wire` maps the
+    scale onto the aliases the probe accepted, capped at ``MAX_EFFORT``
+    (75 → ``"high"``). This harness never sends ``xhigh`` or ``max``.
     """
     if enabled is None:
         enabled = settings.thinking_enabled
-    if not enabled:
-        return {"effort": "none"}
-    return {"effort": effort or settings.reasoning_effort}
+    if effort is None:
+        effort = settings.reasoning_effort
+    return {"effort": effort_to_wire(effort, enabled=bool(enabled))}
 
 
 def output_text(response: Dict[str, Any]) -> str:

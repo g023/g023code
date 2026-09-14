@@ -16,7 +16,14 @@ repairs an incomplete setup.
 4. **API key** — prompts for the DeepSeek key and writes `K.dat`; when
    skipped, leaves the placeholder that `config.load_api_key()` recognises
    and turns into a clear instruction.
-5. **Config** — writes a default machine-level `config.json`.
+5. **Config** — writes a default machine-level `config.json` if none
+   exists. The template is the full `PERSISTED_KEYS` set matching
+   `Settings` defaults: `deepseek-flash`, `reasoning_effort: 75`,
+   `max_iterations: 255`, `max_context_tokens: 256000`,
+   `vision_backend: none`, `vision_max_image_dim: 800`, backups on,
+   surge notify on / pause off. An existing valid `config.json` is left
+   untouched. Older files that still name `deepseek-v4-flash` / `"high"`
+   are mapped onto those values by `config._coerce` on load.
 6. **Launcher** — creates a `g023` shim in `~/.local/bin` (POSIX;
    `installer.bat` sets up the `.bat` launcher), so `g023` works from any
    directory. `G023_HOME`/`G023_PROJECT_ROOT` are resolved by the
@@ -26,7 +33,7 @@ repairs an incomplete setup.
 ## `requirements.txt` — the dependency tiers
 
 ```
-Required           rich, httpx, tiktoken, pygments   → won't start without
+Required           rich, httpx, pygments             → won't start without
 Recommended        prompt_toolkit                    → input degrades to a plain prompt
 Optional (vision)  pillow                            → downscale; avoids out-of-VRAM
 Optional (FetchUrl) curl_cffi, h2, brotli, zstandard → each makes fetches look more
@@ -38,7 +45,8 @@ Optional (FetchUrl) curl_cffi, h2, brotli, zstandard → each makes fetches look
 
 The installer mirrors these tiers (`REQUIRED`/`RECOMMENDED`/`OPTIONAL`
 lists), so a user can decline the heavy bits and still get a working
-program.
+program. The context gauge is last API `input_tokens` /
+`settings.max_context_tokens`; there is no local tokenizer.
 
 ## Related
 

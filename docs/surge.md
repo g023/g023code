@@ -8,15 +8,18 @@ ranges for the "don't work during peak" feature.
 
 ## Source of truth
 
-`config.SURGE_PEAK_WINDOWS_BEIJING` / `config.SURGE_UTC_OFFSET`, loaded
-from `ds_times.json` (Beijing 09:00–12:00 & 14:00–18:00, UTC+8) with a
-hard-coded fallback. `surge.py` never hard-codes the windows itself.
+`config.SURGE_PEAK_WINDOWS_BEIJING` / `config.SURGE_UTC_OFFSET` /
+`config.SURGE_PEAK_WEEKDAYS`, loaded from `ds_times.json` (Beijing
+09:00–12:00 & 14:00–18:00, UTC+8, Monday–Friday) with a hard-coded
+fallback. Weekends are off-peak. `surge.py` never hard-codes the
+windows itself.
 
 ## Functions
 
 - `beijing_now(now=None)` — the current instant as Beijing wall-clock time
   (the only timezone the API's pricing actually cares about).
-- `is_surge(now=None)` — inside a peak window right now?
+- `is_surge(now=None)` — inside a peak window right now (and on a peak weekday)?
+- `is_peak_weekday(bj)` — Monday–Friday in Beijing wall-clock time.
 - `_peak_edges(bj_date)` — today's window start/end instants in local time.
 - `peak_windows_local(now, days)` — upcoming windows expressed in the
   **machine's local timezone** (what the user's clock shows).
@@ -34,10 +37,11 @@ hard-coded fallback. `surge.py` never hard-codes the windows itself.
 
 ## Guarantees (per `tests/test_surge.py`)
 
-Only two facts come from DeepSeek: the Beijing peak windows and that
-off-peak = half of peak. Everything here is arithmetic on top — converting
-the current instant to Beijing time, deciding on/off, widening by the
-buffer — **always reported back in local time**.
+Three facts come from DeepSeek: the Beijing peak windows, that they apply
+Monday–Friday, and that off-peak = half of peak. Everything here is
+arithmetic on top — converting the current instant to Beijing time,
+deciding on/off, skipping weekends, widening by the buffer — **always
+reported back in local time**.
 
 ## Related
 

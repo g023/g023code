@@ -14,12 +14,28 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import get_cache_db
+from .cost_policy import VAULT_LEADIN, VAULT_MIN_CHARS
 
 
 def _sha256(text: str | bytes) -> str:
     if isinstance(text, str):
         text = text.encode("utf-8")
     return hashlib.sha256(text).hexdigest()
+
+
+def _vault_excerpt(text: str, head: int = 400, tail: int = 800) -> str:
+    """Head + a longer tail so pytest/log failures at the end stay visible."""
+    if len(text) <= head + tail + 80:
+        return text
+    return (
+        text[:head].rstrip()
+        + "\n\n… [middle elided; full body in tool_vault, re-run the tool to hydrate] …\n\n"
+        + text[-tail:].lstrip()
+    )
+
+
+def is_vault_pointer(text: str) -> bool:
+    return (text or "").startswith(VAULT_LEADIN)
 
 
 class Cache:
@@ -71,6 +87,15 @@ class Cache:
                     engine      TEXT,
                     profile     TEXT,
                     fetched_at  REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    hit_count   INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS tool_vault (
+                    body_hash   TEXT PRIMARY KEY,
+                    body        TEXT NOT NULL,
+                    chars       INTEGER NOT NULL,
+                    created_at  REAL NOT NULL,
                     accessed_at REAL NOT NULL,
                     hit_count   INTEGER NOT NULL DEFAULT 0
                 );
@@ -347,6 +372,62 @@ class Cache:
         return out[-days:]
 
     # ------------------------------------------------------------------
+    # Tool vault (content-addressed bulky results)
+    # ------------------------------------------------------------------
+    #
+    # Large Bash / FetchUrl / ListDir bodies never enter the orchestrator
+    # history as raw text. History holds a short pointer + excerpt; the full
+    # body is keyed by sha256 so a repeat of the same bytes is free. This is
+    # append-only: the pointer is what is written the first time, so there is
+    # no later middle rewrite of a cached prefix (DeepSeek Example 2).
+
+    def put_tool_body(self, body: str) -> str:
+        """Store ``body`` by sha256. Same bytes are a no-op. Returns the hash."""
+        body_hash = _sha256(body)
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_vault (body_hash, body, chars, created_at, accessed_at, hit_count)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(body_hash) DO UPDATE SET accessed_at = excluded.accessed_at
+                """,
+                (body_hash, body, len(body), now, now),
+            )
+        return body_hash
+
+    def get_tool_body(self, body_hash: str) -> Optional[str]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT body FROM tool_vault WHERE body_hash = ?",
+                (body_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE tool_vault SET accessed_at = ?, hit_count = hit_count + 1 "
+                "WHERE body_hash = ?",
+                (time.time(), body_hash),
+            )
+            return row["body"]
+
+    def offload_tool_output(
+        self, text: str, *, min_chars: int = VAULT_MIN_CHARS
+    ) -> str:
+        """Replace a bulky tool result with a pointer + excerpt.
+
+        Short strings and existing pointers pass through unchanged so a
+        second pass cannot rewrite history bytes.
+        """
+        if not text or len(text) < min_chars or is_vault_pointer(text):
+            return text
+        body_hash = self.put_tool_body(text)
+        excerpt = _vault_excerpt(text)
+        return (
+            f"{VAULT_LEADIN}sha256:{body_hash} chars={len(text)}]\n{excerpt}"
+        )
+
+    # ------------------------------------------------------------------
     # Session facts (lightweight memory)
     # ------------------------------------------------------------------
 
@@ -371,7 +452,12 @@ class Cache:
 
     def stats(self) -> dict[str, int]:
         """Row counts per cache, for /cache."""
-        tables = {"files": "file_cache", "vision": "vision_cache", "web": "web_cache"}
+        tables = {
+            "files": "file_cache",
+            "vision": "vision_cache",
+            "web": "web_cache",
+            "vault": "tool_vault",
+        }
         out: dict[str, int] = {}
         with self._conn() as conn:
             for label, table in tables.items():
@@ -384,6 +470,7 @@ class Cache:
             conn.execute("DELETE FROM file_cache")
             conn.execute("DELETE FROM vision_cache")
             conn.execute("DELETE FROM web_cache")
+            conn.execute("DELETE FROM tool_vault")
             conn.execute("DELETE FROM session_facts")
 
 

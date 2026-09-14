@@ -1,8 +1,9 @@
 """
 DeepSeek surge (peak/off-peak) pricing windows.
 
-DeepSeek moved to tidal pricing on 2026-08-17: peak hours are **09:00–12:00 and
-14:00–18:00 Beijing time (UTC+8)**, and off-peak prices are exactly half of
+DeepSeek moved to tidal pricing on 2026-08-17 (sheet restated 2026-09-10):
+peak hours are **09:00–12:00 and 14:00–18:00 Beijing time (UTC+8), Monday
+through Friday**. Weekends are off-peak. Off-peak prices are exactly half of
 peak. That anchor is fixed, but the user's clock is not — so every window below
 is computed from the current instant's Beijing wall-clock time and *reported in
 the machine's local timezone*. ``/surge status`` and the loop notifications
@@ -28,7 +29,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .config import SURGE_PEAK_WINDOWS_BEIJING, SURGE_UTC_OFFSET
+from .config import (
+    SURGE_PEAK_WEEKDAYS,
+    SURGE_PEAK_WINDOWS_BEIJING,
+    SURGE_UTC_OFFSET,
+)
 
 # Beijing has no DST; a fixed offset is correct all year round.
 BEIJING_TZ = timezone(timedelta(hours=SURGE_UTC_OFFSET))
@@ -42,9 +47,17 @@ def beijing_now(now: Optional[datetime] = None) -> datetime:
     return now.astimezone(BEIJING_TZ)
 
 
+def is_peak_weekday(bj: datetime) -> bool:
+    """True when ``bj`` (Beijing wall-clock) falls on a published peak weekday."""
+    days = SURGE_PEAK_WEEKDAYS or (0, 1, 2, 3, 4)
+    return bj.weekday() in days
+
+
 def is_surge(now: Optional[datetime] = None) -> bool:
     """True when the DeepSeek API is at surge pricing right now."""
     bj = beijing_now(now)
+    if not is_peak_weekday(bj):
+        return False
     for start_hour, end_hour in SURGE_PEAK_WINDOWS_BEIJING:
         if start_hour <= bj.hour < end_hour:
             return True
@@ -63,16 +76,23 @@ def _peak_edges(bj_date: datetime) -> list[datetime]:
 def peak_windows_local(
     now: Optional[datetime] = None, days: int = 2
 ) -> list[tuple[datetime, datetime]]:
-    """Raw (unbuffered) surge windows for the next ``days`` days, in local time.
+    """Raw (unbuffered) surge windows for the next ``days`` peak days, in local time.
 
+    Weekend calendar days are skipped (published sheet is Monday–Friday).
     These are the true peak hours — the pause windows in :func:`pause_ranges`
     are these same windows widened by the buffer. Ordered by start time.
     """
     bj = beijing_now(now)
     out: list[tuple[datetime, datetime]] = []
-    for day_offset in range(days):
+    found_days = 0
+    day_offset = 0
+    while found_days < days and day_offset < 14:
         day = bj.date() + timedelta(days=day_offset)
+        day_offset += 1
         mid = datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TZ)
+        if not is_peak_weekday(mid):
+            continue
+        found_days += 1
         for start_hour, end_hour in SURGE_PEAK_WINDOWS_BEIJING:
             start = mid.replace(hour=start_hour).astimezone()
             end = mid.replace(hour=end_hour).astimezone()
@@ -134,9 +154,12 @@ def pause_ranges(
     bj = beijing_now(now)
     buffer = timedelta(minutes=buffer_minutes)
     ranges: list[tuple[datetime, datetime]] = []
-    for day_offset in (0, 1):  # today + tomorrow, enough for any "next" query
+    # Look ahead a week so Friday evening still finds Monday's window.
+    for day_offset in range(0, 8):
         day = bj.date() + timedelta(days=day_offset)
         mid = datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TZ)
+        if not is_peak_weekday(mid):
+            continue
         for start_hour, end_hour in SURGE_PEAK_WINDOWS_BEIJING:
             start_bj = mid.replace(hour=start_hour) - buffer
             end_bj = mid.replace(hour=end_hour) + buffer
@@ -180,9 +203,11 @@ def next_transition(
 
     candidates: list[tuple[str, datetime]] = []
     bj = beijing_now(now)
-    for day_offset in (0, 1, 2):
+    for day_offset in range(0, 8):
         day = bj.date() + timedelta(days=day_offset)
         mid = datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TZ)
+        if not is_peak_weekday(mid):
+            continue
         buffer = timedelta(minutes=buffer_minutes)
         for start_hour, end_hour in SURGE_PEAK_WINDOWS_BEIJING:
             start_bj = mid.replace(hour=start_hour)
@@ -216,7 +241,7 @@ def describe() -> str:
     lasts = format_duration(next_end - next_start)
     kind, when = next_transition(now)
     return (
-        f"{'SURGE ACTIVE' if active else 'off-peak'} · peak (Beijing 09-12/14-18) "
+        f"{'SURGE ACTIVE' if active else 'off-peak'} · peak (Beijing 09-12/14-18 Mon–Fri) "
         f"in your clock: {windows} · next surge in {until}, lasts {lasts} "
         f"({clock_range(next_start, next_end)}) · next: "
         f"{kind.replace('_', ' ')} {clock(when)} ({local_tz})"

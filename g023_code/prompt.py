@@ -17,6 +17,7 @@ from typing import Callable, Optional
 from rich.prompt import Prompt
 
 from . import commands as cmd_registry
+from .prompt_store import last_prompt
 from .ui import Glyph, console
 
 try:  # optional dependency
@@ -44,6 +45,31 @@ PROMPT_STYLE_DEFS = {
 
 
 if HAS_PROMPT_TOOLKIT:
+
+    def make_key_bindings() -> KeyBindings:
+        """Bindings for the input line — newline-on-Esc-Enter and Ctrl+Up recall.
+
+        Ctrl+Up loads the last stored user request from ``.g023/prompts/``.
+        Up-arrow FileHistory is unchanged. Safe to call without a TTY.
+        """
+        bindings = KeyBindings()
+
+        @bindings.add("escape", "enter")
+        def _(event):  # noqa: ANN001 - prompt_toolkit callback signature
+            """Alt/Esc then Enter inserts a newline instead of submitting."""
+            event.current_buffer.insert_text("\n")
+
+        @bindings.add("c-up")
+        def _recall_last(event):  # noqa: ANN001 - prompt_toolkit callback signature
+            """Ctrl+Up replaces the input line with the last stored user request."""
+            text = last_prompt()
+            if text is None:
+                return
+            buf = event.current_buffer
+            buf.text = text
+            buf.cursor_position = len(text)
+
+        return bindings
 
     class SlashCompleter(Completer):
         """Completes slash commands and their first-argument choices."""
@@ -84,6 +110,7 @@ class Reader:
     ):
         self.status = status
         self.session = None
+        self.bindings = make_key_bindings() if HAS_PROMPT_TOOLKIT else None
         # prompt_toolkit needs a real terminal; piped or redirected input (a
         # smoke test, a heredoc, a CI run) has to go through the plain prompt.
         if not HAS_PROMPT_TOOLKIT or not sys.stdin.isatty():
@@ -97,18 +124,11 @@ class Reader:
             except OSError:
                 history = None
 
-        bindings = KeyBindings()
-
-        @bindings.add("escape", "enter")
-        def _(event):  # noqa: ANN001 - prompt_toolkit callback signature
-            """Alt/Esc then Enter inserts a newline instead of submitting."""
-            event.current_buffer.insert_text("\n")
-
         self.session = PromptSession(
             history=history,
             completer=SlashCompleter(),
             complete_while_typing=True,
-            key_bindings=bindings,
+            key_bindings=self.bindings,
             style=Style.from_dict(PROMPT_STYLE_DEFS),
             bottom_toolbar=self._toolbar if status else None,
             enable_history_search=True,
