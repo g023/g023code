@@ -1,6 +1,6 @@
 # `cli.py` — the CLI: REPL, slash commands, dashboard
 
-`g023_code/cli.py` (~2,670 lines) is the user-facing shell. It owns the
+`g023_code/cli.py` is the user-facing shell. It owns the
 `CLI` class: startup banner, the main REPL loop, every slash-command
 handler, and the per-turn orchestration call. All rendering goes through
 `ui.py`; all input through `prompt.py`.
@@ -15,7 +15,7 @@ catalogue entry has no matching `cmd_*` method.
 - `loop()` (the async main loop):
   1. `print_banner()` — title/version banner (see `ui.banner`).
   2. `load_api_key()` — dies early with a clear message if `K.dat` is
-     missing or a placeholder. (OpenRouter key is only loaded on demand.)
+     missing or a placeholder. It is the only credential.
   3. Runs a surge monitor (`_surge_tick`): prints a one-time panel when
      peak pricing starts/stops if `surge_notify` is on.
   4. Surge pause: if `surge_pause` is on and the next peak (plus buffer) is
@@ -23,14 +23,21 @@ catalogue entry has no matching `cmd_*` method.
      once; Ctrl-C bypasses the pause for the rest of the session
      (`_surge_bypass`).
   5. Reads a line. `/`-prefixed lines go to `handle_slash`; everything else
-     goes to `run_prompt`. Ctrl-C/EOF prints "Bye." and exits.
+     goes to `run_prompt`. Ctrl-C/EOF at an empty prompt prints "Bye." and exits.
+  6. Ctrl-C while something runs (a turn, a slash command, the surge pause)
+     stops only that work (`interrupts.InterruptController`): the turn rolls
+     back as a transaction, Bash process groups are killed, and the REPL keeps
+     going. At a permission prompt Ctrl-C means "no". Three presses within 2 s
+     force-quit a step that ignores cancellation.
 - `main(argv=None)` parses argv (`parse_cli_argv`): `--help`/`-h` prints
   `print_flag_help()` (program name + slash-command catalogue) and
   returns 0 without building a Reader; `--version`/`-V` prints
   `g023 Code <version>`; `--continue` (`-c`) seeds a new orchestration from
   the latest `.g023/logs/` handoff (else `/resume` JSONL) then continues;
   remaining tokens are one prompt (`_run_oneshot` → `run_prompt`) then
-  exit; no tokens start the REPL (`CLI.loop()`). Launchers already forward
+  exit, unless the first token is a known slash command (`/goal` runs
+  `cmd_goal`). An unknown `/…` stays a prompt. No tokens start the REPL
+  (`CLI.loop()`). Launchers already forward
   `"$@"` / `%*` to `python -m g023_code`.
 
 The toolbar shows the live effort integer (`think 75`), context fraction,
@@ -48,18 +55,22 @@ Errors inside a handler print `Command failed: …` (with a traceback when
 
 **Session** — `cmd_help` (list / one-command detail), `cmd_status`
 (one-screen dashboard: model, context, cost, vision, or-sub, cache,
-surge, which `g023.md`/`g023_compact.md` is loaded, memory-notes line),
+surge, which `g023.md`/`g023_compact.md` is loaded, memory-notes and
+bbs lines),
 `cmd_clear` (reset conversation + usage counters + working set),
 `cmd_resume` (latest JSONL view; `/resume log` seeds from `.g023/logs/`;
 warns on prefix-fingerprint mismatch), `cmd_learn` (status / search /
-get / save / forget / outcome — see `learn.md`), `cmd_undo` (restore
+get / save / forget / outcome — see `learn.md`), `cmd_bbs` (status /
+list / search / read / post / index — see `bbs.md`), `cmd_undo` (restore
 newest `.g023/backups/` copy; bare `/undo` uses the last working-set
 file pointer), `cmd_exit`, `cmd_config`.
 
-**Model** — `cmd_model` (choose orchestrator model; only `deepseek-flash`
-today; `flash` and `deepseek-v4-flash` aliases; `pro` is refused with
-the UNAVAILABLE_MODELS reason), `cmd_thinking` (0–100 or
-low/high/max/off; 75 is the ceiling; picker when bare; saved), `cmd_verbose`
+**Model** — `cmd_model` (info panel only: the one model, `deepseek-flash`
+/ DeepSeek V4.1 Flash, its endpoint, context and output limits, thinking
+levels, vision and prices — there is nothing to choose), `cmd_surge`
+(status / on / off / buffer / notify / `now` — current instant, same panel
+as status), `cmd_thinking` (0–100 or
+low/high/max/on/off; 75 is the ceiling; picker when bare; saved), `cmd_verbose`
 (low/mid/high), `cmd_steps`, `cmd_max_tokens`.
 
 **Context** — `cmd_compact` (manual compaction + what was dropped),
@@ -69,32 +80,34 @@ reasoning; leaves the original),
 `cmd_context` (context gauge, token breakdown), `cmd_cost` (per-model
 cost + totals), `cmd_signals` (drift-signal log and hit-rate verdict),
 `cmd_settings` / `show_settings` (all knobs in one panel + `usage_table`
-+ `pricing_note`).
++ `pricing_note`; `set KEY VALUE` goes through `config.parse_setting`, which
+types the text by the key's current value and applies the load-time `_coerce`
+rules, then saves).
 
 **Tools** — `cmd_tools` (registry policy and `_cache_size_line`),
 `cmd_fetch` (manual web fetch, shows the cached result and
 engine fidelity), `cmd_cache` (cache stats + `show_web_cache` entries).
 
-**Vision** — `cmd_ollama` (status / `set-host` / `models` / `test` /
-`ps`), `cmd_vision` (backend none|ollama|deepseek|openrouter, endpoint,
-model, downscale, ctx, keep-alive, timeout; `_enable_vision` /
-`_disable_vision`), `cmd_surge` (status / on / off / buffer / notify / `now` —
-current instant, same panel as status), `cmd_or` (OpenRouter status,
-`models`, credits tier),
-`cmd_orsub` (OpenRouter subagent offload: enable, primary, add/remove
-models, priorities, reasoning, live `test`; `_orsub_status` shows the
-model table and today's usage).
+**Vision** — `cmd_vision` (`on` / `off` / `status`; bare asks whether to
+toggle). `vision_status()` is the one-line summary; `_set_vision(enabled)`
+saves `vision_enabled` and rebuilds the instructions (the AnalyzeImage tool
+appears or disappears). Images always go to `deepseek-flash`, capped at
+800 px (`images.py`).
 
-**Work** — `cmd_goal` (`/goal <objective>` — one turn with reasoning
-forced to 75 (the harness ceiling), step cap lifted, and a prompt asking
-the model to break the objective into tool-using steps; seeds
-`working_set.goal`; keeps a same-response `[next_effort]` for the next
-request, otherwise restores the usual settings after).
+**Work** — `cmd_goal` (`/goal <objective>` — reasoning forced to 75 (the
+harness ceiling), step cap lifted, and a prompt asking the model to finish
+the objective with TodoWrite evidence; seeds `working_set.goal`. If the
+judge still says not completed, at most two continuation turns name the
+open leaves, and a continuation that does not change the working set
+stops. Identical tool calls in one turn are skipped after the second.
+Keeps a same-response `[next_effort]` in settings, otherwise restores
+the previous dial. The wire stays on the alias that goal warmed until
+the transcript is replaced, or the user runs `/thinking` or `/clear`).
 
 Each handler's help text, choices, aliases, and examples live in
 `commands.py` (see `commands.md`); the handlers here implement the
-behaviour. `interactive` commands (model, thinking, verbose, vision, or,
-orsub, config) run a `choose`-style picker when no argument is given.
+behaviour. `interactive` commands (thinking, verbose, vision,
+config) run a `choose`-style picker when no argument is given.
 
 ## Running a prompt (`run_prompt`, `_surge_tick`)
 

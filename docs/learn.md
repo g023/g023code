@@ -1,6 +1,6 @@
 # `learn.py` — cross-session procedural guides
 
-`g023_code/learn.py` (~697 lines) is a file-backed store of reusable
+`g023_code/learn.py` is a file-backed store of reusable
 procedures, pitfalls, routing notes, and facts. Guides travel across
 sessions and (for `env`/`user` scope) across projects. They are **not**
 injected into `Orchestrator._system` — the model must `LearnSearch` /
@@ -83,3 +83,10 @@ matches. Prefixed `[learn] LearnSearch query=`.
   nothing from this store is concatenated into `instructions`.
 - `tests/test_learn.py` — round-trip, cross-project env visibility,
   prefix pin, secret reject, root confine.
+
+## Concurrency
+
+Index upsert/remove run under `fsutil.file_lock(INDEX)` and replace the file
+atomically. `outcome` re-reads the guide under the guide's lock, so concurrent
+votes all count. There is no per-session vote dedupe by design (the repeat
+detector already blocks same-turn duplicates).

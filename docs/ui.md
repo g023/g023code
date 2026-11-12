@@ -1,6 +1,6 @@
 # `ui.py` — the terminal UI layer
 
-`g023_code/ui.py` (~641 lines) is the single place pixels get decided.
+`g023_code/ui.py` is the single place pixels get decided.
 Everything rendered goes through here: a shared rich `console`, glyphs,
 panels, tables, gauges, and the activity printer the orchestrator
 narrates through. `_unicode_ok()` detects a non-Unicode terminal and

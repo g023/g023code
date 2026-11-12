@@ -1,16 +1,17 @@
 # Overview — how g023 Code fits together
 
 g023 Code is a pure-Python, DeepSeek-powered terminal coding agent.
-Architecture is inspired by Claude Code, with a **strict Subagent-First
-design**: the orchestrator model never reads whole files into its context —
-heavy data work is delegated to isolated subagents that return compact
-summaries.
+Architecture is inspired by Claude Code. Since 2026-11-07 it runs
+**single-agent by default**: the orchestrator still never reads whole files
+into its context — local helpers (structural index, local focus ranking,
+grep) return compact summaries without a model call; model-backed subagents
+(`Agent`, LLM focus) are opt-in with `/subagents on`.
 
-The model id sent on every DeepSeek call is **`deepseek-flash`**
-(orchestrator, FileReader LLM path, Agent nested loop, `/g023-compact`,
-and the DeepSeek vision backend). `/model` still accepts the alias
-`flash`. `deepseek-v4-pro` is withheld: the Responses API has not enabled
-it for this integration.
+There is one model: **DeepSeek V4.1 Flash** (`config.MODEL =
+"deepseek-flash"`), used for the orchestrator, FileReader's model path, the
+Agent nested loop, `/g023-compact` and vision. It is a constant, not a setting.
+There is one wire: `POST /anthropic/v1/messages`, translated by
+`anthropic_codec.py`. `/model` shows the limits and prices.
 
 ## Module map
 
@@ -25,18 +26,18 @@ g023_code/cli.py            CLI class: banner, slash commands, main REPL loop
 g023_code/orchestrator.py   Orchestrator: the per-turn agent loop
         │  talks to DeepSeek through
         ▼
-g023_code/api.py            ResponsesClient (create / stream / vision)
+g023_code/api.py            DeepSeekClient (create / stream / vision; one model, one wire)
+g023_code/anthropic_codec.py  internal items <-> Anthropic messages (deterministic)
         │
-        ├── server-side tools (web_search)  — offered natively by the API
         ├── heavy tools → g023_code/subagents/router.py
         │        ├── file_reader.py   ReadFile → JSON summary
         │        ├── searcher.py      SearchContent / Glob → JSON (rg | grep | walk)
-        │        ├── vision.py        AnalyzeImage → ollama | deepseek | openrouter
+        │        ├── vision.py        AnalyzeImage → images.py → DeepSeekClient.vision
         │        └── _run_agent       Agent (research / planning / todos / task;
         │                             explore/plan aliases) → isolated tool loop
         └── light tools → g023_code/tools/registry.py
                  ├── Bash, WriteFile, Edit, ListDir, Glob, TodoWrite,
-                 │   FetchUrl, LearnSearch, LearnGet, LearnPut, SessionSearch
+                 │   WebSearch, FetchUrl, LearnSearch, LearnGet, LearnPut, SessionSearch
                  └── schemas.py  (the tool definitions shown to the model)
 ```
 
@@ -56,13 +57,12 @@ Supporting modules (used by all of the above):
 | `session_log.py` | append-only `.g023/sessions/*.jsonl` and `.g023/logs/` handoffs |
 | `learn.py` | cross-session procedural guides (`~/.g023/learn`, `<project>/.g023/learn`) |
 | `memory_notes.py` | `.g023/memory/MEMORY.md` notebook (never injected into instructions) |
+| `bbs.py` | `.g023/bbs/` bulletin board (never injected; SearchContent overlay) |
 | `prompt_store.py` | `.g023/prompts/{n}.txt`; Ctrl+Up recalls the last one |
 | `ui.py` | every pixel: rich console, glyphs, panels, gauges, activity printer |
 | `prompt.py` | user input: prompt_toolkit reader with completion + fallbacks |
-| `web_fetch.py` | the FetchUrl engine: browser-like HTTP, HTML→text extraction |
-| `ollama_client.py` | local Ollama host: probe, models, image load, vision chat |
-| `openrouter_client.py` | OpenRouter vision with model failover and daily quota |
-| `or_subagents.py` | OpenRouter subagent offload: model list, priorities, reasoning, failover |
+| `web.py` | WebSearch/FetchUrl: DeepSeek Search/Fetch APIs, machine-wide cache, page focus |
+| `images.py` | load an image (project path or URL), sniff its media type, cap it at 800 px |
 | `project_instructions.py` | `g023.md` / `g023_compact.md` plus a project-root `AGENTS.md` |
 
 ## One session, end to end
@@ -98,7 +98,7 @@ Supporting modules (used by all of the above):
 6. Every model call is metered by `usage.py`; the context gauge and `/cost`
    read from it. The cache keeps file summaries, vision answers, web
    fetches, and the working set across sessions. Learn guides and memory
-   notes are files, not SQLite.
+   notes and the bulletin board are files, not SQLite.
 
 ## The ideas the code is built around
 
@@ -106,10 +106,12 @@ Supporting modules (used by all of the above):
   summary, never a raw dump; escalation is a deliberate, exact re-read by
   line range, or `raw=true` / Edit for a unique span. `G023_READFILE_RAW`
   flips this off for baseline measurements.
-- **The client must not invent limits.** `max_iterations` and `max_tokens`
-  default to "no client-side cap" (0); what replaces a ceiling is
-  visibility (iteration notices, `/signals`, Ctrl-C).
-- **History integrity is a hard invariant.** Responses items must keep
+- **The client must not invent limits.** `max_tokens` defaults to "no
+  client-side cap" (0). `max_iterations` defaults to 255, a loose backstop
+  against a turn that calls tools forever (`/steps off` sets 0 = no cap).
+  What replaces a tight ceiling is visibility (iteration notices,
+  `/signals`, Ctrl-C).
+- **History integrity is a hard invariant.** Internal items must keep
   `function_call` ⇄ `function_call_output` pairs intact; a dangling pair
   kills every following turn. A user-role working-set item must not land
   between a parallel tool batch and its outputs — that is also a 400.

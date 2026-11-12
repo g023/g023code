@@ -1,6 +1,6 @@
 # `paths.py` — project-root confinement
 
-`g023_code/paths.py` (~64 lines) is the single resolver that refuses a
+`g023_code/paths.py` is the single resolver that refuses a
 tool path outside `G023_PROJECT_ROOT`. Symlink escapes are included:
 the check is after `Path.resolve()`.
 

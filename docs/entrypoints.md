@@ -13,7 +13,7 @@ The `python -m g023_code` entry point. Imports `cli.main` and
 
 Package metadata only:
 
-- `__version__ = "1.3.4"` — the version shown in the banner and by the CLI.
+- `__version__ = "1.5.0"` — the version shown in the banner and by the CLI.
 - `__title__ = "g023 Code"`.
 
 It deliberately does **not** reassign `__name__` (a comment in the file
@@ -48,7 +48,7 @@ Set by the launchers (override at your own risk):
 
 | Variable | Meaning | Read by |
 |---|---|---|
-| `G023_HOME` | installation dir; holds `K.dat`, `OK.dat`, machine `config.json`, `ds_*.json` | `config.get_home()` |
+| `G023_HOME` | installation dir; holds `K.dat`, machine `config.json`, `ds_*.json` | `config.get_home()` |
 | `G023_PROJECT_ROOT` | the working project; its `.g023/` holds `cache.db` and the project `config.json` | `config.get_project_root()` |
 
 Read directly from the environment:
@@ -60,7 +60,6 @@ Read directly from the environment:
 | `G023_WRITE_BACKUP_KEEP` | how many backup versions to retain per file (minimum 1) |
 | `G023_LEARN` | `0`/`false`/`off` disables the learn store |
 | `G023_ASCII` | force plain-ASCII glyphs |
-| `OLLAMA_HOST` | vision daemon, when `vision_host` is unset |
 
 ## Related
 

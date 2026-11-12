@@ -1,43 +1,41 @@
 # `effort.py` — reasoning-effort mapping and same-response trailers
 
-`g023_code/effort.py` (~255 lines) is the encode/decode layer between the
-user/model scale and what `/responses` actually accepts. It also strips the
-two trailing control blocks the orchestrator may attach to a final answer.
-I/O stays out of this module.
+`g023_code/effort.py` is the encode/decode layer between the
+user/model effort scale and what DeepSeek V4.1 Flash's Anthropic endpoint
+accepts. It also strips the two trailing control blocks the orchestrator may
+attach to a final answer. I/O stays out of this module.
 
 ## Why a mapping exists
 
-A live probe of `POST https://api.deepseek.com/responses` on
-`deepseek-flash` (2026-09-14) found:
+`/anthropic/v1/messages` takes `thinking: {"type": "enabled" | "disabled"}`
+plus `output_config.effort`. The effort levels it really distinguishes are
+`low`, `high` and `max`; DeepSeek folds `minimal` → `low`, `medium` /
+`xhigh` → `high` and `ultra` → `max` server-side, and numbers are rejected.
+Sending `medium` therefore buys `high`, silently — so the harness only ever
+sends a level that means what it says (`HARNESS_WIRE_VARIANTS = ("none",
+"low", "high")`).
 
-- JSON numbers `0` / `1` / `75` / `100` are rejected (`reasoning.effort`
-  is not valid JSON of that shape).
-- Numeric strings `"0"` / `"1"` / `"75"` / `"100"` are rejected: unknown
-  variant, expected one of `none`, `minimal`, `low`, `medium`, `high`,
-  `xhigh`, `max`.
-- Those string aliases are accepted. `none` is what disables thinking
-  (`reasoning_tokens` 0, no reasoning item).
+Stored effort is an integer `0`–`75`; `api.reasoning_param` calls
+`effort_to_wire` to pick the level, and the codec turns `none` into
+`thinking: disabled`. This harness never sends `max`: `MAX_EFFORT = 75` is
+both the thinking-on default and the ceiling. A `[next_effort: 100]`,
+`/thinking max`, `/goal`, or Agent `reasoning=max` is stored and sent as
+75 / `high`. `max` often burns the entire output budget on thinking and
+returns an empty answer.
 
-So stored effort is an integer `0`–`75`, but the wire value is always
-one of those aliases. `api.reasoning_param` calls `effort_to_wire`.
-This harness never sends `xhigh` or `max`: `MAX_EFFORT = 75` is both the
-thinking-on default and the ceiling. A `[next_effort: 100]`, `/thinking
-max`, `/goal`, or Agent `reasoning=max` is stored and sent as 75 / `high`.
-`max` on this endpoint often burns the entire `max_output_tokens` budget
-on thinking and returns an empty answer.
+## Scale
 
-## Scale (Together's documented anchors: low=50, high=75, max=100)
-
-Input still accepts the 0–100 user/model scale and the API aliases; values
-above 75 cap to 75 before mapping.
+Input accepts the 0–100 user/model scale and the level names; values above
+75 cap to 75 before mapping.
 
 | Stored | Wire |
 |--------|------|
-| `0` / off | `none` |
-| `1`–`24` | `minimal` |
-| `25`–`50` | `low` |
-| `51`–`74` | `medium` |
-| `75`–`100` | `high` (75 is the thinking-on default and the ceiling) |
+| `0` / off | `none` (thinking disabled) |
+| `1`–`50` | `low` |
+| `51`–`75` | `high` (75 is the thinking-on default and the ceiling) |
+
+Aliases: `none`/`off` → 0, `minimal` → 12, `low` → 50, `medium` → 62,
+`high`/`xhigh`/`max` → 75.
 
 `DEFAULT_EFFORT = MAX_EFFORT = 75`. Old configs that say `"high"` or
 `"max"` coerce to 75 via `ALIAS_TO_INT`. `parse_effort_value` never
@@ -45,9 +43,13 @@ raises: invalid input returns `None` ("leave the current effort
 unchanged"); 76–100 return 75.
 
 `/thinking` accepts `1-100` or `low`/`high`/`max`/`off` (max aliases to
-75). `/goal` forces 75 for its own turn. A `[next_effort: N]` on that
-turn is kept for the next user request; an omitted trailer restores the
-pre-goal dial.
+75). `/goal` forces 75 for its own turn and releases the effort pin
+first, so a session pinned lower is not stuck there. The turn re-pins
+`high`. A `[next_effort: N]` on that turn is stored; an omitted trailer
+restores the pre-goal dial. Neither one retunes the wire while the goal
+transcript is still the prefix. The stored dial is sent when post-turn
+compact has replaced that input list, or the user runs `/thinking` or
+`/clear`.
 
 ## Same-response trailers
 
@@ -59,6 +61,9 @@ Locked shapes, trailing-only, on the same final answer:
 [/handoff]
 [next_effort: N]
 ```
+
+`[handoff]` is only requested on turns whose user item ends with
+`[handoff due]` (see `docs/orchestrator.md`, JIT handoff forecast).
 
 The standing prompt uses `N` as a placeholder so Flash does not copy 75
 on every turn (reasoning tokens are billed as output). 75 is the

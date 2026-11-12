@@ -1,6 +1,6 @@
 # `project_instructions.py` — g023.md / g023_compact.md / AGENTS.md
 
-`g023_code/project_instructions.py` (~186 lines) is this program's
+`g023_code/project_instructions.py` is this program's
 AGENTS.md: optional standing instructions in the project root, appended
 to the orchestrator's system prompt.
 

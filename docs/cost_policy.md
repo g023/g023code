@@ -6,7 +6,7 @@ call the API. It answers one question: **is rewriting this prefix cheaper
 than keeping it?**
 
 Flash regular rates (see `ds_pricing.json`): hit $0.003/M, miss $0.15/M
-(~50×), output $0.60/M (~200× a hit). A later `/responses` request hits
+(~50×), output $0.60/M (~200× a hit). A later request hits
 only when it fully matches a persisted cache prefix unit from token 0
 (Example 1: A+B then A+B+C hits; Example 2: A+B then A+C misses).
 
@@ -33,7 +33,7 @@ new orchestration).
 |---|---|---|
 | `should_micro_cached_prefix` | `_maybe_auto_compact` | window pressure only |
 | `should_post_turn_compact` | `_should_post_turn_compact` | objective done, window full, or large *uncached* leftover |
-| `should_vault_tool_output` | `_run_tool_calls` | Bash/FetchUrl/ListDir/SearchContent/Glob/AnalyzeImage ≥ 2 500 chars, not a raw ReadFile, not already a pointer |
+| `should_vault_tool_output` | `_run_tool_calls` | Bash/FetchUrl/ListDir/Glob/AnalyzeImage ≥ 2 500 chars (after `tool_codec`), not a raw ReadFile, not already a pointer. SearchContent is excluded: it is bounded by its sample cap, and vaulting it kept only the envelope (1.5.0) |
 | `turns_to_recoup_rewrite` | tests / docs | arithmetic for the 183-turn example |
 
 `HIT_RATE_KEEP = 0.5`: last orchestrator call at or above that hit rate
@@ -46,8 +46,9 @@ list, so that is when the stored dial is applied.
 
 Vaulting is **append-only**. The pointer is what is written the first
 time, so there is no later middle rewrite of a cache unit. The full body
-lives in `cache.tool_vault` (sha256). Re-run the original tool to hydrate;
-file reads and URL fetches already have their own caches.
+lives in `cache.tool_vault` (sha256). The excerpt says what is true: a
+re-run returns the same body, so narrow the command, scope or range to see
+the elided middle. File reads and URL fetches already have their own caches.
 
 ## Related
 

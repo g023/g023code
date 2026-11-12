@@ -1,6 +1,6 @@
 # `session_log.py` — JSONL ancestry and objective handoffs
 
-`g023_code/session_log.py` (~464 lines) writes two on-disk records of a
+`g023_code/session_log.py` writes two on-disk records of a
 session. Compact records a *view*; the JSONL keeps ancestry. Large write
 bodies are stored as hash + byte count, not 200k-character contents.
 
@@ -19,14 +19,27 @@ Record kinds:
 | `compact_boundary` | The compacted `view` plus working set |
 | `working_set` | The object itself |
 | `interrupt` | Items at Ctrl-C |
+| `view` | Whole history after a non-append rewrite (rollback, repair) |
 | `prefix_fingerprint` | sha256 of `instructions` and of the tools list |
 
-`sanitize_item` omits WriteFile/Edit `content` / large `old_string` /
-`new_string`, large tool outputs, and large non-working-set content
-(`LARGE_LOG_CHARS = 4096`). Working-set items are kept in full.
+`sanitize_item` omits only **re-derivable** bodies: WriteFile/Edit
+`content` / large `old_string` / `new_string` (the file holds them) and large
+tool outputs (`LARGE_LOG_CHARS = 4096`; re-run the tool). Message `content`
+— user prompts, the compaction summary, the mid-turn restatement, assistant
+text — is never elided: it has no other copy, and eliding it made
+`/resume` restore a hash stub instead of the summary.
 
-`replay_log` rebuilds the latest view: compact_boundary **replaces**
-items rather than appending. `load_latest_view` uses `CURRENT`, else the
+Torn tail: attaching to a log whose last byte is not `\n` (a
+crash mid-append) writes the newline first, so the next record is not glued
+onto the torn line and lost with it.
+
+`replay_log` rebuilds the latest view: compact_boundary / interrupt / view
+**replace** items rather than appending. Invariant: replay ==
+memory. `SessionLog` keeps a shadow built with the same reducer (`_reduce`);
+`checkpoint(items)` at the end of every turn appends an `output` tail or a
+`view` record if memory diverged, and nothing otherwise. Each record is one
+O_APPEND write; one live writer per file (resuming the same session from two
+REPLs interleaves them). `load_latest_view` uses `CURRENT`, else the
 newest jsonl. `/resume` (bare) loads that view and repairs pairing.
 
 `search_records(query)` greps the JSONL without reconstructing omitted
@@ -48,6 +61,8 @@ G023_OBJECTIVE_LOG 1
 ts: ...
 completed: true|false|unknown
 goal: ...
+key: <key id>              (absent when no key could be created)
+sig: hmac-sha256:<hex>
 
 --- working_set ---
 {...}
@@ -59,7 +74,9 @@ goal: ...
 `CURRENT` in the same folder points at the latest. `--continue` / `-c`
 and `/resume log` seed from it (`seed_from_objective_log`). A file
 without the header is treated as the summary body so a hand-edited log
-still loads.
+still loads. `parse_objective_log` returns `provenance` (`verified` /
+`modified` / `foreign` / `unsigned`; signing and the key are in `checkpoint.md`);
+a non-verified log still loads, with a `[rehydrate]` caveat for the model.
 
 ## Related
 

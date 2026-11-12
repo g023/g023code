@@ -1,17 +1,19 @@
 # `orchestrator.py` — the agent loop
 
-`g023_code/orchestrator.py` (~2,060 lines) is the reasoning engine. It
+`g023_code/orchestrator.py` is the reasoning engine. It
 runs one user prompt through as many model→tools cycles as needed, keeps
-the conversation in **Responses API items** (not chat messages), delegates
-heavy work to subagents, and enforces history integrity and the step cap.
+the conversation in **Responses API items** (not chat messages) — the
+Anthropic wire is a translation layer in `api.py` — runs local helpers for
+heavy reads (subagent model calls only with `subagents_enabled`), and
+enforces history integrity and the step cap.
 
 The model id on every DeepSeek call from here is `settings.orchestrator_model`
 (`deepseek-flash`).
 
 ## The conversation model
 
-The orchestrator talks to DeepSeek's `/responses` endpoint, where history
-is a flat list of typed items:
+History is a flat list of typed items (sent as Anthropic `messages` by
+`anthropic_codec`):
 
 - `message` (user/assistant text), `function_call` (a tool request),
   `function_call_output` (the tool's result), `reasoning`, `web_search_call`.
@@ -43,7 +45,18 @@ fingerprint (sha256 of both) is written to the session JSONL on first use.
    Bash/FetchUrl/ListDir bodies are offloaded at append time into
    `tool_vault` instead, so they never enter a cache unit as raw text.
    Layer 3 `compact()` then runs only if the history is still over
-   threshold on a real (not char/4-guessed) gauge. After a tool-heavy micro,
+   `compact_trigger_tokens()` (the lower of `compact_at_tokens`, default
+   200k, and window × `compact_threshold`) on a real (not char/4-guessed)
+   gauge, or earlier when `economic_compact_due()` says the rent paid
+   re-reading history since the last compaction has reached the price of
+   compacting (`CompactionMeter`, see `economics.md`; never below
+   `compact_floor_tokens`, and the economic path never micro-blanks). **Mid-turn**: `_maybe_mid_turn_compact` re-checks the same trigger
+   after every tool batch (all tool_use ids are answered at that point),
+   compacts with "turn in progress" instructions, and re-appends the user's
+   request as a `[continuing after mid-turn compaction]` item if it fell out
+   of the kept tail. Every summary ends with a `[recall]` line
+   (`with_recall_pointer`) naming `.g023/sessions/<id>.jsonl` and telling the
+   model to use SessionSearch for exact details. After a tool-heavy micro,
    wait for the next API `input_tokens` rather than rewriting history on
    the pre-blank gauge.
 3. Append the user message; step counter from `settings.max_iterations`
@@ -56,7 +69,8 @@ fingerprint (sha256 of both) is written to the session JSONL on first use.
      (drop the dangling exchange so the next turn starts clean), return.
    - `state.add_output(reply.output)`; record usage
      (`usage.record(..., scope="orchestrator")`) and drift signals.
-   - Track server-side `web_search` items as `ToolEvent`s in the trace.
+   - Track `web_search_call` items (only present in sessions recorded before
+     1.5.0, when the server-side tool was still sent) as `ToolEvent`s in the trace.
    - `_apply_reply_meta(reply)` — strip trailing `[handoff]...[/handoff]` and
      `[next_effort: N]` from the visible answer and from history items. A
      complete handoff on a final (no-tool) reply is stored as `_last_handoff`.
@@ -85,27 +99,46 @@ fingerprint (sha256 of both) is written to the session JSONL on first use.
    short chat-only reply, and a small tool turn under that floor, stay as-is
    — prefix cache still hits, no extra Flash call. Summary source, in order:
    a complete `[handoff]` on this turn's final answer (no second model call);
-   a **local fold** of an existing compact-summary item (append this turn's
-   user/assistant text, drop tool rows); otherwise Flash. On a successful
+   a **local fold** of an existing compact-summary item (`checkpoint.fold_summary`:
+   narrative bytes kept, this turn's exchange enters a ring of the last 3, the oldest
+   leaves as a one-line digest, tool rows dropped; bounded, see `checkpoint.md`);
+   otherwise Flash. On a successful
    replace the summary is written to `.g023/logs/{YYYYMMDD_HHMMSS}.log` for
    `--continue` / `/resume log`, and `release_prefix_effort()` runs so a
    stored `[next_effort]` can retune the wire on the new prefix.
 
+   **Commit point.** Just before post-turn compaction the final
+   answer is recorded as `committed_answer`. Turn state (`_turn_user_item`,
+   `committed_answer`) is cleared at `run_turn` entry and in `reset()`.
+   `handle_interrupt` rolls back only an uncommitted turn: Ctrl-C during
+   post-turn compaction keeps the finished turn (compaction swaps history
+   only after the summary returns), and `cli.run_prompt` still shows a
+   non-streamed answer.
+
+   `_call_blocking` owns its request task: if the caller is cancelled the
+   request is cancelled too (`asyncio.wait` does not cancel what it waits
+   on, so it used to finish, billed, in the background).
+
 ## Model calls (`_call_model`, `_call_blocking`, `_call_streaming`)
 
-`_request_body` builds the Responses body: system prompt (`_system`),
+`_request_body` builds the request body: system prompt (`_system`),
 items, `reasoning=reasoning_param(effort)`, `max_output_tokens`
 (only when `settings.max_tokens > 0`), `temperature`, `tools` = the
-frozen registry schemas **plus** DeepSeek's server-side `web_search` tool.
+frozen registry schemas (WebSearch and FetchUrl are ordinary client tools; the
+server-side `web_search` tool is not sent). `anthropic_codec` turns the body into
+an Anthropic Messages request.
 
 `_system` is the static orchestrator prompt (Edit / Glob / TodoWrite /
-LearnSearch / SessionSearch / memory notes / same-response trailers,
-plus `A_Improve.txt` communication markers) plus a vision clause, then
-the project-instruction addendum from `project_instructions.system_addendum()`:
-`g023_compact.md` if that file exists in the project root, otherwise
-`g023.md`, plus a project-root `AGENTS.md` when readable. Neither file
-is required. See `project_instructions.md`. Learn guides are **not**
-concatenated here.
+LearnSearch / SessionSearch / memory notes / bulletin board at
+`.g023/bbs/` / peer stance / same-response trailers, plus `A_Improve.txt`
+communication markers) plus a vision clause, then the project-instruction
+addendum from `project_instructions.system_addendum()`: `g023_compact.md`
+if that file exists in the project root, otherwise `g023.md`, plus a
+project-root `AGENTS.md` when readable. Neither file is required. See
+`project_instructions.md`. Learn guides, memory-note bodies, and bbs
+posts are **not** concatenated here. `Orchestrator.__init__` seeds
+`.g023/bbs/` via `bbs.ensure_layout()` so the board exists before the
+first turn.
 
 - Streaming: consumes `client.stream(...)`, repaints a live spinner,
   records reasoning/items, and sets `_streamed_answer` when the final
@@ -132,6 +165,47 @@ stay serial. ASK tools stay serial.
   A tool error may attach a learn `catalog_nudge`.
 - After WriteFile/Edit, `working_set.note_file`. After a Bash command
   that looks like a test runner, `working_set.note_verify`.
+- Repeat guard (1.5.0): read/run calls are keyed on `(write epoch, call)`,
+  write calls on the call alone. A successful Edit/WriteFile, or a Bash command
+  that plausibly mutates files (`bash_may_write`) with exit 0, advances the
+  epoch, so test → edit → test → edit → test is never blocked; the 3rd identical
+  call with no write in between is skipped, the 4th stops the turn.
+- Verify replay (1.5.0, `_after_batch`): a check-class Bash command
+  (`looks_like_test_command`) that failed this turn is remembered. After a batch
+  with a successful write and no check of its own, it is re-run (Bash must be
+  ALLOW, the check must have taken < 30 s) and `verify: {command, exit_code,
+  output_tail, note}` is attached to the last write's result. Disable with
+  `G023_VERIFY_REPLAY=0`.
+- Failure attribution (1.5.0, `_attribute_failure`): before each Edit/WriteFile
+  the path's pre-turn bytes are captured (`Preimages`). A failing check-class
+  command after such writes is re-run in a shadow copy with them restored, and
+  `attribution: {new, pre_existing, fixed_by_edits, verdict}` is attached to its
+  result. A Bash call that changes an un-pre-imaged project file (stat
+  fingerprint before/after) taints the turn (skip). See attribution.md.
+- Predicated finish (on by default, `finish_on_success`): `_run_tool_calls` takes a
+  `final_answer` argument off Bash/Edit/WriteFile calls before display,
+  permission and repeat keys. After `_after_batch`, `finish.decide` delivers
+  it only when every call of the batch ran and passed; `_deliver_finish`
+  parses trailers via `_apply_final_meta`, sets `_finished_by_tool`, and the
+  loop ends with no further model call. Otherwise the text is discarded. See
+  finish.md.
+- Round-trip economics (`hops.py`, see hops.md): `_system` applies
+  `hops.system_text` (ordered-batch contract replaces the batching line; budget
+  addendum), and `hops.prompt_key()` is part of `_instructions_key`.
+  With `ordered_batches`, `_run_tool_calls` records failed/denied/guarded
+  writes and answers later Bash calls (and later writes to the same file) of
+  that response with `hops.skipped_result` without running them
+  (`hop_stats["skipped"]`). With `step_budget`, the loop feeds each reply to
+  `self._budget.observe` and the last result of each batch gets the
+  `[hop N · step k of L-H +O · request $X]` tracker (history only; the
+  terminal shows the raw result). The budget state is reset at each user turn.
+- The frozen standing prompt ends with an Environment section — `environment_line()`:
+  the working directory is the project root (relative paths, no `cd`), OS, shell, python.
+  Wording that named Bash doubled denied Bash attempts in the long-doc bench (3 → 6).
+  It deliberately carries **no path**: DeepSeek renders the tool schemas after the
+  instructions, so any per-project byte there forks the cache before the tools
+  (measured: call 1 hit 1.4k / miss 3.9k tokens in each new project; without the
+  path, hit 5.1k / miss 168 — a live probe during development).
 - Working-set mirroring waits until **every** output in the batch is
   recorded. Appending the user-role working-set item after the first
   WriteFile of a parallel group splits the remaining outputs from their
@@ -204,23 +278,42 @@ Same-response trailers live in `effort.py` (`split_reply_meta`,
 [next_effort: N]
 ```
 
+The `[handoff]` block is solicited just in time. `run_turn` appends the
+line `[handoff due]` to the user item only when `_handoff_due_forecast()`
+predicts a compaction within ~2 turns: ctx + 2 x growth-EMA >= 0.9 x the
+trigger (or 0.9 x the window threshold), or, under the economic policy,
+rent + 2 x rent-EMA >= `meter.price(next_ctx, inline_handoff=True)` once
+past `floor_tokens`. Estimated contexts (just after a compaction) never
+forecast. `_observe_turn_growth()` updates both EMAs (alpha 0.5) after each
+turn and skips turns that compacted. On other turns the model omits the
+block, which saves the ~150-400 output tokens per turn the trailer used to cost.
+The other trigger is also decided by the harness (1.5.0): a TodoWrite that
+closes the last open todo returns `note: "[handoff due]"`. The old rule ("your
+reply marks every open todo done") was vacuously true with zero todos and gave
+unrequested ~1k-char blocks in 4 of 10 bench runs.
+
 An unclosed `[handoff]` is hidden from the user but is not used as a
 summary — compact then falls back to fold or Flash. `N` is 0–75 (75 is
-the ceiling; values above 75 cap). `/goal` forces 75 for its turn and
-keeps a same-response `[next_effort]` for the next user request instead
-of restoring the pre-goal dial.
+the ceiling; values above 75 cap). `/goal` forces 75 for its turn
+(releasing the pin first so a lower alias cannot stick) and keeps a
+same-response `[next_effort]` in settings instead of restoring the
+pre-goal dial. It does not release the pin again on the way out. The
+stored dial is sent when the prefix is new.
 
 ## Resume
 
 - `resume_from_latest()` — replay `.g023/sessions/` JSONL into
-  `state.items` and restore the working set. Pairing is repaired.
+  `state.items` and restore the working set. Pairing is repaired. Working-set
+  files that changed on disk since get a `[rehydrate]` note (`checkpoint.md`).
 - `seed_from_objective_log()` — new orchestration from `.g023/logs/`:
-  standing instructions + working-set item + summary.
+  standing instructions + working-set item + summary, plus a `[rehydrate]` note
+  when the log's signature is not `verified` or tracked files drifted.
+  `last_rehydrate` keeps the verdict for the CLI.
 
 ## Status & cost reporting
 
 - `status_line()` — the context gauge line after every turn.
-- `turn_summary()` / `cost_lines()` / `cost_summary()` — the `/cost` and
+- `turn_summary()` / `cost_lines()` — the `/cost` and
   per-turn numbers, formatted by `usage.format_cost`.
 
 ## Related

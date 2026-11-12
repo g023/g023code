@@ -17,13 +17,17 @@ repairs an incomplete setup.
    skipped, leaves the placeholder that `config.load_api_key()` recognises
    and turns into a clear instruction.
 5. **Config** — writes a default machine-level `config.json` if none
-   exists. The template is the full `PERSISTED_KEYS` set matching
-   `Settings` defaults: `deepseek-flash`, `reasoning_effort: 75`,
-   `max_iterations: 255`, `max_context_tokens: 256000`,
-   `vision_backend: none`, `vision_max_image_dim: 800`, backups on,
-   surge notify on / pause off. An existing valid `config.json` is left
-   untouched. Older files that still name `deepseek-v4-flash` / `"high"`
-   are mapped onto those values by `config._coerce` on load.
+   exists. It is generated, not hand-kept: both installers run
+   `config.write_default_config()`, which writes every `PERSISTED_KEYS` entry
+   at its built-in `Settings` default (1M window, compaction at 200k with the
+   `economic` policy, effort 75, verbose `low`, `permission_default: ask`, …)
+   and ignores `G023_*` switches in the installing shell. (Until 1.5.0 the
+   template was a literal that had drifted to a 256k window and lacked six
+   keys; `tests/test_release.py` now pins the generator.) It names no model
+   (the model is a constant) and no provider. An existing valid
+   `config.json` is left untouched; keys older versions wrote (model,
+   `api_format`, Ollama/OpenRouter vision, `or_*`) are ignored on load and
+   dropped on the next save.
 6. **Launcher** — creates a `g023` shim in `~/.local/bin` (POSIX;
    `installer.bat` sets up the `.bat` launcher), so `g023` works from any
    directory. `G023_HOME`/`G023_PROJECT_ROOT` are resolved by the
@@ -36,11 +40,6 @@ repairs an incomplete setup.
 Required           rich, httpx, pygments             → won't start without
 Recommended        prompt_toolkit                    → input degrades to a plain prompt
 Optional (vision)  pillow                            → downscale; avoids out-of-VRAM
-Optional (FetchUrl) curl_cffi, h2, brotli, zstandard → each makes fetches look more
-                                                       like a real browser; without
-                                                       them /fetch status reports
-                                                       what's missing and httpx fallback
-                                                       is used
 ```
 
 The installer mirrors these tiers (`REQUIRED`/`RECOMMENDED`/`OPTIONAL`
@@ -52,4 +51,4 @@ program. The context gauge is last API `input_tokens` /
 
 - `docs/entrypoints.md` — what the launchers created here do at runtime.
 - `docs/data_files.md` — `K.dat`, `config.json` written by installers.
-- `docs/web_fetch.md` — how the FetchUrl optional deps are used.
+- `docs/web.md` — web search/fetch need nothing beyond httpx.
