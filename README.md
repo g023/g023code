@@ -2,14 +2,14 @@
 
 # g023 Code
 
-**A pure-Python AI coding agent for your terminal, powered by DeepSeek V4.**
+**A pure-Python AI coding agent for your terminal, powered by DeepSeek V4.1 Flash.**
 
-*Subagent-First · Context is Currency · Terminal-native*
+*Single-agent by default · Context is Currency · Terminal-native*
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.4-informational)](releases/1.3.4/RELEASE_NOTES.md)
-[![License](https://img.shields.io/badge/license-MIT-green)](#license)
-[![Model](https://img.shields.io/badge/model-DeepSeek%20V4-8A2BE2)](https://platform.deepseek.com/)
+[![Version](https://img.shields.io/badge/version-1.5.0-informational)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Model](https://img.shields.io/badge/model-DeepSeek%20V4.1%20Flash-8A2BE2)](https://platform.deepseek.com/)
 
 </div>
 
@@ -21,9 +21,10 @@ and what it just cost. Think of the orchestrator as a miser with a gold card:
 it will spend, but it wants the receipt, and it would rather send a specialist
 than haul the whole warehouse onto the table.
 
-Data-heavy work is delegated by default. A subagent reads the file in an
-isolated context and what comes back is a structural summary plus a
-symbol → line-range map. When the summary is not enough, the orchestrator
+It works **alone by default**: one orchestrator, no subagent model calls.
+ReadFile answers locally with a structural summary plus a symbol → line-range
+map (a free-text `focus` is ranked locally too). `/subagents on` brings back
+the `Agent` tool and model-assisted focus for people who want delegation. When the summary is not enough, the orchestrator
 asks for an exact line range and gets verbatim source — so "summary first,
 raw on request" is the design, not "never raw".
 
@@ -34,16 +35,17 @@ file's text would otherwise have sat in context, which no test here can know.
 See [break-even](#what-delegation-costs) for the arithmetic and
 [what we measured](#what-we-measured) for the numbers that *are* pinned.
 
-It talks to DeepSeek exclusively through the **Responses API**, which is what
-makes DeepSeek's own **native web search** a first-class tool of the loop
-rather than a search provider bolted on the side. One model, one endpoint,
-one price sheet — `deepseek-flash` on `POST /responses`.
+It runs one model — **DeepSeek V4.1 Flash** (`deepseek-flash`) — through
+DeepSeek's **Anthropic-format API** (`POST /anthropic/v1/messages`), and
+reaches the web through two client tools on DeepSeek's **Search** and
+**Fetch** APIs behind one machine-wide cache. One model, one wire, one key
+(`K.dat`).
 
 <p align="center">
-  <img src="media/screenshots/01-startup-banner.png" alt="g023 Code starting up and working through a request" width="880">
+  <img src="media/screenshots/01-startup-banner.png" alt="The g023 Code launch banner: version, project and home paths, model, thinking level, vision" width="880">
 </p>
 
-<p align="center"><sub>Startup banner, live tool trace, and a permission prompt before anything runs a command. Captured on 1.3.4 from sanitised paths — see <a href="media/README.md">media/README.md</a>.</sub></p>
+<p align="center"><sub>Startup banner. Captured on 1.5.0; paths under the home directory print as <code>~</code> — see <a href="media/README.md">media/README.md</a>.</sub></p>
 
 ## Table of contents
 
@@ -57,12 +59,15 @@ one price sheet — `deepseek-flash` on `POST /responses`.
 - [Project instructions (`g023.md`)](#project-instructions-g023md)
 - [Slash commands](#slash-commands)
 - [Verbosity, context & cost](#verbosity-context--cost)
-- [Web search (native)](#web-search-native)
+- [Web search and pages](#web-search-and-pages)
 - [Vision](#vision)
+- [Optional local model (llama.cpp)](#optional-local-model-llamacpp)
 - [Fetching web pages](#fetching-web-pages)
+- [For researchers](#for-researchers)
 - [Design principles](#design-principles)
 - [Tests](#tests)
 - [Extending](#extending)
+- [Changelog](#changelog)
 - [License](#license)
 
 ## Quick start
@@ -99,7 +104,7 @@ half-finished setup or add the optional extras later.
 |---|---|---|
 | `--yes` | `/y` | Non-interactive; take the recommended default everywhere |
 | `--key sk-…` | `/key sk-…` | Write the key into `K.dat` instead of prompting (`$DEEPSEEK_API_KEY` is used if set) |
-| `--with-optional` / `--no-optional` | `/optional` / `/nooptional` | Decide the extras (vision preprocessing, browser-grade fetching) up front |
+| `--with-optional` / `--no-optional` | `/optional` / `/nooptional` | Decide the extras (vision image downscaling) up front |
 | `--no-venv` | — | Install into the current interpreter instead of a venv |
 | `--no-path` | `/nopath` | Do not touch `~/.local/bin`, your shell rc, or the user `PATH` |
 | `--uninstall` | `/uninstall` | Remove the launcher shim and `PATH` entry (the folder, `.venv`, `K.dat` and `config.json` stay) |
@@ -113,7 +118,7 @@ cd ~/some/project
 g023
 ```
 
-Doing it by hand instead is four commands — `pip install -r requirements.txt`,
+Doing it by hand instead is three steps — `pip install -r requirements.txt`,
 your key on the first line of `K.dat`, then `/path/to/g023-code/g023.sh` (or
 `g023.bat`) from a project folder. The launchers prefer `.venv/` in the install
 folder when one exists, and set two environment variables for you:
@@ -127,7 +132,8 @@ A per-project `.g023/` folder holds the SQLite cache, your input history,
 `backups/` (every WriteFile/Edit overwrite snapshots the previous version,
 mirroring the file tree, newest few kept per file), `sessions/` (append-only
 JSONL), `logs/` (objective handoffs for `--continue`), `prompts/` (each user
-prompt, recalled with Ctrl+Up), and optional `memory/` / `learn/` stores.
+prompt, recalled with Ctrl+Up), optional `memory/` / `learn/` stores,
+and a bulletin board at `.g023/bbs/`.
 
 `prompt_toolkit` is listed as a dependency but is not strictly required: with it
 you get tab completion, persistent history, a live status bar pinned to the
@@ -146,7 +152,7 @@ The point is to never wonder what it is doing, or what it just cost.
 Tool traces say what *happened* (`708 lines, 9 classes, cached`), not what was
 sent. The status line after every turn carries the numbers that only mean
 something together — context used, **cache hit rate**, cost of this turn, cost
-of the session — because on V4 Flash a cached input token is billed at $0.003/M
+of the session — because on V4.1 Flash a cached input token is billed at $0.003/M
 off-peak against $0.15/M for an uncached one, and both double during surge
 hours (peak times are 09:00–12:00 & 14:00–18:00 Beijing time, Monday–Friday). The hit/miss
 gap is DeepSeek's price sheet, not something this harness achieves; what the
@@ -162,7 +168,8 @@ a slash command.
 
 ## Configuration
 
-`/settings` shows every setting in one place and marks which ones persist;
+`/settings` shows every setting in one place and marks which ones persist
+(`/settings set KEY VALUE` changes any of the persisted ones);
 `/tools` shows what the agent may do and what it has done this turn. Both are
 editable from inside the session, and the `·saved` keys are written to
 `config.json` next to `K.dat` — the **global** default that follows you across
@@ -190,30 +197,37 @@ make exactly those settings the default for every future project — even when a
 project file would otherwise mask them.
 
 <p align="center">
-  <img src="media/screenshots/03-tools-and-permissions.png" alt="The /tools panel: permission level and subagent isolation for every tool" width="430">
+  <img src="media/screenshots/03-tools-and-permissions.png" alt="The /tools panel: every tool with its permission level and API-cost note" width="430">
   <img src="media/screenshots/14-settings.png" alt="The /settings panel: every setting with its live value" width="430">
 </p>
 
 Defaults out of the box: **`deepseek-flash`** for the orchestrator and
-subagents, thinking on at effort **75** (wire alias `high`), verbosity
-**low**, auto-compaction **on** at 85% of the window (both numbers settable
-— `/max-ctx`, `/compact-threshold`), acting **tools** set to **ask**, and
-**vision disabled**. Nothing that writes, runs, or leaves your machine
+everything, **no subagents** (`/subagents on` to opt in), thinking on at
+effort **75** (wire alias `high`), verbosity **low**, a **1M** context window
+with auto-compaction **on at 200k tokens** — checked after every tool batch,
+not only at turn start (`/max-ctx`, `/compact-threshold 200k`), **WebSearch**
+and **FetchUrl** on DeepSeek's Search and Fetch APIs through one **machine-wide
+web cache**, acting **tools** set to **ask**, and
+**vision on** (`/vision off` to drop the tool). Nothing that writes, runs, or leaves your machine
 happens without a prompt.
 
 ## Architecture
 
-Everything — orchestrator, subagents, compaction — goes to a single endpoint:
-`POST /responses`. That is a deliberate choice, not an implementation detail. It
-is the only DeepSeek endpoint that exposes the server-side `web_search` tool, so
-using it everywhere is what lets web search be part of the loop.
+Everything — orchestrator, compaction, vision — goes to one model and one
+endpoint: `POST {base}/anthropic/v1/messages`. Internally the program still
+keeps its history as item-shaped records (message / reasoning / function_call …); `g023_code/anthropic_codec.py`
+translates them to Anthropic `messages` on the way out and translates replies
+(blocking or SSE) back. The translation is deterministic — same items, same
+bytes, fixed key order — so DeepSeek's prefix cache keeps hitting (measured:
+1,920 of 2,098 input tokens cached on the call after a web search). Thinking
+blocks are replayed with their `signature`; `server_tool_use` +
+`web_search_tool_result` blocks from sessions recorded before 1.4 are replayed byte-for-byte.
 
-The Responses API does not take a list of chat messages. It takes **items** —
-and the model's own output items go back into the next request *verbatim*:
+The model's own output items go back into the next request *verbatim*:
 
 - `message` items (your input; the model's narration and its final answer)
 - `reasoning` items — echoed back unmodified so the model keeps its own chain
-- `web_search_call` items — the server's record of a search it ran
+- `web_search_call` items — only in sessions recorded before the client WebSearch tool
 - `function_call` / `function_call_output` pairs, one per tool call
 
 Two rules fall out of that, and every part of the program respects them. A
@@ -224,23 +238,30 @@ the prefix cache and desyncs the model's reasoning.
 
 - **Orchestrator** (`deepseek-flash`) keeps only high-level reasoning, tool
   schemas, and compact summaries.
-- **Subagents** handle data-heavy work in isolated contexts:
-  - `FileReader` → local structural index + symbol → line-range map (zero API
-    calls unless a *semantic* `focus` hint asks Flash; an exact / unique-suffix
-    symbol name is local too); cached by content hash
+- **Local helpers** handle data-heavy work without a model call (the `Agent`
+  tool and model-assisted focus exist only after `/subagents on`):
+  - `FileReader` → local structural index + symbol → line-range map; a
+    `focus` is resolved locally (exact phrase → outline section path → word BM25
+    over symbols / windows) with the best match verbatim and every match carrying
+    its section path. Plain-text files get an induced outline (docs/docindex.md). Only with `/subagents on` does a semantic
+    focus ask Flash. Cached by content hash.
   - `Searcher` → metadata-first grep (`rg` if present, else `grep`, else a
     Python walk) — **no API call**. Total occurrence count is reported
     separately from a sample list.
-  - `Agent` → isolated reasoning: `research` / `planning` / `todos` / `task`
+  - `Agent` *(opt-in, `/subagents on`)* → isolated reasoning: `research` / `planning` / `todos` / `task`
     (`explore`/`plan` still work as aliases). Task workers can Edit/Write/Bash;
     research/planning are read-only.
-  - `Vision` → DeepSeek (`deepseek-flash`), OpenRouter, or an Ollama daemon
-    (local or remote). The orchestrator itself is text-only.
-- **Native `web_search`** runs server-side inside the model's turn — no client
-  executor, no provider chain
+  - `Vision` → one isolated `deepseek-flash` call per image (thinking off,
+    800 px cap). The orchestrator's history never holds image bytes.
+- **Web** (`g023_code/web.py`): `WebSearch` and `FetchUrl` call DeepSeek's
+  Search and Fetch APIs ($0.75 / 1,000 requests each, shown in `/cost`) through
+  one SQLite cache shared by every g023 instance on the machine. A repeated or
+  reworded search, and any page a search already returned, costs nothing.
+  See [docs/web.md](docs/web.md).
 - **Lightweight tools** on the orchestrator: Bash, WriteFile, **Edit**
   (unique-span replace, fails closed), ListDir, **Glob**, **TodoWrite**
-  (working-set leaves), FetchUrl, LearnSearch/Get/Put, SessionSearch
+  (working-set leaves), WebSearch, FetchUrl, LearnSearch, LearnGet, LearnPut,
+  SessionSearch
 - **SQLite cache** → a repeated read of unchanged bytes is a local lookup and
   costs no API call
 - **Prefix-cache-friendly**: instructions and tool definitions stay frozen
@@ -249,26 +270,21 @@ the prefix cache and desyncs the model's reasoning.
   (last call mostly cache hits) is kept: rewriting it to "save tokens"
   turns hits into misses and does not recoup (~294 turns to break even on
   blanking 500 cached tokens). Nested Agent calls reuse that frozen prefix
-  so they hit it too. Bulky Bash/FetchUrl/ListDir output is stored by hash
+  so they hit it too. Bulky Bash/ListDir/Glob output is stored by hash
   and replaced with a pointer *before* it enters history.
 - **Project-root confined**: ReadFile, ListDir, SearchContent, Glob, Edit,
   WriteFile, and `/undo` refuse paths that resolve outside the launch directory.
 - **Learn store**: reusable procedures live in `~/.g023/learn` and
   `<project>/.g023/learn`. They are searched on demand (`LearnSearch` /
   `/learn`), never prepended to the system prompt.
-- **Thinking mode** on a 0–100 dial (75 is the default). `/responses` rejects
-  integers, so the client maps onto `none` / `minimal` / `low` / `medium` /
-  `high` / `xhigh` / `max`. Off is `reasoning: {"effort": "none"}` — the only
-  thing that actually disables thinking.
+- **Thinking mode** on a 0–100 dial (75 is the default), mapped onto effort
+  aliases. On the Anthropic wire that is `thinking: {"type": "enabled"}` +
+  `output_config.effort`; off is `thinking: {"type": "disabled"}` (temperature
+  is only sent when thinking is off — DeepSeek ignores it in thinking mode).
 
-**One model.** `deepseek-flash` is the only model sent to the DeepSeek API, in
-every role. `/model` still accepts the alias `flash`. It refuses
-`deepseek-v4-pro` because calls to it on `/responses` returned an error when
-this was last checked, and refusing with that reason attached beats handing you
-a model every call fails on. If DeepSeek has since enabled it, that refusal is
-stale — it is a hardcoded list in `config.py`, not a capability probe. Vision
-on the DeepSeek backend uses the same `deepseek-flash` id; Ollama and
-OpenRouter are the other backends, and they do not use the DeepSeek API.
+**Model.** There is exactly one: DeepSeek V4.1 Flash (`deepseek-flash`, 1M
+context). It is a constant, not a setting — no config file can name a model the
+API will not serve, and `/model` only shows its limits and prices.
 
 The presentation and command layers are deliberately separate from the agent:
 
@@ -277,7 +293,10 @@ The presentation and command layers are deliberately separate from the agent:
 | `commands.py` | The command catalogue as *data* — one source of truth shared by `/help`, tab completion, and "did you mean". A command cannot be completable but undocumented. |
 | `ui.py` | Theme, glyphs, gauges, and the compact renderings of tool calls and their results. Falls back to ASCII on terminals that cannot draw box characters. |
 | `prompt.py` | The input line and the shared numbered picker. Degrades cleanly without `prompt_toolkit`. |
-| `ollama_client.py` | Host resolution, reachability probes, model discovery, and vision inference against any daemon. |
+| `images.py` | Image loading for vision: project-confined paths or URLs, real media type, 800 px cap. |
+| `salience.py` | Long-output excerpts picked by the step's own intent; full output kept as a readable `.g023/vault/` file. |
+| `local_llm.py`, `local_ask.py` | Optional llama.cpp model: shared server, GPU guard, `LocalAsk` bulk reading with verbatim evidence, local-first vision. |
+| `scout.py` | Turn-zero scout card: a free local pre-read of the project that puts verbatim, anchored lines in the request (docs/scout.md). |
 
 See [`docs/`](docs/README.md) for the per-module specification.
 
@@ -286,7 +305,7 @@ See [`docs/`](docs/README.md) for the per-module specification.
 A handful of things that look like opinions from the outside and are
 actually pinned by a test, a live probe, or DeepSeek's published sheet.
 Dated 2026-09-10 (price sheet) and 2026-09-14 (the probes). The suite
-that holds this to account is **421 tests**, all offline.
+that holds this to account is **732 tests**, all offline (about 20 s).
 
 **The price sheet, off-peak Flash (effective 2026-09-10).** Cache hit
 $0.003/M, cache miss $0.15/M (~50×), output $0.60/M (~200× a hit). Peak
@@ -301,22 +320,29 @@ Coding sessions do not last 294 turns. So the shipped policy
 (`cost_policy.py`) is: do not rewrite a cached prefix unless the window
 is actually full, the leftover is uncached, or the objective is done.
 Layer-1 auto-micro of already-sent items waits for window pressure.
-Bulky Bash / FetchUrl / ListDir bodies are vaulted *before* they enter
-a cache unit — append-only pointers, not a later middle rewrite.
+Every tool result is encoded once by `tool_codec.py` before it enters
+history: echoed args, duplicate views, and digest tails are dropped, and
+search becomes grep-style hits. On the live bench this cut cost per solved
+task about 2.3x. Bulky Bash / ListDir / Glob bodies are vaulted *before*
+they enter a cache unit — append-only pointers, not a later middle rewrite.
+The `[handoff]` summary is requested only on turns forecast to compact.
 
 **Output is the remaining bill once the prefix is hot.** Reasoning
 tokens are billed as output. Effort is pinned to the standing prefix
 (changing it mid-stream is a cache miss); a stored `[next_effort: N]`
-lands on the next request after `/thinking`, `/goal`, `/clear`, or a
-post-turn compact that already replaced the input list. Temperature is
-pinned the same way — it is a `/responses` cache-key field.
+lands on the next request after `/thinking`, `/clear`, or a post-turn
+compact that already replaced the input list. `/goal` releases the pin
+only before its own turn, so that turn sends the ceiling, and leaves it
+afterwards so the warmed transcript still hits. Temperature is pinned
+the same way, so the request bytes (and the cache key) do not drift.
 
 **FileReader buys Flash only for a semantic question.** Unfocused
 reads of any language are a local index (AST for Python, structure for
 JS/TS/Go/Rust/JSON/Markdown/…). A focus that is already a symbol in
 that map — or a unique method suffix — is local too: 0 API calls, line
-span returned. A sentence like "what does method_one do" still costs 1
-Flash call, so the hint is honoured. Tests pin 0 vs 1.
+span returned. A sentence like "what does method_one do" is ranked locally
+by default (0 calls); with `/subagents on` it costs 1 Flash call instead.
+Tests pin both.
 
 **Nested Agent workers reuse the parent's frozen prefix.** Children
 used to miss from token 0 on a different system prompt and a subset
@@ -353,7 +379,9 @@ so they are checked rather than remembered:
 | `SearchContent`, any size | 0 — `rg` / `grep` / Python walk, no API call |
 | `ReadFile`, unfocused (any language) | 0 — local index (AST for Python, structure for JS/TS/Go/Rust/JSON/Markdown/…) |
 | `ReadFile`, same bytes again (cache hit) | 0 |
-| `ReadFile` with `start_line`/`end_line` | 0 — returns verbatim source |
+| `ReadFile` with `start_line`/`end_line` | 0 — returns verbatim source (lines over 2,000 chars clipped, marked `verbatim: false`) |
+| `ReadFile` on a binary, CSV/JSON/JSONL, log, or >64 MB file | 0 — structural digest: image dims, archive members, SQLite tables, column profiles, JSON shape, log templates with exact rare-line counts (`docs/shapes.md`) |
+| `ListDir` / `Glob` on thousands of entries | 0 — templated digest counting every entry (`frame_{00000..03999}.png  x4000`, `docs/dirmap.md`) |
 | `ReadFile` with `raw=true` | 0 — returns the whole file verbatim (the FileReader never needs the API for this) |
 | `ReadFile` with a `focus` that is an exact / unique-suffix symbol | 0 — looked up in the local map |
 | `ReadFile` with a semantic `focus` hint | 1 — Flash honours the question |
@@ -402,7 +430,11 @@ silently truncates the file. That is exactly how `config.py` got truncated once.
 Three safeguards now cover it:
 
 - Prefer **Edit**: `old_string` / `new_string` on a unique span. If the span is
-  missing or not unique, the tool refuses and writes nothing.
+  missing or not unique, the tool refuses and writes nothing — but the refusal
+  carries the fix: every occurrence with its line and enclosing function (retry
+  with `line=N`), or the closest region verbatim. Matching tolerates line-ending,
+  trailing-space and consistent indentation differences; CRLF, BOM and file mode
+  survive every edit, and writes are atomic (`docs/edit_engine.md`).
 - `ReadFile raw=true` returns the **whole file verbatim** (capped at 200k chars)
   when a full rewrite really is required. The tool schema and the system prompt
   both say to hold exact bytes before WriteFile.
@@ -448,7 +480,7 @@ is appended as well. None of the files is required.
 ## Slash commands
 
 Commands that take a fixed set of options **open a picker when typed bare**, so
-`/vision` is as usable as `/vision qwen3.5:2b` — there is nothing to memorise.
+`/thinking` is as usable as `/thinking 50` — there is nothing to memorise.
 `/help <command>` explains any one of them in full.
 
 <details open>
@@ -461,6 +493,7 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/clear` | Reset the conversation, usage counters, and working set |
 | `/resume` · `/resume log` | Load the latest JSONL session, or seed from `.g023/logs/` |
 | `/learn [search\|get\|save\|forget\|outcome]` | Cross-session procedures (not in the system prompt) |
+| `/bbs [list\|search\|read\|post\|index]` | Project bulletin board in `.g023/bbs/` (searched on demand, not in the system prompt) |
 | `/undo [path]` | Restore a file from its newest `.g023/backups/` copy |
 | `/exit` | Quit |
 | `/config [status\|save\|global\|project\|clear]` *(alias `/cfg`)* | Show or manage the global vs per-project config scopes |
@@ -472,8 +505,9 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/model [flash]` | Show or set the orchestrator model — `deepseek-flash` is the only one the Responses API serves |
-| `/thinking [1-100\|low\|high\|max\|off]` | Set reasoning effort (75 default and ceiling; max aliases to 75). Bare opens a picker: low / high / off |
+| `/model` | Show the model (DeepSeek V4.1 Flash), its limits, thinking levels and prices |
+| `/surge` | DeepSeek surge pricing — status, notify, auto-pause around peak |
+| `/thinking [1-100\|low\|high\|max\|on\|off]` | Set reasoning effort (75 default and ceiling; max aliases to 75; `on` restores the saved effort). Bare opens a picker: low / high / off |
 | `/verbose [low\|mid\|high]` | How much detail to print while working |
 | `/steps [n\|off\|default]` | Cap the tool steps one turn may take before it gives up (default 255; `off` for no cap, with progress printed every 10 steps) |
 | `/max-tokens [n\|off\|default]` | Cap how long one reply may be (default `off` — no budget is sent, so the model's own maximum is the only ceiling) |
@@ -487,11 +521,13 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 |---|---|
 | `/compact [focus]` | Summarise the history (`micro` = free local pass, `auto on\|off`) |
 | `/g023-compact` | Compact `g023.md` → `g023_compact.md` (Flash, no reasoning; leaves the original) |
-| `/max-ctx [n\|default]` | Set the context window ceiling (default 256k; DeepSeek's real limit is 1M) |
-| `/compact-threshold [fraction\|default]` | Set when auto-compact fires, as a fraction of the window (default 0.85; e.g. `0.9` or `90%`) |
+| `/max-ctx [n\|default]` | Set the context window ceiling (default 1M, DeepSeek's real limit) |
+| `/compact-threshold [tokens\|fraction\|default]` *(alias `/compact-at`)* | When auto-compact fires: a token count (`200k` default, e.g. `150k`, `1m`) or a fraction of the window (`0.85`); the lower of the two wins. `economic` (default) / `fixed` picks whether compaction may also fire earlier, once re-reading the history has cost more than compacting would (`/compact-at floor 64k` sets the lower bound; see docs/economics.md) |
+| `/subagents [on\|off]` | Opt in to the `Agent` tool and model-assisted ReadFile focus (default off) |
+| `/ownership [auto\|user\|agent]` | Whose code the model may tidy: files it created (`auto`, default), none (`user`), whole project (`agent`) — see docs/ownership.md |
 | `/context` | Break down what is occupying the context window, by role and size |
 | `/cost` | Token usage and spend, split by cache hit/miss, with a per-turn sparkline |
-| `/settings [save\|reset]` | Every setting, marking which persist; save or restore defaults |
+| `/settings [save\|reset\|set KEY VALUE]` | Every setting, marking which persist; save, restore defaults, or change one saved key (typed and validated) |
 | `/signals` *(alias `/drift`)* | Prefix hit rate against its own history, unknown item types, unexplained empty responses |
 
 </details>
@@ -504,8 +540,8 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 | `/tools` | List tools, their permission level, and how often each ran |
 | `/tools <tool> allow\|ask\|block` | Change one tool's permission |
 | `/fetch <url>` | Fetch a URL yourself, with the cache/fresh prompt |
-| `/fetch status` | Report how closely fetches imitate a real browser |
-| `/cache [stats\|web\|clear]` | Inspect and purge the local SQLite caches |
+| `/search [fresh] <query>` | Search the web (machine-wide cache; `fresh` bypasses it) |
+| `/cache [stats\|web\|web clear\|web prune\|clear]` | Cache sizes, web fees saved; purge the project cache or the machine-wide web cache |
 
 </details>
 
@@ -514,17 +550,8 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/ollama` | Status: host, version, latency, installed model count |
-| `/ollama host <addr>` | Point vision at another machine (tested before saving) |
-| `/ollama host default` | Fall back to `OLLAMA_HOST`, then localhost |
-| `/ollama models` | List installed models, sizes, quantisation, vision capability |
-| `/ollama test [model]` | Run a real inference — proves the whole path, not just the port |
-| `/ollama ps` | What the daemon currently holds in VRAM |
-| `/vision` | Interactive picker of installed vision models |
-| `/vision <model>` · `/vision off` | Enable a specific model, or disable |
-| `/surge` | DeepSeek surge pricing — status, notify, auto-pause around peak |
-| `/or` | OpenRouter vision — key, models, rate-limit tier, usage |
-| `/orsub` | OpenRouter subagent offload — models, primary, failover, reasoning |
+| `/vision on\|off\|status` | Turn image analysis on or off (saved). Bare shows the state and asks whether to toggle |
+| `/local [status\|auto\|on\|off\|tune\|unload\|models\|model NAME\|vision NAME\|scout MODE]` | Optional local llama.cpp model (`auto` by default: on only when `llama-server`, a model and a fitting GPU are found) |
 
 </details>
 
@@ -533,7 +560,7 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 
 | Command | Action |
 |---|---|
-| `/goal <text>` | State a high-level objective; runs one turn at effort 75 (the ceiling) with no step cap |
+| `/goal <text>` | State a high-level objective; effort 75 (the ceiling), no step cap, and up to two continuations while the working-set judge says it is still open |
 
 </details>
 
@@ -551,115 +578,121 @@ Commands that take a fixed set of options **open a picker when typed bare**, so
 If tool results dominate, `/compact micro` clears the stale ones for free; if
 it is real conversation, `/compact` summarises it on the standing prefix.
 The command tells you which of the two applies. Auto-compact waits for
-window pressure (default 85%): blanking a cached prefix every turn is a
-cache miss, not a savings. A finished objective still hands off to a
+real pressure (default **200k tokens**, checked after every tool batch so a
+long agentic turn is compacted mid-turn instead of growing toward 1M):
+blanking a cached prefix every turn is a cache miss, not a savings. A
+mid-turn compaction pins the request in progress, and every summary ends with
+a `[recall]` line naming the on-disk transcript (`.g023/sessions/*.jsonl`) so
+the model can `SessionSearch` exact details it no longer has. A finished objective still hands off to a
 summary so the next request is a new orchestration. Turn auto-compact off
 with `/compact auto off`, move the trigger with `/compact-threshold`, or
 resize the window with `/max-ctx`.
 
 Every API call — orchestrator *and* subagents — reports its token usage to a
 single tracker, so `/cost` and `/settings` show the cache-hit / cache-miss /
-output split per model and price it from the SPEC §3.2 table.
+output split per model and price it from [`ds_pricing.json`](ds_pricing.json)
+(peak calls at the surge rate). Paid `WebSearch` and `FetchUrl` requests are
+counted too, at $0.75 per 1,000 successful requests (a `Tools` line in
+`/cost`); cache hits cost nothing and are counted separately.
 
-## Web search (native)
+## Web search and pages
 
-Web search is **DeepSeek's own**, not a search API wired in behind it. There is
-no provider chain, no key to supply, no rate limit to nurse, and no
-`/websearch` command — because there is nothing on this side to configure.
+Web access is two client tools on DeepSeek's own APIs: **`WebSearch`**
+(`POST /v1/tools/search`) and **`FetchUrl`** (`POST /v1/tools/fetch`). Both are
+billed $0.75 / 1,000 successful requests and shown in `/cost`. Both go through
+**one SQLite cache shared by every g023 instance on the machine**
+(`<install>/global_cache/web.db`, or `$G023_GLOBAL_CACHE_DIR`), so a search or
+page already paid for in any project is not paid for again.
 
-The entire integration is one line in `tools/schemas.py`:
+| | what it saves |
+|---|---|
+| **Pay once per machine** | Order, case, tracking params and URL fragments do not change the cache key |
+| **Reworded searches reuse** | `asyncio.TaskGroup cancel others` ≈ `TaskGroup other tasks cancelled docs`; versions and `site:` must agree; the result names the cached query, and `fresh=true` forces a new search |
+| **Search-primed pages** | Each search asks for every hit's full Markdown at the same fee, so FetchUrl on a hit costs nothing (`page cached` in the results) |
+| **Query-aware freshness** | News/release/price queries keep 6 h, others 7 days; pinned URLs (commit SHAs, arXiv vN, DOIs) 30 days, most pages 1 day; refusals are remembered for 1 h |
+| **Bounded pages** | A page over 8k chars returns a window plus an outline; `focus="topic"` returns the best sections (BM25, local, free), and `offset=N` continues |
 
-```python
-WEB_SEARCH_TOOL = {"type": "web_search"}
+Why client-side: DeepSeek's server-side `web_search` tool cost $0.001398 per
+step in a live probe (it reads the prefix twice) and replayed about 2.2k opaque
+tokens on every later turn, and none of it could be cached. Measured runs and
+the design are in [docs/web.md](docs/web.md).
+
+```
+  ✓ WebSearch  asyncio TaskGroup cancel remaining tasks      5 results · cache
+  ✓ FetchUrl   docs.python.org/3/library/asyncio-task.html focus=TaskGroup cancel
+                                                              44,467 chars · focus · primed
 ```
 
-That marker is appended to the tool list. No name, no parameters, no executor.
-The server takes it from there.
-
-**The search happens inside the model's turn**, on DeepSeek's infrastructure,
-before the response comes back. g023 never sees a tool call for it and never
-returns a result for it. What arrives instead is a record of what the server
-did, which shows up in the trace like any other tool:
-
-```
-  ● searching the web…
-  ✓ web_search  deepseek responses api web_search tool, deepseek v4 pricing
-  ✓ web_search  read platform.deepseek.com/docs/…
-```
-
-A few consequences are worth stating plainly:
-
-- **It never asks permission.** There is no moment at which g023 could
-  interpose a prompt — the search is over by the time the response exists. So
-  `web_search` has no entry in `/tools`. Giving the model the tool is the
-  decision; each individual search is not. Everything that *does* leave your
-  machine under g023's own control — `FetchUrl` — still asks every time.
-- **It can search several times per turn**, following up on what it finds.
-- **Findings persist.** The server's `web_search_call` items are carried in
-  history like everything else, so what it learned survives across tool
-  round-trips, across turns, and across `/compact`.
-- **Slow searches are visible.** The server can be out on the web for a while
-  without emitting anything, so g023 draws a live `searching the web…` line
-  rather than letting it read as a hang.
-
-Just ask — `what changed in the DeepSeek Responses API this month?` — and it
-searches when it decides it needs to.
+`/search [fresh] <query>` and `/fetch <url>` do the same from the prompt.
+`/cache` shows how many requests were paid, served from cache, or primed, and
+the fees saved. `/cache web` lists entries; `/cache web clear` and
+`/cache web prune` maintain the store.
 
 ## Vision
 
-The orchestrator does not see image bytes. Image analysis is delegated to a
-*vision backend*. Three are supported, toggled with `/vision backend`:
-
-| Backend | Key | Default model | Notes |
-|---|---|---|---|
-| `deepseek` | `K.dat` | `deepseek-flash` | Same model id as the orchestrator; billed at text prices. |
-| `openrouter` | `OK.dat` | `google/gemma-4-26b-a4b-it:free` | Models from `./OR_VISION.json`, rotated on rate limits. |
-| `ollama` | — | local daemon | A local/remote Ollama vision model (`/ollama host` points at it). |
-
-**Vision is disabled by default** — enable it once and the choice persists.
+The orchestrator does not see image bytes. `AnalyzeImage` sends one image and
+one question to the same model, `deepseek-flash`, as an isolated request
+(thinking off) and returns a short text answer. Same `K.dat` key, same token
+prices, counted in `/cost`.
 
 ```
-/vision                      # configure the active backend (or pick an Ollama model)
-/vision backend deepseek     # DeepSeek's deepseek-flash (K.dat key)
-/vision backend openrouter   # OpenRouter (OK.dat key)
-/vision backend ollama       # local/remote daemon
-/vision endpoint responses   # deepseek wire format: responses | chat_completions
-/vision off                  # disable (the default)
-/vision status               # show the current setting
+/vision on       # offer AnalyzeImage to the model (saved)
+/vision off      # stop offering it
+/vision status   # show the current setting
 ```
 
-- **DeepSeek backend** — `deepseek-flash` on the same `K.dat` key, billed at
-  exactly the token rates of the orchestrator model. The wire format is chosen
-  per endpoint: `/responses` (the program's native format, default) or
-  `/chat/completions`.
-- **OpenRouter backend** — the key lives in `OK.dat` next to `K.dat`. Put a
-  JSON array of model ids in `./OR_VISION.json` (project folder) to set the
-  failover list; when one model returns HTTP 429 the next is tried. Free
-  `:free` models are capped at **50 requests/24h** for accounts under $10 of
-  lifetime credits, and up to **1000/24h** once you've bought $10+ credits —
-  tell g023 which tier you're on with `/or tier free|credits`.
-- **Ollama backend** — only models the daemon reports as `vision`-capable are
-  listed; sizes are shown so you can stay inside your VRAM budget. The daemon
-  may be local or on another machine (`/ollama host`).
-- While vision is disabled the `AnalyzeImage` tool is not even offered to the
-  orchestrator, so it never proposes a call it cannot fulfil.
-- Images are always constrained-resized so each edge is ≤ 800px (needs
-  `pillow`; oversized images are refused if it is not installed).
-  `vision_max_image_dim` does not change the send size. Answers are cached by
-  image hash + question + backend + model, so re-asking the *same* question
-  about the same image is a local SQLite lookup rather than another inference.
+- **Vision is on by default.** While it is off the `AnalyzeImage` tool is not
+  even offered, so the model never proposes a call it cannot make.
+- Local paths are confined to the project, like every other file tool;
+  `http(s)` URLs are downloaded. jpeg, png, gif and webp are accepted and sent
+  with their real media type.
+- Images are capped so each edge is ≤ 800 px (needs `pillow` to downscale;
+  an oversized image is refused if it is not installed). Smaller images are
+  sent unchanged.
+- Answers are cached by image hash + question, so asking the *same* question
+  about the same image again is a local SQLite lookup.
 
-Once enabled, just ask: `analyze screenshot.png — what's the error?`
+Just ask: `analyze screenshot.png — what's the error?`
 
-### OpenRouter specifics
+## Optional local model (llama.cpp)
+
+Automatic. With a built [llama.cpp](https://github.com/ggml-org/llama.cpp), a
+small GGUF model and a GPU it fits on, g023 hands free work to your own GPU
+while the main loop stays on DeepSeek, in every project, with no setup:
+`local_model` defaults to `auto`. The machine probe (`autotune.py`) looks for
+`llama-server` (`local_llama_dir`, common checkout folders, `PATH`), models
+(`local_models_dir`, `~/models`, LM Studio and llama.cpp caches) and the GPU,
+then picks the best model measured on the scout eval (LFM3-VL-2B Q8, which also
+answers screenshots, then LFM3-1.7B; any other small chat model by size). No GPU
+means auto stays off: a CPU is too slow for per-turn help.
 
 ```
-/or               status: key, tier, model list, today's usage
-/or model <id>    set the vision model (or `default` to reset)
-/or models        reload ./OR_VISION.json
-/or tier free|credits   50/24h vs 1000/24h ceiling
-/or usage         requests used today vs the ceiling
+/local tune                          # what auto found and picked on this machine
+/local auto | on | off               # default auto; on forces it, off never (or G023_LOCAL=1/0)
+/local model LFM3-1.7B-Q8_0.gguf     # pin a model ('auto' unpins)
+/local vision off                    # DeepSeek vision only ('auto': local when the model can see)
+/settings set local_llama_dir ~/src/llama.cpp   # only if it lives somewhere unusual
 ```
+
+- **Scout card** — before DeepSeek's first call, the local model reads the
+  code units that best match your request (~1 s) and the request carries the
+  lines it picked, verbatim and labelled as a lead, so the paid model can skip
+  some of its own digging. Cards the model keeps ignoring switch themselves off.
+  `/local scout local|always|off`.
+- **LocalAsk** — the model can ask the local model to read big files (or a
+  vault file of an earlier long output), or, with no paths, to search the whole
+  project. Evidence lines are copied from the files, never generated; the short
+  answer is marked as a small-model lead.
+- **Vision** — local first; asking the same thing again goes to DeepSeek.
+- **GPU etiquette** — one shared server per machine that drops to ~120 MiB of
+  VRAM after 5 idle minutes; it stays off when another program is using the
+  GPU, and it is released for the rest of the turn when a command looks like
+  GPU work (CUDA, training, llama.cpp, ollama, vllm, ...).
+
+Long outputs no longer need a re-run either way: the cut excerpt keeps the
+lines that match what the model said it was looking for, and the full output is
+kept under `.g023/vault/` for `ReadFile` ranges or `grep -n`. Details:
+[docs/local_model.md](docs/local_model.md), [docs/scout.md](docs/scout.md), [docs/salience.md](docs/salience.md).
 
 ### Surge pricing (peak/off-peak)
 
@@ -685,113 +718,127 @@ While a pause window is active the CLI waits it out instead of reading input, so
 no requests are sent at double price; `Ctrl-C` bypasses it for that pass. The
 toolbar shows `SURGE 2×` while peak hours are active.
 
-### Running Ollama on another machine
-
-The daemon does not have to be local — the usual reason to move it is that the
-GPU is somewhere else.
-
-```
-/ollama host 192.168.1.50                 # bare IP: :11434 is appended for you
-/ollama host gpu-box:11434
-/ollama host https://ollama.example.com   # behind a TLS proxy, port left alone
-/ollama host default                      # back to OLLAMA_HOST, then localhost
-```
-
-Addresses are forgiving: a missing scheme becomes `http://`, a missing port
-becomes `:11434`. The host is **tested before it is saved**, and if it does not
-answer you are told why — connection refused reads differently from a timeout —
-and asked whether to save it anyway.
-
-Precedence, highest first: the `vision_host` setting (what `/ollama host`
-writes) → the `OLLAMA_HOST` environment variable → `http://localhost:11434`.
-`/ollama` always shows which one is in effect.
-
-Three commands make a remote setup diagnosable rather than a guessing game:
-
-| Command | Answers |
-|---|---|
-| `/ollama` | Is anything listening, what version, how far away (latency), how many models |
-| `/ollama models` | What that machine actually has — names, sizes, quantisation, vision capability |
-| `/ollama test` | A real inference round-trip: g023 sends a generated image and checks the answer. This proves the whole path — encoding, transport, and the model genuinely being image-capable — rather than just that the port is open. |
-
-> [!WARNING]
-> For a remote daemon to accept connections it must be bound to the network
-> (`OLLAMA_HOST=0.0.0.0:11434 ollama serve`) and the port must be open.
-> **Ollama has no authentication.** Anyone who can reach that port can use the
-> GPU and read whatever is sent to it — keep it on a trusted network, behind an
-> SSH tunnel (`ssh -L 11434:localhost:11434 gpu-box`, then leave the host at
-> default), or behind an authenticating reverse proxy.
-
 ## Fetching web pages
 
-Distinct from [web search](#web-search-native): that runs on DeepSeek's side and
-you never see the request. `FetchUrl` is g023 reaching out from *your* machine,
-to a URL you or the model named — so it is held to a different standard.
-
-`FetchUrl` reads a page and hands back readable text rather than raw HTML, in
-keeping with the context budget. Two things make it different from a plain
-`requests.get`.
-
-**It asks first, every time.** A fetch leaves your machine and touches someone
-else's server, so it is never on the `allow` list. When a cached copy exists the
-prompt is a three-way choice rather than yes/no:
+`FetchUrl` reads one page as Markdown via DeepSeek's Fetch API. It follows
+`permission_default` (ask by default, `allow` for unattended runs). When a
+cached copy exists, the prompt offers it:
 
 ```
 Permission required to fetch https://example.com/pricing
-engine: curl_cffi · requested mode: auto
-Cached copy available — fetched 12m ago, HTTP 200, 48,210 chars
+Cached copy available — 12m ago, 48,210 chars (search prefetch)
 Use cached copy, fetch fresh, or deny? [c/f/d] (c):
 ```
 
-Your answer overrides whatever the model asked for. The model can also request
-a mode itself — `auto` (cache if younger than `max_age`), `fresh`, or `cache`
-(never touch the network) — and `cache` mode is the cheap way to re-read a page
-at a larger `max_chars` without a second request.
-
-**It presents itself as an ordinary browser.** Requests carry a real browser's
-headers *in the order that browser sends them*, negotiate HTTP/2, and keep
-cookies per domain in `.g023/cookies.json` so a second visit looks like a
-returning user rather than a stranger. Requests to the same host are spaced out
-instead of fired back-to-back. Nothing identifies g023.
-
-The weak point is TLS: Python's handshake has a recognisable fingerprint, and a
-UA claiming Chrome over a Python TLS stack is a contradiction that fingerprint
-checks notice. Installing `curl_cffi` fixes it properly — it reproduces Chrome's
-actual handshake:
-
-```bash
-pip install curl_cffi        # then: /fetch status
-```
-
-| | headers | HTTP/2 | TLS (JA4) |
-|---|---|---|---|
-| `curl_cffi` | Chrome order | yes | `t13d1516h2…` — matches Chrome |
-| `httpx` + `h2` | Chrome order | yes | generic Python |
-| `httpx` alone | Chrome order | no | generic Python |
-
-`/fetch status` always tells you which of these you are on, and the JA4 column
-reports what `curl_cffi` impersonates rather than a measurement — point `/fetch
-https://tls.peet.ws/api/all` at it to see your own fingerprint on the wire.
-
-What is *not* claimed: that this gets you past any particular bot defence. Those
-systems weigh behaviour, IP reputation and history alongside the fingerprint, and
-they change. A handshake that matches Chrome removes one obvious tell; it is not
-a guarantee about any site, and any site may block you anyway.
+The model can pick a cache mode itself: `auto` (cache within its TTL or
+`max_age`), `fresh`, or `cache` (never touch the network). URLs with
+credentials are refused before any request is made. 408/429/5xx are retried
+with backoff. On failure a cached copy is served with a note, and a 403/404
+never overwrites a good copy.
 
 > [!NOTE]
-> **There is no JavaScript engine.** Pages that build their body client-side
-> return the shell. Use a server-side check like `tls.peet.ws/api/all` to see
-> what your requests actually look like on the wire.
+> Pages come from DeepSeek's fetcher, not from your machine: there is no
+> local browser, no cookie jar, and no JavaScript engine. Login-only pages
+> return nothing.
+
+The service cuts some pages at exactly 20,480 bytes and gives no sign of it.
+g023 detects that size and fetches one plain-text twin (`<url>.md` for doc
+paths, raw.githubusercontent.com for GitHub blobs). It checks that the twin is
+the same document, then caches the full text under the original URL. A page that
+cannot be recovered is shown with `"complete": false`, so the model knows the
+rest is missing.
+
+## For researchers
+
+g023 Code doubles as a small testbed for **cost-aware agent plumbing** on an
+API that bills prompt-cache hits at ~1/50 of a miss and output at ~200× a
+hit. Most of what follows combines known techniques; the table says which
+part we could not find stated elsewhere. **Rating:** *existing* = a known
+technique applied as-is; *derived* = known parts combined or adapted in a way
+we did not find stated; *new?* = no prior art found in a non-exhaustive search
+(treat as a lead, not a claim).
+
+**How strong the evidence is.** Every mechanism below is pinned by offline
+tests (`tests/`). The cost numbers are **small live benches** on
+`deepseek-flash` (4–10 tasks, a handful of runs per variant, 2026-11-07/08),
+reported as measured; they are not a controlled study, and run-to-run
+variance on the same task was of the same order as some of the effects.
+Treat them as effect sizes worth replicating, not results.
+
+| # | Technique | Where | Rating | What it does | Evidence |
+|---|---|---|---|---|---|
+| 1 | Deterministic wire codec | `anthropic_codec.py` | derived | Item history → Anthropic `messages` with fixed key order and byte-identical replay, so the provider's prefix cache keeps hitting | 1,920 / 2,098 input tokens cached on the call after a web search (live) |
+| 2 | Ski-rental compaction timing | `economics.py` | derived | Compact once the cache-hit *rent* of re-reading history since the last compaction reaches `fidelity ×` the price of compacting; equals the EOQ optimum under linear growth, 2-competitive in the worst case | Simulation: 87.2% of the cost of a fixed 200k trigger, vs 86.5% for the hindsight-best fixed threshold |
+| 3 | Prefix-pinned effort | `orchestrator.py`, `effort.py` | derived | When the effort level is part of the cache key, per-step effort routing busts the prefix; pin effort to the standing prefix and retune only when the prefix is new anyway | ~100 output tokens/call saved by a lower level vs a ≥4k-token cache bust (live, 8 calls) |
+| 4 | Tool-result codec at the history boundary | `tool_codec.py` | derived | Encode each tool result once, losslessly and idempotently, into its densest form *before* it enters cached history (drop echoed args, duplicate views; grep-style search hits) | 4-task bench: $0.00230 → ~$0.00100 per solved task (~2.3×, with #5 and ranked search sampling; single runs) |
+| 5 | Just-in-time handoff solicitation | `orchestrator.py` | **new?** | Ask for the same-response compaction summary only on turns where a growth/rent forecast predicts compaction within ~2 turns (in-band `[handoff due]` marker) | Saves 116–323 output tokens on every other tool turn |
+| 6 | Local BM25 focus over symbol spans | `subagents/file_reader.py`, `docindex.py` | derived | A free-text "focus" on a file is answered by local BM25 over AST symbol spans and gaps instead of a model call | One live turn: $0.00105 / 3 iterations → $0.00019 / 2 |
+| 7 | Plain-text heading induction | `docindex.py` | derived (title promotion: *new?*) | Recover a section tree from unmarked text by line shape, keyword ranks, boilerplate suppression, implied parents; an ALL-CAPS line before a numbering reset becomes the work title | 5.4 MB → full tree in ~0.1 s, no model; 6-task long-document bench $0.000947 → $0.000659 per solved task |
+| 8 | Breadcrumb-addressed hits, fold-to-budget outlines | `docindex.py`, `subagents/searcher.py` | derived | Every search/focus hit carries its enclosing function or section path; outlines fold breadth-first to a budget with explicit `+N` counts, never silent truncation | Offline tests; part of #7's bench |
+| 9 | Machine-wide canonical web cache | `web.py` | existing | One SQLite (WAL) store for every instance; canonical query/URL keys; TTL chosen by query or URL kind; a ledger of fees saved | Offline tests |
+| 10 | Search-primed fetch | `web.py` | derived | A flat per-request fee makes "include page content" free at the margin, so one search pre-fills up to 10 pages byte-identical to the Fetch API | Live: a primed fetch cost $0 and took 41 ms; 5 operations cost 2 paid requests |
+| 11 | Near-duplicate query reuse with a fee threshold | `web.py` | derived | Stemmed-Jaccard reuse of earlier searches; scope operators must agree and version numbers veto; the threshold is derived from prices (reuse pays above ~30% usefulness) | Replay of agent rewordings: 3/5 reused (exact keys: 0/5) |
+| 12 | Anticipatory tool results | `edit_engine.py`, `tools/registry.py` | derived | Fold the predictable, locally free next observation into the current result when P(needed) × hop cost > added tokens × rent: small files whole, a missed Edit returns the closest region or every occurrence, exit 127 names `python3` | Write-side bench (10 tasks): $0.001810 → $0.001451 per solved task, 92 → 65 calls, 4 → 0 edit errors |
+| 13 | Affine indentation-map matching | `edit_engine.py` | derived | A fuzzy `old_string` rung solving `file_w = a + f·old_w`, proven on every non-blank line (2→4-space drift, quoted blocks); `new_string` is re-indented through the same map; unique matches only | Offline tests |
+| 14 | Epoch-aware repeat guard | `orchestrator.py` | derived | Loop guards key reads/runs on (write epoch, call) and writes on the call alone: test → edit → test is new information, the same Edit three times is a loop | Offline tests |
+| 15 | Verify replay | `orchestrator.py` | derived | After a successful write, re-run the check that failed this turn (allowed, < 30 s, chosen by the model) and attach `{exit_code, tail}` to the write's own result | Part of #12's bench |
+| 16 | Counterfactual failure attribution | `attribution.py` | derived | When a check fails after this turn's writes, re-run it in a shadow copy with the turn's pre-images restored and label failures *new* / *pre-existing* / *fixed*; sound by an effect-based taint (stat fingerprint around every Bash call) | 65 live runs, all solved; cost per task neutral within noise ($0.001443 → $0.001428); unaided, the model rebuilt this counterfactual by hand at 3 extra hops |
+| 17 | Nothing variable before the tool schemas | `orchestrator.py` | existing (re-measured) | A per-project path at the end of the instructions forks the cache before the tools | Call-1 hit/miss 1,408 / 3,875 tokens per new project, vs 5,120 / 168 without it |
+| 18 | Test oracle | `testoracle.py` | derived | pytest run through Bash also writes a report outside the project; the result gains only what the model's own output filter hid (failing id, `@ path:line`, error, vacuous new tests) | delta-only version −14% mean $ on 5 write tasks × 6; listing passing new tests was +11% |
+| 19 | Request obligations + write guards | `obligations.py` | derived | Signatures the request names are checked by `ast` before the final answer (one note); "do not change ..." refuses the first write to a protected file | method-vs-function misread task: 9/9 solved with vs 18/25 without (p = 0.09) |
+| 20 | Claim check + callee digests | `claims.py`, `callees.py` | existing | A "tests pass" answer is compared with the turn's runs (note only); ReadFile lists imported project signatures | final check of all defaults vs off: 35/35 both, cost neutral ($0.001916 vs $0.001905) |
+| 21 | Volatility-ordered bounded fold; signed, evidence-bound handoffs | `checkpoint.py` | derived | The state carried across post-turn compaction is ordered by how often it changes (narrative, then capped request digests, then a ring of the last 3 exchanges), so consecutive states share a cached prefix and the size has a fixed point; a handoff is HMAC-signed and, on resume, re-checked against the working set's file hashes, with drift and a stale passing verify reported to the model | Token model, 40 turns with a cold cache every 10: a sliding "last 3 turns verbatim" window costs 1.4× keeping the whole history (its head drops every turn, so the retained turns re-bill at the miss rate); the bounded fold costs 0.56× with ~9× smaller peak context (a model of token accounting, not a live bench) |
+
+**Prior art we checked against** (non-exhaustive): ski rental
+([Wikipedia](https://en.wikipedia.org/wiki/Ski_rental_problem)) and its use for
+cache TTLs; Okapi BM25; aider's [repository map](https://aider.chat/docs/repomap.html)
+and relative-indentation edit matching; MemGPT recall storage
+([arXiv:2310.08560](https://arxiv.org/abs/2310.08560)); observation masking
+([arXiv:2508.21433](https://arxiv.org/abs/2508.21433)); per-step effort routing
+(ARES, arXiv:2603.07915); speculative actions
+([arXiv:2510.04371](https://arxiv.org/abs/2510.04371)); provider-side compaction (OpenAI's
+encrypted [compaction item](https://developers.openai.com/api/docs/guides/compaction), Anthropic's
+[`compact_20260112`](https://platform.claude.com/docs/en/build-with-claude/compaction)) and signed
+thinking blocks; ACON ([arXiv:2510.00615](https://arxiv.org/abs/2510.00615)); context rot
+([Chroma](https://research.trychroma.com/context-rot)); semantic caches such as
+[GPTCache](https://github.com/zilliztech/GPTCache); HTTP caching
+([RFC 9111](https://www.rfc-editor.org/rfc/rfc9111)); SWE-agent's
+[agent-computer interface](https://swe-agent.com/latest/background/aci/); and
+SWE-bench `FAIL_TO_PASS` / `PASS_TO_PASS` with Agentless regression filtering.
+The gap we found in each case is the one stated in the table: the billed
+prefix cache as the cost model, not latency or a context-length budget.
+
+**Reproducing.** Everything above runs from this folder:
+
+- `python3 -m pytest tests -q` — the offline suite (no key, no network) pins
+  every mechanism in the table.
+- `G023_READFILE_RAW=1`, `G023_VERIFY_REPLAY=0`, `G023_ATTRIBUTION=0`,
+  `/compact-at fixed` and `/subagents on` switch individual techniques off (or
+  delegation on) for an A/B. The meters are `/cost` (tokens split by cache
+  hit / miss / output, priced, with a per-turn sparkline), `/signals` (prefix
+  hit rate per day, kept in `.g023/cache.db`) and `.g023/sessions/*.jsonl`
+  (the full transcript plus prefix fingerprints).
+- The arithmetic behind #2 and the break-even claims is in
+  [`docs/economics.md`](docs/economics.md); the codec in
+  [`docs/tool_codec.md`](docs/tool_codec.md), the web layer in
+  [`docs/web.md`](docs/web.md), attribution in
+  [`docs/attribution.md`](docs/attribution.md).
+
+**What would make a paper.** #1 + #4 + #2 together support a short empirical
+note on "cache-aware agent plumbing": hit rate and cost per solved task with
+each technique ablated, over a task set large enough to beat the run-to-run
+variance seen here. That benchmark has not been run.
 
 ## Design principles
 
 1. **Context is currency** — keep raw files and search dumps out of the
    orchestrator unless they were asked for by line range.
-2. **Subagents are the treasury** — heavy I/O happens in isolated, minimal
-   contexts, and the escalation path back to verbatim source stays open.
+2. **Local helpers are the treasury** — heavy I/O is answered by local
+   indexes (AST, induced outlines, BM25) or, opt-in, by isolated subagents,
+   and the escalation path back to verbatim source stays open.
 3. **Cache everything cacheable** — file hashes, vision Q&A, fetched pages.
-4. **Do it off-API where it is free** — search the filesystem locally, see with
-   a local GPU, and spend tokens only on reasoning.
+4. **Do it off-API where it is free** — search the filesystem, rank text and
+   outline documents locally, and spend tokens only on reasoning.
 5. **Thinking mode is a dial** (0–100, default 75), not always-on max.
 6. **Say what happened, not what was sent** — and always say what it cost.
 7. **Claim only what is checked.** Numbers in this documentation are either
@@ -799,6 +846,10 @@ a guarantee about any site, and any site may block you anyway.
    labelled as an estimate. Where something is not measured, it says so.
 8. **Retrieve, don't prepend** — learned procedures live in files and are
    searched on demand, so they cannot bust the prompt-cache prefix.
+9. **Committed work survives** — Ctrl-C or a crash mid-write never loses a
+   finished turn or a compaction summary, and what was interrupted is rolled
+   back and said so. Two instances on one project keep each other's settings;
+   one session log has one writer (two REPLs resuming the same session interleave).
 
 ## Tests
 
@@ -809,7 +860,7 @@ pip install pytest && python3 -m pytest tests/ -q
 No plugins beyond `pytest` — async tests run through a small hook in
 `tests/conftest.py`, and every test points `G023_PROJECT_ROOT` at a temporary
 directory, so a run never reads your real cache and never touches the network.
-**421 tests**, all passing, none of them on the network.
+**732 tests**, all passing, none of them on the network.
 
 | File | What it holds to account |
 |---|---|
@@ -820,15 +871,20 @@ directory, so a run never reads your real cache and never touches the network.
 | `test_drift_signals.py` | Each signal fires on the shape that matters and stays quiet on ordinary turns; hit-rate history survives restarts |
 | `test_history_integrity.py` | Tool-call pairing survives rollback and repair; output items are echoed back byte-identical |
 | `test_usage_accounting.py` | Cost arithmetic, both usage spellings, worst-case assumption when the split is unreported |
-| `test_reasoning.py` | Effort 0–100 ↔ wire aliases, capped at 75 / `high`; `[handoff]` / `[next_effort]` stripped from the visible answer |
+| `test_reasoning.py` | Effort 0–100 ↔ wire levels `none`/`low`/`high`, capped at 75; `[handoff]` / `[next_effort]` stripped from the visible answer |
 | `test_learn.py` | Learn store round-trip, prefix pin, secret reject, cross-project env visibility |
 | `test_session_log.py` | JSONL `/resume` and `.g023/logs/` handoff round-trip |
+| `test_checkpoint.py` | Post-turn fold carries every new turn and stays bounded; signed handoff provenance; `[rehydrate]` on disk drift |
 | `test_goal_judge.py` | Working-set completed vs not-completed from evidence, not from a final message |
 | `test_prefix_stable.py` | Standing instructions + tools stay byte-identical until vision changes |
 | `test_root_confine.py` | ReadFile / ListDir / SearchContent refuse paths outside the project root |
-| `test_search.py` | Total-vs-sample counts, gitignore, glob/brace, grep fallback |
-| `test_vision_resize.py` | Every vision send is constrained to 800px |
-| `test_write_backup.py` | Every overwrite snapshots `.g023/backups/`; skipped for `.g023/` paths, new files, unchanged content |
+| `test_tool_codec.py` | ReadFile outline + byte-exact content, grep-style ranked search (`shown:"all"`), the `[handoff due]` forecast and marker |
+| `test_search.py` | Total-vs-sample counts, gitignore, glob/brace, grep fallback, `.g023/memory/` and `.g023/bbs/` overlay |
+| `test_bbs.py` | Bulletin board layout, slugs, retrieve-don't-prepend, search overlay, `/bbs` |
+| `test_images.py` | Vision sends are capped at 800 px with the real media type, paths stay in the project, every request names `deepseek-flash` |
+| `test_write_backup.py` | Every overwrite snapshots `.g023/backups/`; skipped for `.g023/` paths except `.g023/bbs/`, new files, unchanged content |
+| `test_interrupt_and_concurrency.py` | A real SIGINT cancels only the running turn; interrupted turns roll back as a transaction; `/resume` replay equals memory; reads after a write see it; retries are bounded; stores survive concurrent writers |
+| `test_durability_and_commit.py` | Summaries survive `/resume`; a torn log tail is repaired; Ctrl-C after the final answer keeps the turn; `/undo` restores the right version; no silent todo drops; per-key config merge |
 
 The full suite is listed in [`docs/tests.md`](docs/tests.md).
 
@@ -844,13 +900,13 @@ cost, or whether a summary was good enough for the question asked.
 - **New tool** — add a schema in `tools/schemas.py` plus an executor or a
   subagent route. Give it an entry in `ui.TOOL_STYLES` and a case in
   `ui.describe_call` / `describe_result` so its trace reads like the others.
-- **Vision backends** — `ollama_client.py` and `subagents/vision.py`; the router
-  dispatches `AnalyzeImage` there.
+- **Vision** — `images.py` (loading, media type, cap) and `subagents/vision.py`
+  (the call, cache, usage); the router dispatches `AnalyzeImage` there.
 - **Permissions** — `permission_default` (`allow` | `ask` | `block`) sets the
   starting level for the tools that act: `Bash`, `WriteFile`, `Edit`, `Agent`,
-  `AnalyzeImage`. Read-only tools (including Glob, TodoWrite, Learn*,
-  SessionSearch) stay `allow`, and `FetchUrl` still asks unless the default is
-  `block`. Per-tool overrides live in `tools/registry.py` and `/tools`.
+  `AnalyzeImage`, `FetchUrl`. The rest stay `allow`: they read, or write only
+  g023's own stores (ReadFile, SearchContent, ListDir, Glob, TodoWrite,
+  LearnSearch/LearnGet/LearnPut, SessionSearch, WebSearch). Per-tool overrides live in `tools/registry.py` and `/tools`.
 
 Environment overrides:
 
@@ -858,13 +914,32 @@ Environment overrides:
 |---|---|
 | `G023_HOME` | Installation folder — where `K.dat` and `config.json` live |
 | `G023_PROJECT_ROOT` | The project being worked on |
-| `OLLAMA_HOST` | Vision daemon, when `vision_host` is unset |
 | `G023_ASCII=1` | Force plain-ASCII output on terminals that mangle box drawing |
 | `G023_READFILE_RAW=1` | `ReadFile` returns raw content instead of delegating — the A/B baseline described in [What delegation costs](#what-delegation-costs) |
 | `G023_WRITE_BACKUP=0` | Disable the automatic `.g023/backups/` snapshot before WriteFile/Edit overwrites |
 | `G023_WRITE_BACKUP_KEEP=5` | How many backup versions to retain per file (minimum 1) |
+| `G023_VERIFY_REPLAY=0` | Disable verify replay (re-running the last failing test command after a successful Edit/WriteFile, attached to the write's result) |
+| `G023_ATTRIBUTION=0` | Disable failure attribution (re-running a failing check in a shadow copy with this turn's edits reverted, to label failures new or pre-existing) |
+| `G023_FINISH_ON_SUCCESS=0` | Disable predicated finish: the step that completes a task may carry the final answer, delivered only if that step succeeds (on by default) |
+| `G023_STEP_BUDGET=0` | Disable step budgets: `[budget MIN-MAX +OVER]` per step and the `[hop ...]` tracker on results (on by default; with predicated finish: $ −8 %, calls −16 %, time −10 % live) |
+| `G023_PREREAD=off` | Disable pre-emptive reads: before the first model call the harness runs the reads the request makes predictable (named files, a named test's subject, the definition of a named function) as the model's own tool exchange (`ghost`, default; `prose` appends them to the request instead) |
+| `G023_FINISH_LICENSED=0` | Disable licensed finish: an answer on a check whose failures all pre-date the turn is delivered with a ⚠ line (on by default) |
+| `G023_ANSWER_ESCROW=0` | Disable answer escrow: a held-back answer is kept and the model can release it with `[deliver]` instead of re-writing it (on by default) |
+| `G023_CLAIMED_WRITE_GUARD=0` | Disable the claimed-write guard: an answer saying a request-named file changed is held when no call wrote it (on by default) |
+| `G023_MULTI_EDIT=0` | Remove Edit's `more_edits` (more hunks, optionally in other files, one call, all or nothing; on by default) |
+| `G023_RENAME_TOOL=0` | Remove the `Rename` tool (whole-word identifier rename across the project, all files or none; on by default) |
+| `G023_ORDERED_BATCHES=1` | Program-order batch contract in the prompt; a failed write skips the later checks of that response (opt-in) |
+| `G023_WRITE_CHECK=1` | Edit/WriteFile carry an optional `check` command run after the response's writes if all succeeded (opt-in) |
+| `G023_CLOSURE_RECEIPTS=0` / `G023_LEAN_CODEC=0` / `G023_LEAN_PROMPT=0` / `G023_ORIENT_CARD=0` | Turn off a lean-turn feature (docs/lean.md) |
+| `G023_SCOPE_COUNT=1` | Scoped SearchContent also reports `elsewhere_in_project` |
+| `G023_NEAR_MISS=0` | Disable near-miss names on a zero-hit SearchContent (the project's real spelling of the name searched for) |
 | `G023_LEARN=0` | Disable the learn store (search/get/put become no-ops) |
+| `G023_GLOBAL_CACHE_DIR` | Where the machine-wide web cache (`web.db`) lives (default `<install>/global_cache/`) |
+
+## Changelog
+
+What changed in each release: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-MIT — built for the g023 workflow.
+MIT — see [`LICENSE`](LICENSE).

@@ -1,40 +1,29 @@
 """
-Reasoning-effort encode/decode for DeepSeek ``/responses``.
+Reasoning-effort encode/decode for DeepSeek V4.1 Flash (Anthropic-format wire).
 
-Live probe of ``POST https://api.deepseek.com/responses`` on ``deepseek-flash``
-(2026-09-14) found:
+The endpoint takes ``thinking: {type: enabled|disabled}`` plus
+``output_config.effort``, whose real levels are ``low`` / ``high`` / ``max``
+(DeepSeek maps ``minimal``->low, ``medium``/``xhigh``->high, ``ultra``->max
+server-side). Numbers are rejected. So the user/model scale is an integer
+``0``–``100`` and the wire value is always one of the real levels; this module
+is that mapping. I/O stays out.
 
-* JSON numbers ``0`` / ``1`` / ``75`` / ``100`` are rejected (body is not valid
-  JSON for ``reasoning.effort``).
-* Numeric strings ``"0"`` / ``"1"`` / ``"75"`` / ``"100"`` are rejected:
-  unknown variant, expected one of ``none``, ``minimal``, ``low``, ``medium``,
-  ``high``, ``xhigh``, ``max``.
-* String aliases ``none`` / ``minimal`` / ``low`` / ``medium`` / ``high`` /
-  ``xhigh`` / ``max`` are accepted. ``none`` is what disables thinking
-  (``reasoning_tokens`` 0, no reasoning item).
-
-So the user/model scale is integer ``0``–``100``, but the wire value is always
-one of those aliases. This module is the mapping. I/O stays out.
-
-This harness never sends ``xhigh`` or ``max``. ``MAX_EFFORT = 75`` (wire
-``high``) is both the thinking-on default and the ceiling: a ``[next_effort:
-100]``, ``/thinking max``, ``/goal``, or Agent ``reasoning=max`` is stored
-and sent as 75 / ``high``. ``max`` on this endpoint often burns the entire
-``max_output_tokens`` budget on thinking and returns an empty answer.
+This harness never sends ``max``. ``MAX_EFFORT = 75`` (wire ``high``) is both
+the thinking-on default and the ceiling: a ``[next_effort: 100]``,
+``/thinking max``, ``/goal``, or Agent ``reasoning=max`` is stored and sent as
+75 / ``high``. ``max`` often burns the whole output budget on thinking and
+returns an empty answer.
 
 The same reply can also carry a compact ``[handoff]...[/handoff]`` block
 ahead of ``[next_effort: N]``. Both are stripped from user-visible text
 and from history items so the next turn can reuse the handoff instead of
 paying for a second summarizer call.
 
-Wire mapping (Together's documented anchors: low=50, high=75, max=100).
-Stored values are capped at ``MAX_EFFORT`` before mapping:
+Wire mapping (stored values are capped at ``MAX_EFFORT`` first):
 
-* ``0`` / off → ``none``
-* ``1``–``24`` → ``minimal``
-* ``25``–``50`` → ``low``
-* ``51``–``74`` → ``medium``
-* ``75``–``100`` → ``high``   (75 is the thinking-on default and the ceiling)
+* ``0`` / off → ``none`` (the codec sends ``thinking: disabled``)
+* ``1``–``50`` → ``low``
+* ``51``–``100`` → ``high``   (75 is the thinking-on default and the ceiling)
 """
 
 from __future__ import annotations
@@ -63,26 +52,11 @@ ALIAS_TO_INT: dict[str, int] = {
     "max": 75,
 }
 
-# Aliases the live ``/responses`` probe accepted. This harness never *sends*
-# ``xhigh`` or ``max`` (see ``MAX_EFFORT``); they remain here because the API
-# still lists them and ``effort_to_wire`` must only ever produce a probed name.
-WIRE_VARIANTS: tuple[str, ...] = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-)
-# Wire aliases this harness is willing to put on a request.
-HARNESS_WIRE_VARIANTS: tuple[str, ...] = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-)
+# Levels output_config.effort accepts (DeepSeek folds minimal/medium/xhigh/ultra
+# onto these server-side). ``none`` is the harness's "thinking disabled".
+WIRE_VARIANTS: tuple[str, ...] = ("none", "low", "high", "max")
+# Levels this harness is willing to put on a request (never ``max``).
+HARNESS_WIRE_VARIANTS: tuple[str, ...] = ("none", "low", "high")
 
 # Trailing-only control blocks. Locked shapes (the live model attached these
 # on the same response):
@@ -148,10 +122,9 @@ def parse_effort_value(raw: Any) -> Optional[int]:
 
 
 def effort_to_wire(effort: Any, *, enabled: bool = True) -> str:
-    """The string ``reasoning.effort`` actually sent to ``/responses``.
+    """The effort level actually sent: ``none`` (thinking off), ``low`` or ``high``.
 
-    Never returns ``xhigh`` or ``max``. Anything at or above ``MAX_EFFORT``
-    is sent as ``high``.
+    Never returns ``max``.
     """
     if not enabled:
         return DISABLE_WIRE
@@ -161,13 +134,7 @@ def effort_to_wire(effort: Any, *, enabled: bool = True) -> str:
     n = cap_effort(n)
     if n <= 0:
         return DISABLE_WIRE
-    if n <= 24:
-        return "minimal"
-    if n <= 50:
-        return "low"
-    if n <= 74:
-        return "medium"
-    return "high"
+    return "low" if n <= 50 else "high"
 
 
 def _split_effort_trailer(text: str) -> tuple[str, Optional[int]]:
@@ -224,22 +191,14 @@ def split_reply_meta(text: str) -> tuple[str, Optional[str], Optional[int]]:
     return visible, handoff, effort
 
 
-def split_effort_meta(text: str) -> tuple[str, Optional[int]]:
-    """Split trailing control blocks from visible text; return next-effort.
-
-    Also strips a ``[handoff]`` block so display callers do not show it.
-    Returns ``(visible, next_effort)``. ``next_effort`` is ``0``–``MAX_EFFORT``
-    when the trailer is present *and* the value is valid; otherwise ``None``.
-    A recognised trailer is always stripped, even when the value is invalid,
-    so the user never sees the control block. Does not raise.
-    """
-    visible, _, effort = split_reply_meta(text)
-    return visible, effort
-
-
 def visible_reply_text(text: str) -> str:
     """User-visible prefix of a (possibly still-streaming) assistant reply."""
     visible, _, _ = split_reply_meta(text)
+    # Answer escrow (finish.py): "[deliver]" releases a kept answer that the
+    # caller prints in full afterwards; the token itself is not for the eye.
+    stripped = visible.lstrip()
+    if stripped.lower().startswith("[deliver]"):
+        return stripped[len("[deliver]"):].lstrip()
     return visible
 
 

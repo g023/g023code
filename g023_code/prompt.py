@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from rich.prompt import Prompt
+from .interrupts import Prompt
 
 from . import commands as cmd_registry
+from .interrupts import UserInterrupt, blocking_prompt
 from .prompt_store import last_prompt
 from .ui import Glyph, console
 
@@ -159,13 +161,50 @@ class Reader:
     async def ask_async(self, label: str = "you") -> str:
         """The same read, driven by the caller's already-running event loop."""
         if self.session is not None:
-            return await self.session.prompt_async(self._message(label))
-        # rich blocks the loop while it waits, so keep it off the loop thread.
-        return await asyncio.to_thread(Prompt.ask, f"[user]{label}[/user]")
+            try:
+                return await self.session.prompt_async(self._message(label))
+            except KeyboardInterrupt:
+                # prompt_toolkit reads Ctrl-C as a key and raises KI in this
+                # coroutine; a KI leaving a Task escapes the event loop.
+                raise UserInterrupt() from None
+        # rich blocks while it waits, so keep it off the loop thread. A daemon
+        # thread, not asyncio.to_thread: when Ctrl-C abandons the read, an
+        # executor thread stuck in input() would hold interpreter shutdown.
+        return await _read_in_daemon_thread(Prompt.ask, f"[user]{label}[/user]")
 
     @property
     def enhanced(self) -> bool:
         return self.session is not None
+
+
+async def _read_in_daemon_thread(fn, *args):
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def deliver(ok: bool, value) -> None:
+        if fut.done():
+            return
+        if ok:
+            fut.set_result(value)
+        else:
+            fut.set_exception(value)
+
+    def worker() -> None:
+        try:
+            value = fn(*args)
+        except KeyboardInterrupt:
+            ok, value = False, UserInterrupt()
+        except BaseException as e:  # EOFError reaches the caller
+            ok, value = False, e
+        else:
+            ok = True
+        try:
+            loop.call_soon_threadsafe(deliver, ok, value)
+        except RuntimeError:
+            pass  # loop already closed: nobody is waiting
+
+    threading.Thread(target=worker, name="g023-input", daemon=True).start()
+    return await fut
 
 
 def install_hint() -> str:
@@ -186,10 +225,11 @@ def confirm(question: str, *, default: bool = False) -> bool:
     would surface to the user as a traceback-ish error for what was really just
     a change of mind.
     """
-    from rich.prompt import Confirm
+    from .interrupts import Confirm
 
     try:
-        return Confirm.ask(question, default=default)
+        with blocking_prompt():
+            return Confirm.ask(question, default=default)
     except (KeyboardInterrupt, EOFError):
         console.print("[muted]Cancelled.[/muted]")
         return False
@@ -227,7 +267,8 @@ def choose(
 
     choices = [str(i) for i in range(0 if allow_cancel else 1, len(options) + 1)]
     try:
-        picked = Prompt.ask("Choose", choices=choices, default=str(default), show_choices=False)
+        with blocking_prompt():
+            picked = Prompt.ask("Choose", choices=choices, default=str(default), show_choices=False)
     except (KeyboardInterrupt, EOFError):
         console.print("[muted]Cancelled.[/muted]")
         return None

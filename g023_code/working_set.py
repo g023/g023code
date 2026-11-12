@@ -21,14 +21,24 @@ WORKING_SET_LEADIN = "Working set:\n"
 MAX_OPEN_LEAVES = 8
 MAX_FILES = 32
 
+# A check may be wrapped: `VAR=x`, `timeout 60`, `uv run`, `poetry run`, or an
+# interpreter path (`.venv/bin/python -m pytest`). A 1.5.0 development benchmark measured that the
+# old start-anchored form missed all of those, so verify replay and the goal
+# judge never saw the check.
+_CMD_PREFIX = (
+    r"(?:\w+=\S*\s+)*"
+    r"(?:(?:timeout\s+(?:-{1,2}[\w-]+(?:[=\s]+(?:[A-Z]+|\d\S*))?\s+)*\d\S*|(?:uv|poetry|pipenv|hatch|pdm|rye)\s+run|"
+    r"nice|time|env|xvfb-run|npx|bunx|pnpm\s+exec|yarn\s+exec)\s+)*"
+    r"(?:[\w.~/-]*/)?"
+)
 _TEST_CMD = re.compile(
-    r"(^|[;&|]\s*)("
-    r"python3?\s+-m\s+pytest|pytest|py\.test|python3?\s+-m\s+unittest|"
-    r"python3?\s+\S*test\S*\.py|"
+    r"(^|[;&|(]\s*)" + _CMD_PREFIX + r"("
+    r"python3?(?:\.\d+)?\s+-m\s+pytest|pytest|py\.test|python3?(?:\.\d+)?\s+-m\s+unittest|"
+    r"python3?(?:\.\d+)?\s+\S*test\S*\.py|"
     r"node\s+--check|"
     r"node\s+\S*test|"
-    r"cargo\s+test|go\s+test|npm\s+(?:run\s+)?test|npx\s+jest|"
-    r"make\s+test|ctest|mvn\s+test|gradlew?\s+test"
+    r"cargo\s+test|go\s+test|(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test|jest|vitest|"
+    r"make\s+(?:test|check)|ctest|mvn\s+test|gradlew?\s+test|\./gradlew\s+test|tox|nox"
     r")\b",
     re.IGNORECASE,
 )
@@ -45,6 +55,8 @@ def empty_working_set() -> dict[str, Any]:
             "exit_code": None,
             "excerpt": "",
             "at": "",
+            "failed_command": "",
+            "failed_exit_code": None,
         },
     }
 
@@ -82,15 +94,36 @@ def normalize(ws: Optional[dict]) -> dict[str, Any]:
     leaves = [_leaf(x) for x in (ws.get("open") or []) if isinstance(x, dict) and x.get("id")]
     open_ones = [x for x in leaves if x["status"] not in ("done", "cancelled")]
     closed = [x for x in leaves if x["status"] in ("done", "cancelled")]
-    base["open"] = open_ones[:MAX_OPEN_LEAVES] + closed
+    # No truncation here: dropping open leaves silently let the goal judge
+    # "all done" with work still pending. The MAX_OPEN_LEAVES cap is
+    # enforced where leaves are added (TodoWrite), with an explicit reject.
+    base["open"] = open_ones + closed
     files = [_file_ptr(x) for x in (ws.get("files") or []) if isinstance(x, dict) and x.get("path")]
     base["files"] = files[-MAX_FILES:]
     verify = ws.get("verify") if isinstance(ws.get("verify"), dict) else {}
+    command = str(verify.get("command") or "")
+    exit_code = verify.get("exit_code")
+    failed_command = str(verify.get("failed_command") or "")
+    failed_exit = verify.get("failed_exit_code")
+    # Facts written before failed_command existed: a non-zero last exit is
+    # still an open failure. An explicit empty failed_command means a later
+    # run of that same command already cleared it.
+    if (
+        not failed_command
+        and "failed_command" not in verify
+        and command
+        and not _exit_ok(exit_code)
+        and exit_code is not None
+    ):
+        failed_command = command
+        failed_exit = exit_code
     base["verify"] = {
-        "command": str(verify.get("command") or ""),
-        "exit_code": verify.get("exit_code"),
+        "command": command,
+        "exit_code": exit_code,
         "excerpt": str(verify.get("excerpt") or ""),
         "at": str(verify.get("at") or ""),
+        "failed_command": failed_command,
+        "failed_exit_code": failed_exit,
     }
     return base
 
@@ -101,8 +134,23 @@ def dumps_working_set(ws: dict) -> str:
     return json.dumps(n, ensure_ascii=False, separators=(",", ":"))
 
 
+# The model-facing item shows 12 hex of each file digest, like tool_codec; a
+# prefix is a valid evidence citation (_evidence_cites_file). Persisted
+# copies (cache fact, session log) keep the full digest.
+ITEM_HASH_CHARS = 12
+
+
 def working_set_item_content(ws: dict) -> str:
-    return WORKING_SET_LEADIN + dumps_working_set(ws)
+    n = normalize(ws)
+    files = n.get("files")
+    if isinstance(files, list):
+        n = dict(n)
+        n["files"] = [
+            {**f, "hash": str(f.get("hash") or "")[:ITEM_HASH_CHARS]}
+            if isinstance(f, dict) and f.get("hash") else f
+            for f in files
+        ]
+    return WORKING_SET_LEADIN + json.dumps(n, ensure_ascii=False, separators=(",", ":"))
 
 
 def is_working_set_item(item: dict) -> bool:
@@ -165,6 +213,38 @@ def mirror_working_set(
     return existing
 
 
+def _is_open(leaf: dict) -> bool:
+    return leaf.get("status") not in ("done", "cancelled")
+
+
+def split_open_overflow(existing: list[dict], incoming: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split ``incoming`` into (fits, overflow) under ``MAX_OPEN_LEAVES``.
+
+    Leaves are taken in order. A leaf overflows only if it would *add* an open
+    leaf beyond the cap; updates, closes and cancels always fit (and a close
+    earlier in the batch frees a slot for a later new leaf).
+    """
+    state: dict[str, bool] = {}
+    for leaf in existing:
+        if isinstance(leaf, dict) and leaf.get("id"):
+            state[str(leaf["id"])] = _is_open(_leaf(leaf))
+    fits: list[dict] = []
+    overflow: list[dict] = []
+    for leaf in incoming:
+        if not isinstance(leaf, dict) or not leaf.get("id"):
+            continue
+        lid = str(leaf["id"])
+        prev_open = state.get(lid, False)
+        prev = next((x for x in existing if isinstance(x, dict) and str(x.get("id")) == lid), {})
+        now_open = _is_open(_leaf({**prev, **leaf}))
+        if now_open and not prev_open and sum(state.values()) >= MAX_OPEN_LEAVES:
+            overflow.append(leaf)
+            continue
+        state[lid] = now_open
+        fits.append(leaf)
+    return fits, overflow
+
+
 def merge_leaves(existing: list[dict], incoming: list[dict]) -> list[dict]:
     by_id: dict[str, dict] = {}
     for leaf in existing:
@@ -188,13 +268,40 @@ def note_file(path: str, file_hash: str, last_range: Any = None) -> dict[str, An
     return save(ws)
 
 
+def _norm_cmd(command: str) -> str:
+    return " ".join((command or "").split())
+
+
+def _exit_ok(exit_code: Any) -> bool:
+    return str(exit_code).strip() == "0"
+
+
 def note_verify(command: str, exit_code: Any, excerpt: str) -> dict[str, Any]:
+    """Record a test-like command.
+
+    A later *different* command that exits 0 does not clear an earlier
+    failure. ``node --check`` passing after ``pytest`` failed used to
+    mark the goal complete. Only the same command, whitespace-normalised,
+    exiting 0 clears ``failed_command``.
+    """
     ws = load()
+    prev = ws.get("verify") if isinstance(ws.get("verify"), dict) else {}
+    failed_command = str(prev.get("failed_command") or "")
+    failed_exit = prev.get("failed_exit_code")
+    command = command or ""
+    if _exit_ok(exit_code) and failed_command and _norm_cmd(command) == _norm_cmd(failed_command):
+        failed_command = ""
+        failed_exit = None
+    elif not _exit_ok(exit_code):
+        failed_command = command
+        failed_exit = exit_code
     ws["verify"] = {
         "command": command,
         "exit_code": exit_code,
         "excerpt": (excerpt or "")[:500],
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "failed_command": failed_command,
+        "failed_exit_code": failed_exit,
     }
     return save(ws)
 
@@ -280,19 +387,39 @@ def evidence_satisfies_done(ws: dict, leaf: dict) -> bool:
     for item in evidence:
         if _evidence_cites_file(item, files):
             return True
-        if verify_ok and (
-            item == verify_cmd
-            or verify_cmd in item
-            or item.lower() == "verify"
-            or item.lower().startswith("verify:")
-        ):
-            return True
-        probe = item
-        if probe.lower().startswith("verify:"):
-            probe = probe.split(":", 1)[1].strip()
-        if files and (looks_like_test_command(item) or looks_like_test_command(probe)):
+        if verify_ok and _evidence_cites_verify(item, verify_cmd):
             return True
     return False
+
+
+def _evidence_cites_verify(item: str, verify_cmd: str) -> bool:
+    """True when a citation points at the verify command that actually ran.
+
+    A string that merely looks like pytest is not evidence. The recorded
+    command has to be the one that exited 0, and the citation has to name it
+    (or be the generic ``verify`` / ``verify:`` form models emit).
+    """
+    if item == verify_cmd or (verify_cmd and verify_cmd in item):
+        return True
+    if item.lower() == "verify" or item.lower().startswith("verify:"):
+        return True
+    probe = item
+    if probe.lower().startswith("verify:"):
+        probe = probe.split(":", 1)[1].strip()
+    probe = probe.split("->", 1)[0].strip()
+    if not probe or not verify_cmd:
+        return False
+    return probe == verify_cmd or probe in verify_cmd or verify_cmd in probe
+
+
+def verify_failed(ws: dict) -> bool:
+    """True while a test-like command is still failing.
+
+    The last command may have exited 0. That does not count when a
+    different command failed earlier and has not been re-run successfully.
+    """
+    verify = ws.get("verify") if isinstance(ws.get("verify"), dict) else {}
+    return bool(str(verify.get("failed_command") or "").strip())
 
 
 def evidence_hint(ws: dict, leaf: Optional[dict] = None) -> str:
@@ -308,7 +435,7 @@ def evidence_hint(ws: dict, leaf: Optional[dict] = None) -> str:
         path = str(files[-1].get("path") or "")
         digest = str(files[-1].get("hash") or "")
         if path and digest:
-            example = f" Example: {path}@sha256:{digest}."
+            example = f" Example: {path}@sha256:{digest[:ITEM_HASH_CHARS]}."
         elif path:
             example = f" Example: {path}."
     known = [str(f.get("path")) for f in files[:12]]
@@ -324,8 +451,9 @@ def judge_goal_completion(ws: Optional[dict] = None) -> dict[str, Any]:
     """Completed / not completed from working-set leaves and evidence.
 
     A final assistant message is not success. Pending open leaves, done leaves
-    without evidence, or an empty leaf list are not completed. No open leaves
-    with every done leaf citing file/verify evidence is completed.
+    without evidence, an empty leaf list, a list that was only cancelled, or a
+    failing verify command are not completed. No open leaves, at least one
+    done leaf citing file/verify evidence, and no failing verify is completed.
     """
     ws = normalize(ws if ws is not None else load())
     leaves = [x for x in (ws.get("open") or []) if isinstance(x, dict)]
@@ -335,30 +463,31 @@ def judge_goal_completion(ws: Optional[dict] = None) -> dict[str, Any]:
     missing = [x for x in done if not evidence_satisfies_done(ws, x)]
     pending_ids = [str(x.get("id") or "") for x in pending]
     missing_ids = [str(x.get("id") or "") for x in missing]
+
+    def _open(reason: str) -> dict[str, Any]:
+        return {
+            "completed": False,
+            "status": "not completed",
+            "reason": reason,
+            "pending": pending_ids,
+            "done_without_evidence": missing_ids,
+        }
+
     if pending:
-        return {
-            "completed": False,
-            "status": "not completed",
-            "reason": f"{len(pending)} open leaves still pending",
-            "pending": pending_ids,
-            "done_without_evidence": missing_ids,
-        }
+        return _open(f"{len(pending)} open leaves still pending")
     if missing:
-        return {
-            "completed": False,
-            "status": "not completed",
-            "reason": "done leaves missing evidence",
-            "pending": pending_ids,
-            "done_without_evidence": missing_ids,
-        }
-    if not done and not cancelled:
-        return {
-            "completed": False,
-            "status": "not completed",
-            "reason": "no working-set leaves with evidence",
-            "pending": pending_ids,
-            "done_without_evidence": missing_ids,
-        }
+        return _open("done leaves missing evidence")
+    if not done:
+        if cancelled:
+            return _open("every leaf was cancelled; nothing was finished")
+        return _open("no working-set leaves with evidence")
+    if verify_failed(ws):
+        verify = ws.get("verify") or {}
+        cmd = verify.get("failed_command") or verify.get("command")
+        code = verify.get("failed_exit_code")
+        if code is None:
+            code = verify.get("exit_code")
+        return _open(f"verify failed ({cmd} exit {code})")
     return {
         "completed": True,
         "status": "completed",
@@ -366,18 +495,3 @@ def judge_goal_completion(ws: Optional[dict] = None) -> dict[str, Any]:
         "pending": pending_ids,
         "done_without_evidence": missing_ids,
     }
-
-
-def assert_evidence(ws: dict, claim_path: str) -> bool:
-    """Citation lock helper: path is in files[] and file_cache still has that hash."""
-    rel = rel_to_root(claim_path)
-    files = ws.get("files") or []
-    digest = None
-    for f in files:
-        if isinstance(f, dict) and f.get("path") == rel and f.get("hash"):
-            digest = str(f["hash"])
-            break
-    if not digest:
-        return False
-    hit = get_cache().get_file_summary(claim_path, content_hash=digest)
-    return hit is not None

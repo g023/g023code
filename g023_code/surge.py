@@ -3,7 +3,8 @@ DeepSeek surge (peak/off-peak) pricing windows.
 
 DeepSeek moved to tidal pricing on 2026-08-17 (sheet restated 2026-09-10):
 peak hours are **09:00–12:00 and 14:00–18:00 Beijing time (UTC+8), Monday
-through Friday**. Weekends are off-peak. Off-peak prices are exactly half of
+through Friday, excluding Chinese public holidays**. Weekends and holidays
+(dates listed under ``"holidays"`` in ds_times.json) are off-peak. Off-peak prices are exactly half of
 peak. That anchor is fixed, but the user's clock is not — so every window below
 is computed from the current instant's Beijing wall-clock time and *reported in
 the machine's local timezone*. ``/surge status`` and the loop notifications
@@ -30,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .config import (
+    SURGE_HOLIDAYS,
     SURGE_PEAK_WEEKDAYS,
     SURGE_PEAK_WINDOWS_BEIJING,
     SURGE_UTC_OFFSET,
@@ -48,8 +50,14 @@ def beijing_now(now: Optional[datetime] = None) -> datetime:
 
 
 def is_peak_weekday(bj: datetime) -> bool:
-    """True when ``bj`` (Beijing wall-clock) falls on a published peak weekday."""
+    """True when ``bj`` (Beijing wall-clock) falls on a published peak weekday.
+
+    Chinese public holidays listed in ds_times.json ``"holidays"`` are
+    off-peak in full, per the pricing sheet.
+    """
     days = SURGE_PEAK_WEEKDAYS or (0, 1, 2, 3, 4)
+    if bj.date().isoformat() in SURGE_HOLIDAYS:
+        return False
     return bj.weekday() in days
 
 
@@ -62,15 +70,6 @@ def is_surge(now: Optional[datetime] = None) -> bool:
         if start_hour <= bj.hour < end_hour:
             return True
     return False
-
-
-def _peak_edges(bj_date: datetime) -> list[datetime]:
-    """All peak window start/end instants (Beijing) for one Beijing date."""
-    edges = []
-    for start_hour, end_hour in SURGE_PEAK_WINDOWS_BEIJING:
-        edges.append(bj_date.replace(hour=start_hour, minute=0, second=0, microsecond=0))
-        edges.append(bj_date.replace(hour=end_hour, minute=0, second=0, microsecond=0))
-    return edges
 
 
 def peak_windows_local(
@@ -98,6 +97,18 @@ def peak_windows_local(
             end = mid.replace(hour=end_hour).astimezone()
             out.append((start, end))
     return out
+
+
+def upcoming_peak_windows(
+    now: Optional[datetime] = None, count: int = 2
+) -> list[tuple[datetime, datetime]]:
+    """The next ``count`` peak windows that have not ended yet, in local time.
+
+    /surge shows these beside :func:`pause_ranges` (which also drops ended
+    windows), so both rows describe the same upcoming windows.
+    """
+    now_local = (now or datetime.now()).astimezone()
+    return [w for w in peak_windows_local(now, days=3) if w[1] > now_local][:count]
 
 
 def next_peak_window(
@@ -170,12 +181,6 @@ def pause_ranges(
     return ranges
 
 
-def in_pause_window(now: Optional[datetime] = None) -> bool:
-    """True if the current instant falls inside any pause window."""
-    now_local = (now or datetime.now()).astimezone()
-    return any(start <= now_local < end for start, end in pause_ranges(now))
-
-
 def seconds_until_pause_ends(now: Optional[datetime] = None) -> int:
     """Seconds until the active pause window ends (0 when not paused)."""
     now_local = (now or datetime.now()).astimezone()
@@ -226,8 +231,6 @@ def next_transition(
 
 def describe() -> str:
     """One human-readable summary line, in local time, AM/PM + 24-hour."""
-    from .config import settings  # local import: avoids a cycle at import time
-
     now = datetime.now().astimezone()
     local_tz = now.strftime("%Z") or f"UTC{now.utcoffset() or timedelta(0)}"
     active = is_surge(now)

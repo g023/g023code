@@ -1,23 +1,15 @@
 """
-Tool schemas for the DeepSeek Responses API.
+Tool schemas, in the flat internal shape. ``anthropic_codec.tools_to_anthropic``
+converts them for the wire (``parameters`` -> ``input_schema``). A tool is
+declared *flat* — ``name``, ``description`` and ``parameters`` sit directly on the tool object.
 
-The Responses API declares a function tool *flat* — ``name``, ``description``
-and ``parameters`` sit directly on the tool object. The chat-completions shape,
-with everything nested under a ``"function"`` key, is rejected outright
-("tools[0]: missing field `name`"), so this file is not interchangeable with an
-OpenAI-style schema list.
-
-Web search is absent from this list on purpose: it is not a function we
-implement. DeepSeek runs it server-side, and the orchestrator offers it as
-:data:`WEB_SEARCH_TOOL` alongside these.
+Web access is two client tools on DeepSeek's Search and Fetch APIs
+(``WebSearch``, ``FetchUrl``), both served through the machine-wide cache in
+``g023_code/web.py``. The server-side ``web_search`` tool is no longer offered:
+its results are opaque and cannot be cached or compressed, and it reads the prefix twice per call.
 """
 
 from __future__ import annotations
-
-# DeepSeek's own server-side search tool. It needs no schema and no executor —
-# the model calls it, the server runs the whole search loop (issuing queries and
-# opening pages), and the results arrive already folded into the same turn.
-WEB_SEARCH_TOOL = {"type": "web_search"}
 
 TOOL_SCHEMAS = [
     {
@@ -30,7 +22,15 @@ TOOL_SCHEMAS = [
             "when you need exact bytes — e.g. immediately before a WriteFile rewrite. "
             "Prefer Edit (old_string/new_string) for a unique span. "
             "Pass start_line/end_line to get a specific range verbatim instead of "
-            "a summary. Prefer summaries and ranges over full dumps: context is expensive."
+            "a summary. Prefer summaries and ranges over full dumps: context is expensive. "
+            "Result: a one-line JSON header (path, 12-hex hash, lines), then an outline "
+            "`signature  Lstart-end  # doc` per class/method/function; verbatim source, "
+            "when returned, follows a `-----` line exactly as on disk. Re-read an "
+            "outline span with start_line/end_line for its source. "
+            "Data and binary files get a digest from the unranged read: CSV/TSV "
+            "columns with exact row counts, JSON/JSONL shape with array lengths, "
+            "log line templates with exact counts, and images/archives/SQLite/"
+            "executables decoded. Use it for counts instead of line arithmetic."
         ),
         "parameters": {
             "type": "object",
@@ -51,11 +51,12 @@ TOOL_SCHEMAS = [
                 "focus": {
                     "type": "string",
                     "description": (
-                        "Optional focus. An exact symbol name (or unique method "
-                        "suffix, e.g. 'User' or 'login') is resolved from the "
-                        "local index with no API call and returns the line span. "
-                        "A semantic sentence ('auth logic', 'what does login do') "
-                        "still goes to the model."
+                        "Optional focus, resolved locally with no API call. An exact "
+                        "symbol ('do_goto', 'User.login') returns its body. A quoted or "
+                        "multi-word phrase returns every exact hit with its section path "
+                        "plus the passage. A section path from the outline ('Hamlet act 3 "
+                        "scene 1', 'Chapter 12') returns that section. Anything else is "
+                        "ranked by word match; each match carries its section."
                     ),
                 },
                 "start_line": {
@@ -78,8 +79,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "name": "SearchContent",
         "description": (
-            "Search the codebase with grep/glob semantics. "
-            "Returns metadata-first JSON (file, line, match, short context) — never full file dumps."
+            "Search the codebase with grep/glob semantics. Result: a JSON header "
+            "(total, shown; shown=\"all\" means every hit is listed), then grep-style blocks: `## file`, `N: hit`, `N- context`. "
+            "Samples are ranked definitions-first and spread across files; "
+            "`more files (hits)` lists matching files that got no sample. "
+            "Also searches .g023/memory/ (project notebook) and .g023/bbs/ (bulletin board)."
         ),
         "parameters": {
             "type": "object",
@@ -110,8 +114,8 @@ TOOL_SCHEMAS = [
         "type": "function",
         "name": "AnalyzeImage",
         "description": (
-            "Analyze an image (local path or URL) using an external vision model. "
-            "Returns a concise textual description answering the question."
+            "Analyze an image (project-relative path or http(s) URL; jpeg, png, gif or webp) "
+            "in an isolated vision call. Returns a concise text answer to the question."
         ),
         "parameters": {
             "type": "object",
@@ -135,6 +139,8 @@ TOOL_SCHEMAS = [
         "name": "Bash",
         "description": (
             "Execute a shell command in the project root. "
+            "Runs under bash with pipefail when bash is installed, so a failing "
+            "stage in a pipeline fails the command. "
             "Prefer non-destructive commands. Requires confirmation for potentially dangerous ops."
         ),
         "parameters": {
@@ -163,7 +169,8 @@ TOOL_SCHEMAS = [
             "summary-based rewrite truncates the file. First ReadFile with "
             "raw=true (or read every range you will touch) so you hold the complete "
             "current content. The previous version is automatically backed up to "
-            ".g023/backups/ before the write (newest few kept per file). "
+            ".g023/backups/ before the write (newest few kept per file). An existing "
+            "file's CRLF line endings, BOM and mode are kept; the write is atomic. "
             "Requires confirmation."
         ),
         "parameters": {
@@ -180,12 +187,14 @@ TOOL_SCHEMAS = [
         "type": "function",
         "name": "Edit",
         "description": (
-            "Replace a unique span in an existing file. old_string must match "
-            "exactly one region unless replace_all is true. Fails closed (no write) "
-            "if the span is missing or not unique. Prefer this over WriteFile for "
-            "small edits. The previous version is backed up to .g023/backups/. "
-            "Requires confirmation. WriteFile remains the tool for create and "
-            "full-file rewrite."
+            "Replace a unique span in an existing file (prefer over WriteFile for small edits). "
+            "Matching: exact, then tolerant of line endings, trailing spaces and a consistent "
+            "indentation difference (the file's indentation is kept). Line endings, BOM and file "
+            "mode are preserved. Fails closed (no write): if old_string occurs more than once "
+            "the error lists each occurrence (line + enclosing symbol); retry with line=N. If "
+            "not found, the error includes the closest region verbatim. Success returns the "
+            "changed line span and a syntax_error field if a .py/.json file stopped parsing. "
+            "The previous version is backed up to .g023/backups/. Requires confirmation."
         ),
         "parameters": {
             "type": "object",
@@ -201,8 +210,12 @@ TOOL_SCHEMAS = [
                 },
                 "replace_all": {
                     "type": "boolean",
-                    "description": "Replace every occurrence. Default false (unique-match only).",
+                    "description": "Replace every occurrence (exact matches only). Default false.",
                     "default": False,
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "1-based line inside the intended occurrence when old_string is not unique.",
                 },
             },
             "required": ["path", "old_string", "new_string"],
@@ -212,7 +225,12 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "name": "ListDir",
-        "description": "List directory contents with basic metadata (name, type, size).",
+        "description": (
+            "List directory contents with basic metadata (name, type, size). A directory "
+            "too big for an exact list returns a digest instead: numbered names collapsed "
+            "into templates with counts (frame_{0000..3999}.png x4000), sibling dirs with "
+            "a shared layout as one row, and per-directory file counts, extension mix and size."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -333,7 +351,7 @@ TOOL_SCHEMAS = [
                 },
                 "reasoning": {
                     "type": "string",
-                    "enum": ["none", "low", "medium", "high"],
+                    "enum": ["none", "low", "high"],
                     "description": (
                         "Optional reasoning effort for the subagent turn. "
                         "Clamped to what the backend model supports."
@@ -366,49 +384,61 @@ TOOL_SCHEMAS = [
     },
     {
         "type": "function",
-        "name": "FetchUrl",
+        "name": "WebSearch",
         "description": (
-            "Fetch a web page and return its readable text (not raw HTML). "
-            "Always asks the user for permission first, and when a cached copy "
-            "exists the user chooses between the cache and a fresh fetch. "
-            "Requests are made with a real browser's headers, protocol and cookies. "
-            "No JavaScript is executed, so app-shell pages may return little text. "
-            "To find a page in the first place, search the web instead — then fetch "
-            "the specific URL you want in full."
+            "Search the web (DeepSeek Search API). Use it whenever the answer depends on current "
+            "facts, or on a library or API you are not certain about. Returns ranked hits: title, "
+            "url, site, date and a ~700-char abstract. Operators: site:, -site:, \"exact phrase\", "
+            "-term, lang:en, after:2025, before:2026-06-01, OR between site: clauses. "
+            "Results are cached machine-wide (time-sensitive queries 6 h, others 7 days), so "
+            "repeating a query is free; order, case and close rewordings reuse it (the header "
+            "note names the cached query). A hit marked 'page cached' can be read with FetchUrl at no cost."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The http(s) URL to fetch",
+                "query": {"type": "string", "description": "1-128 characters"},
+                "count": {"type": "integer", "description": "Hits to show, 1-20 (default 5)", "default": 5},
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Bypass the cache (only when a cached answer is stale for the task)",
+                    "default": False,
                 },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "FetchUrl",
+        "description": (
+            "Read a web page as Markdown (DeepSeek Fetch API; no JavaScript). Pages are cached "
+            "machine-wide, and pages of WebSearch hits are usually cached already. A page up to "
+            "8k chars comes back whole. A longer one returns a char window plus an outline of "
+            "'@offset heading (size)'. Pass focus='topic' to get the best-matching sections "
+            "instead, or offset=N to continue from a position. Result: one JSON header line "
+            "(url, title, chars, source, shown, next_offset), then '-----' and the text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The http(s) URL"},
+                "focus": {
+                    "type": "string",
+                    "description": "Return the sections that best match this topic (ranked locally, no extra cost)",
+                },
+                "offset": {"type": "integer", "description": "Start at this char offset (from the outline or next_offset)"},
+                "max_chars": {"type": "integer", "description": "Window size, 500-40000 (default 8000)", "default": 8000},
                 "cache_mode": {
                     "type": "string",
                     "enum": ["auto", "fresh", "cache"],
-                    "description": (
-                        "auto = use a cached copy younger than max_age, else fetch; "
-                        "fresh = always hit the network; "
-                        "cache = only use the cache, never the network. "
-                        "The user can override this at the permission prompt."
-                    ),
+                    "description": "auto = cached copy if fresh for this kind of page; fresh = network; cache = never network",
                     "default": "auto",
                 },
                 "max_age": {
                     "type": "integer",
-                    "description": "In auto mode, the oldest acceptable cached copy, in seconds (default 3600)",
-                    "default": 3600,
-                },
-                "extract": {
-                    "type": "string",
-                    "enum": ["text", "markdown", "links", "raw"],
-                    "description": "How to render the page. Use 'raw' only when the exact markup matters.",
-                    "default": "text",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Truncate the returned content to this many characters (default 20000)",
-                    "default": 20000,
+                    "description": "Optional: oldest acceptable cached copy in seconds (overrides the page-kind default)",
                 },
             },
             "required": ["url"],
@@ -421,7 +451,7 @@ TOOL_SCHEMAS = [
         "description": (
             "Search short routing lines for procedures learned in earlier sessions, "
             "including other projects. Returns titles and when-tags, not full guides. "
-            "Use when a tool fails or the task involves a local browser, MCP, Ollama, "
+            "Use when a tool fails or the task involves a local browser, MCP, a local model server, "
             "or a workflow you have not used this session."
         ),
         "parameters": {
@@ -537,6 +567,30 @@ TOOL_SCHEMAS = [
                 },
             },
             "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "LocalAsk",
+        "description": (
+            "Free reading on this machine's small local model (no paid tokens). Give a focused "
+            "question and up to 8 project files (including .g023/vault/ files of earlier long outputs), "
+            "or no paths to search the whole project (where is X handled / how does Y work). "
+            "Returns a short lead plus verbatim cited lines (path:line: text) copied from the files. "
+            "Verify the lead by its lines. Not for GPU-work tasks."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "What to find or extract"},
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Project-relative files to read; omit to search the whole project",
+                },
+            },
+            "required": ["question"],
             "additionalProperties": False,
         },
     },

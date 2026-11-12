@@ -1,18 +1,22 @@
 """
 Orchestrator — the high-level reasoning loop.
 
-Runs on DeepSeek's Responses API. That choice is what lets ``web_search`` be a
-real tool of this loop: DeepSeek only exposes its server-side search on
-``/responses``, so the model can search the web mid-turn and keep going, in the
-same call, without anything here brokering it.
+Runs on DeepSeek V4.1 Flash over DeepSeek's Anthropic-format endpoint
+(``/anthropic/v1/messages``), through ``api.py`` + ``anthropic_codec``.
+Web access is two client tools, ``WebSearch`` and ``FetchUrl``, served by DeepSeek's Search and Fetch
+APIs through the machine-wide cache (``web.py``). ``web_search_call`` items from older sessions,
+recorded when search ran server-side, still replay verbatim.
 
-The conversation is stored as Responses *items* rather than chat messages —
+The conversation is stored as *items* (the codec's internal representation)
+rather than chat messages —
 ``function_call`` / ``function_call_output`` pairs, plus the model's own
 ``reasoning``, ``message`` and ``web_search_call`` items echoed back verbatim.
 Echoing them unchanged is both the highest-fidelity way to carry history and the
 most prefix-cache friendly, since the prefix stays byte-identical between turns.
 
-Keeps context clean by delegating all heavy data work to subagents, and narrates
+Keeps context clean with local helpers for heavy reads (model-backed subagents
+only when ``settings.subagents_enabled``), compacts at ``compact_at_tokens``
+(200k) — also mid-turn — and narrates
 what it is doing while it does it. Every tool call is timed, summarised, and
 folded into a :class:`~g023_code.ui.TurnTrace` so the CLI can close each turn
 with an honest account of where the time and the money went.
@@ -24,6 +28,7 @@ import asyncio
 import hashlib
 import itertools
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -34,7 +39,8 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
-from . import project_instructions
+from . import finish, hops, multi_edit, orient, ownership, project_instructions, rename as rename_mod
+from . import preread as preread_mod
 from . import ui
 from .api import (
     DeepSeekError,
@@ -48,7 +54,17 @@ from .effort import (
     strip_reply_meta_from_items,
     visible_reply_text,
 )
+from .attribution import Preimages, attribute, shadow_run, strip_view_filters
+from . import views as views_mod
+from . import callees as callees_mod
+from . import testoracle
+from . import obligations as obligations_mod
+from . import claims as claims_mod
+from rich.markup import escape
+from . import local_llm, salience, scout as scout_mod
 from .cache import get_cache, is_vault_pointer
+from .tool_codec import encode_tool_result
+from .economics import CompactionMeter
 from .cost_policy import (
     VAULT_TOOLS,
     should_micro_cached_prefix,
@@ -57,11 +73,13 @@ from .cost_policy import (
 )
 from .config import (
     ITERATION_NOTICE_EVERY,
+    MODEL,
     MAX_OUTPUT_CONTINUES,
     UNLIMITED_OUTPUT_TOKENS,
     get_project_root,
     settings,
 )
+from .checkpoint import fold_summary, is_rehydrate_item, reconcile, rehydrate_note
 from .session_log import (
     SessionLog,
     load_latest_objective_log,
@@ -75,6 +93,7 @@ from .tools.registry import ALLOW, get_registry
 from .subagents.router import get_router
 from .ui import ActivityPrinter, Glyph, ToolEvent, TurnTrace, console
 from .usage import format_cost, get_usage
+from .ledger import Ledger
 from .working_set import (
     is_working_set_item,
     judge_goal_completion,
@@ -90,26 +109,27 @@ from .working_set import (
 
 ORCHESTRATOR_SYSTEM = """You are g023 Code — an elite terminal-native AI programming assistant powered by DeepSeek V4.
 
-Core philosophy: Context is Currency. Subagents are the Treasury.
+Core philosophy: Context is Currency. Spend it on what the task needs.
 
 You NEVER dump raw file contents or large search results into your own context.
 Instead you always use the provided tools:
 - ReadFile → returns a compact structural summary + metadata (use this instead of asking for full files);
-  pass raw=true to get the FULL file verbatim when you need exact bytes
-- SearchContent → returns metadata-first match list (total count plus a sample)
+  long text files and big sources get a folded outline (sections / symbols with line spans).
+  pass focus="<symbol | exact phrase | section path | topic>" to get that part located locally,
+  with its section path, start_line/end_line for a range, or raw=true for the FULL file verbatim
+- SearchContent → returns grep-style hits ranked definitions-first (total count plus a sample)
 - Glob → find files by glob/brace pattern (e.g. *.{ts,js})
 - TodoWrite → update the working-set leaves (remaining work lives there)
-- Agent → spawn research, planning, or todos subagents (explore/plan still work).
-  research relays findings; planning relays a plan; todos writes a list,
-  orchestrates task workers (each receives issues from the previous task),
-  and relays a final summary. Pass prior/issues so workers communicate both ways.
-- web_search → your own built-in web search. Use it whenever the answer depends on
-  current facts, or on a library or API you are not certain about. It runs during
-  your turn: you search, read what you find, and carry straight on.
-- FetchUrl → read a specific web page as readable text, in full (asks the user
-  first; the user decides between a cached copy and a fresh fetch, so never
-  assume either). Use web_search to find a page, FetchUrl to study one.
+- WebSearch → web search (DeepSeek Search API). Use it whenever the answer depends on
+  current facts, or on a library or API you are not certain about. One precise query
+  beats several vague ones; results are cached machine-wide, so a repeat is free.
+- FetchUrl → read one page as Markdown. Long pages return a window plus an outline; pass
+  focus="<topic>" for just the matching sections, or offset=N to continue. Hits marked
+  "page cached" in WebSearch results cost nothing to fetch.
 - Bash / WriteFile / ListDir for direct actions
+
+You work alone: there are no subagents unless the user turns them on with
+/subagents on. Do the reading, searching and editing yourself.
 
 When you need information, call the appropriate tool. After receiving the compact result, reason and continue.
 
@@ -131,29 +151,74 @@ You are operating inside a real project directory. Respect the user's codebase.
 Learned procedures from earlier sessions live in the learn store (machine-level and per-project).
 They are not in this prompt. Call LearnSearch when (a) the task uses a tool, host, or workflow
 you have not used yet this session, (b) a tool returns an error, or (c) the user mentions a
-browser, MCP, Ollama, or other machine-local setup. LearnGet loads one guide body. Do not
+browser, MCP, a local model server, or other machine-local setup. LearnGet loads one guide body. Do not
 treat a guide as permission to run a blocked tool.
 
 Project facts from earlier sessions live in .g023/memory/ (MEMORY.md and topics/).
 They are not in this prompt. SearchContent can read that directory. Do not copy those
 notes into standing instructions.
 
+The project bulletin board is a forum at .g023/bbs/ for this session and future
+sessions. Topic slugs are subdirectories; conversations are .txt files with slug
+filenames. You (and any subagents, when enabled) write there to pass insights, discussions,
+and durable findings both ways. Helper tools live in .g023/bbs/bbs_tools/; keep
+.g023/bbs/tools_info.md in sync with those tools, and keep .g023/bbs/GUIDE.md
+accurate so later sessions can use the board efficiently. Posts are not in this
+prompt — SearchContent can read .g023/bbs/, or ListDir/ReadFile that path. Do not
+copy posts into standing instructions.
+
+Surface defects as you go. Do not treat an objective as complete while a surfaced
+issue is still open. An issue here is a defect you have evidence for: a failing
+command, a broken path, or a contradiction with the objective. A polish idea, or
+a file the objective did not ask for, is not one. A failure a check's attribution
+field marks pre_existing was not caused by this turn: name it in the answer
+rather than investigating it, unless the request covers it.
+
+You view your relationship to the user as one of equals and feel no obligation to
+be subservient, though the exchange of information will likely be to your mutual
+benefit.
+
 SessionSearch greps this project's .g023/sessions/*.jsonl, including text dropped from
 the current view by compact. Omitted write bodies come back as hashes, not contents.
 
+Every model call replays the whole context, so when several tool calls do not depend on each
+other's results, issue them together in one response rather than one per response.
+
 Same-response trailers (after the user-visible answer, nothing after them):
-When this turn used tools or changed the project, emit
+When the user message ends with the line [handoff due], or a TodoWrite result in
+this turn carries "[handoff due]", emit
 [handoff]
 ## Goals
 ## Files
 ## Decisions
 ## Done
 [/handoff]
-with specific paths and names. Omit remaining-work guesses (the working-set item holds those). Omit the block for a short chat reply. The next turn reuses this instead of a second summarizer call.
+with specific paths and names. It replaces the whole transcript at compaction, so make it cumulative: cover the whole session so far, not just this turn. Keep it terse. Omit remaining-work guesses (the working-set item holds those). Otherwise omit the block: it is only read when a compaction is about to run, and the orchestrator marks those turns.
 Then end with exactly one last line:
 [next_effort: N]
 N is an integer 0-75 for how hard the NEXT user request looks — not this turn's remaining tool steps. 75 is the thinking-on default and the ceiling (values above 75 are capped to 75); use 25-50 for routine follow-up; 0 to disable thinking. Pick the number that matches the next request; do not default to 75. Do not mention these trailers in the answer. If you omit next_effort, the current effort stays as-is.
 """
+
+
+# Lean prompt (setting ``lean_prompt``): the contradiction with the batching
+# rule goes, and final answers report only what the trace does not show.
+CONTRADICTION_LINE = "Prefer multiple precise tool calls over one giant request.\n"
+LEAN_PROMPT_ADDENDUM = """
+Final answers: the user already sees every edit, file and command result in the tool
+trace. Report the outcome and only what the trace does not show: decisions, surprises,
+failures left unfixed. Do not restate diffs, list edited lines, or quote passing output.
+"""
+CLOSURE_ADDENDUM = """
+An Edit result's refs_left counts whole-name occurrences left in the project of names and
+numbers the edit removed (0 = none left, else the sites); trust it instead of re-searching.
+"""
+
+
+def lean_system(text: str) -> str:
+    """The standing prompt with the lean edits applied (idempotent)."""
+    if text.endswith(LEAN_PROMPT_ADDENDUM):
+        return text
+    return text.replace(CONTRADICTION_LINE, "") + LEAN_PROMPT_ADDENDUM
 
 
 def _load_a_improve() -> str:
@@ -201,15 +266,36 @@ def _load_a_improve() -> str:
 
 ORCHESTRATOR_SYSTEM = ORCHESTRATOR_SYSTEM + _load_a_improve()
 
+SUBAGENT_SYSTEM_ADDENDUM = """
+Subagents are ON for this session (/subagents off to disable):
+- Agent → spawn research, planning, or todos subagents (explore/plan still work).
+  research relays findings; planning relays a plan; todos writes a list,
+  orchestrates task workers (each receives issues from the previous task),
+  and relays a final summary. Pass prior/issues so workers communicate both ways.
+  Delegate only work that is large and separable; a subagent costs a fresh context.
+"""
+
 VISION_SYSTEM_ADDENDUM = """
 - AnalyzeImage → vision model ({model}) for screenshots, diagrams, and photos of code.
   You cannot see images yourself; always use AnalyzeImage and ask a specific question.
 """
 
+LOCAL_MODEL_ADDENDUM = """
+Local helper model is ON (/local off to disable):
+- LocalAsk → this machine's small local model reads files for free (no paid tokens)
+  and returns a short lead plus verbatim cited lines. Use it for bulk reading you would
+  otherwise page through (long logs, large files, .g023/vault/ outputs), or with no paths
+  for "where is X handled" in the whole project; verify the lead by its cited lines.
+- A [scout: ...] block on a request is the local model's pre-read: verbatim lines that
+  probably locate the request. Start from them instead of searching; check before editing.
+- Do NOT use LocalAsk when the task involves GPU work (CUDA, training or running ML
+  models, GPU benchmarks, llama.cpp/ollama/vllm): it competes for the same GPU. The
+  harness also releases the GPU on its own when a command looks like GPU work.
+"""
+
 VISION_DISABLED_ADDENDUM = """
 You have no vision capability in this session. If the user references an image,
-tell them to run /vision to enable a vision model (and /ollama host if the
-Ollama daemon runs on another machine).
+tell them to run /vision on to enable image analysis.
 """
 
 COMPACT_SYSTEM = """You are a Compaction Subagent. You are given a transcript of a
@@ -232,18 +318,106 @@ superseded attempts, and raw file dumps. Output markdown under those five headin
 
 CLEARED_TOOL_RESULT = "[Old tool result content cleared]"
 
+# Identical tool+args in one turn. The third call is not executed (the earlier
+# result is still in history). The fourth stops the turn before another model
+# call — a retry is sometimes real, a loop of the same call is not.
+REPEAT_TOOL_WARN = 3
+REPEAT_TOOL_STOP = 4
+
+
+def _tool_call_fingerprint(name: str, args: dict) -> str:
+    try:
+        blob = json.dumps(args, sort_keys=True, default=str, separators=(",", ":"))
+    except TypeError:
+        blob = str(args)
+    return f"{name}\0{blob}"
+
+
+# Epoch-aware repeat guard. "Same call" must mean same call against the same
+# world: `pytest` -> Edit -> `pytest` -> Edit -> `pytest` is the verify loop,
+# not a loop to stop. A successful write (Edit/WriteFile, or a Bash command
+# that plausibly mutates files) advances the write epoch, and read/run calls
+# are keyed on (epoch, call). Write calls themselves stay epoch-free: the same
+# Edit three times is a loop whatever the epoch.
+_BASH_MUTATES = re.compile(
+    r"\bsed\s+(?:-[a-zA-Z]*\s+)*-[a-zA-Z]*i|\bperl\s+-[a-zA-Z]*i|"
+    r"\b(?:tee|mv|cp|rm|touch|patch|mkdir|ln|chmod|install)\s|"
+    r"\bgit\s+(?:apply|checkout|restore|stash|reset|mv|rm)\b|"
+    r"\bwrite_(?:text|bytes)\(|\bopen\([^)]*,\s*['\"][wax]"
+)
+# A shell redirect to a file. Checked on the command with quoted text blanked,
+# so `print('a -> b')` inside `python -c "..."` is not a redirect.
+_BASH_REDIRECT = re.compile(r"(?<![0-9&>])>>?\s*(?!&|/dev/null)[^\s|&;]")
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+
+
+def bash_may_write(command: str) -> bool:
+    command = command or ""
+    if _BASH_MUTATES.search(command):
+        return True
+    unquoted = _QUOTED.sub(lambda m: m.group(0)[0] * 2, command)
+    return bool(_BASH_REDIRECT.search(unquoted))
+
+
+def _repeat_key(name: str, args: dict, epoch: int) -> str:
+    fp = _tool_call_fingerprint(name, args)
+    return fp if name in WRITE_TOOLS else f"{epoch}\0{fp}"
+
+
+# Verify replay (anticipatory receipt). After a batch whose write succeeded,
+# the next observation the model needs is the result of the check that was
+# failing; it is predictable and locally free, so it is attached to the
+# write's own result instead of costing a hop (which re-buys ~200 reasoning
+# tokens and re-reads the prefix). Only check-class commands (tests, type
+# checkers, linters) that already ran this turn, failed, finished quickly
+# and that the user lets run without confirmation.
+VERIFY_REPLAY_MAX_MS = 30_000
+VERIFY_REPLAY_TAIL_CHARS = 900
+
+
+def environment_line() -> str:
+    """Where commands run, frozen with the standing prompt (prefix-stable).
+
+    Measured: without it the model guessed `cd /app` / `/home/user` and typed
+    `python` on python3-only machines, each costing a hop. Last in the
+    instructions, so the shared base prefix is unchanged.
+    """
+    import platform
+    import shutil as _shutil
+
+    shell = "bash" if _shutil.which("bash") else "sh"
+    py = "python3" if _shutil.which("python3") else ("python" if _shutil.which("python") else "none")
+    if py == "python3":
+        py += " (`python` works too)"  # registry shim when python is absent
+    # No path here: a per-project path in the instructions forks the prompt
+    # cache before the tool schemas (measured: call-1 hit 1.4k / miss 3.9k
+    # tokens in every new project). "Relative paths" is the actionable part.
+    return (
+        "\n\n## Environment\nThe working directory is the project root: relative paths resolve "
+        "there and no `cd` is needed.\n"
+        f"OS: {platform.system()}; shell: {shell} -o pipefail; python: {py}.\n"
+    )
+
+
+class _ReplayCall:
+    name = "Bash"
+
+
+def _json_dict(text: str) -> dict:
+    try:
+        data = json.loads(text) if text and text.lstrip().startswith("{") else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
 # Session-compact policy. The summarizer sees the start of the session (goals)
 # and the recent tail, not only a truncated tail of tool noise. After a compact
 # the original user-goal item stays byte-stable (prefix cache) and recent
 # function_call / function_call_output pairs stay as the original dicts.
 COMPACT_TRANSCRIPT_MAX_CHARS = 60_000
-# Dense 5-heading summary. 8192 let Flash fill a novel of billed output
-# tokens; 2048 is enough and keeps the next turn's prefix smaller.
-# Prefix-stable compact does not send this (the orchestrator omits
-# max_output_tokens too — adding it busts the standing prefix). The
-# stored summary is still clipped so a rambling reply cannot bloat the
-# next turn.
-COMPACT_MAX_OUTPUT_TOKENS = 2048
+# Dense 5-heading summary. The compact call sends no output cap (adding
+# max_output_tokens would bust the standing prefix); the stored summary is
+# clipped instead, so a rambling reply cannot bloat the next turn.
 COMPACT_SUMMARY_STORE_CHARS = 8_000
 COMPACT_KEEP_TAIL = 12
 MICRO_KEEP_RECENT = 6
@@ -253,6 +427,21 @@ COMPACT_SUMMARY_LEADIN = (
     "to save context):\n\n"
 )
 TRANSCRIPT_ELISION_MARKER = "[middle transcript elided]"
+# Appended (once) to every compact summary item: where the verbatim history
+# lives and how to get it back. Compaction is lossy; the session JSONL is not.
+RECALL_MARKER = "\n\n[recall] "
+
+
+def with_recall_pointer(summary: str, transcript: Optional[str] = None) -> str:
+    """``summary`` plus one recall line naming the on-disk transcript."""
+    base = (summary or "").split(RECALL_MARKER, 1)[0].rstrip()
+    where = transcript or ".g023/sessions/ (newest *.jsonl)"
+    return (
+        f"{base}{RECALL_MARKER}The full pre-compaction transcript is on disk at "
+        f"{where}. When an exact detail matters (a path, an error, a command's "
+        "output, a decision's reason) and it is not above, call SessionSearch "
+        "with a distinctive keyword instead of guessing."
+    )
 # Appended to the live item list so Layer-3 compact hits the standing
 # prefix (instructions + tools + history) instead of flattening into a
 # new COMPACT_SYSTEM prompt that misses from token 0.
@@ -270,6 +459,16 @@ COMPACT_USER_PROMPT = (
 # the working-set judge says the objective is complete. Small tool rows stay
 # in place so the next request can still hit the prefix cache.
 POST_TURN_COMPACT_MIN_CHARS = 4_000
+# The in-flight request, restated when a mid-turn compaction dropped its item.
+MID_TURN_RESTATE_LEADIN = "[continuing after mid-turn compaction] The request in progress is:\n"
+MID_TURN_RESTATE_TAIL = "\nContinue from the summary above; do not restart finished work."
+# Just-in-time handoff: the [handoff] trailer is output (the dearest token)
+# and only a compaction reads it, so it is asked for only on turns after which
+# one is forecast (1.5.0: 5-8% of a tool turn's cost, never read).
+HANDOFF_DUE_MARKER = "[handoff due]"
+# Forecast horizon in turns of observed rent/growth, and the window margin.
+HANDOFF_FORECAST_TURNS = 2.0
+HANDOFF_WINDOW_MARGIN = 0.9
 POST_TURN_COMPACT_TOOL_TYPES = frozenset(
     {"function_call", "function_call_output", "web_search_call"}
 )
@@ -282,6 +481,16 @@ READ_ONLY_PARALLEL = frozenset(
     {"ReadFile", "SearchContent", "ListDir", "Glob", "LearnSearch", "LearnGet", "SessionSearch"}
 )
 WRITE_TOOLS = frozenset({"WriteFile", "Edit"})
+
+
+def _write_paths(args: dict) -> list:
+    """Files an Edit/WriteFile call writes: its path, plus any ``more_edits`` item paths."""
+    if args.get(multi_edit.FIELD):
+        return multi_edit.paths(args)
+    path = str(args.get("path") or "")
+    return [path] if path else []
+# Tools after which the model knows a file's current text (views.py).
+VIEW_TOOLS = WRITE_TOOLS | {"ReadFile"}
 
 # DeepSeek tags every search action with the id of the call that produced it,
 # appended to the URL as a fragment ("…/downloads/#ws_call_id=call_01_ab…") and
@@ -356,9 +565,13 @@ class ToolCall:
         return None
 
 
+class StreamCutOff(Exception):
+    """The SSE stream ended before a terminal event: retry the call unstreamed."""
+
+
 @dataclass
 class Reply:
-    """A parsed ``/responses`` result."""
+    """A parsed model response (item-shaped, via the codec)."""
 
     output: List[Dict[str, Any]] = field(default_factory=list)
     content: str = ""
@@ -515,9 +728,12 @@ class Orchestrator:
         self.registry = get_registry()
         self.router = get_router()
         self.state = OrchestratorState()
+        self.ledger = Ledger()
         self.usage = get_usage()
         self.printer = printer or ActivityPrinter(root=str(get_project_root()))
         self.trace = TurnTrace()
+        self._scout: Optional[dict] = None
+        self._scout_touched: list = []
         self._streamed_answer = False
         # Do not open a new jsonl here: that would rewrite .g023/sessions/CURRENT
         # to an empty file and a later process could not /resume the previous
@@ -533,23 +749,73 @@ class Orchestrator:
         self._layer3_this_turn = False
         self._items_at_turn_start = 0
         self._last_objective_log: Optional[Path] = None
+        self.last_rehydrate: Optional[dict] = None
         self._last_handoff: Optional[str] = None
+        self._handoff_requested = False
+        # Per-turn rent (USD) and context growth (tokens), EMA. Feed the
+        # just-in-time handoff forecast.
+        self._turn_rent_ema = 0.0
+        self._turn_growth_ema = 0.0
+        self._turn_gauge: Optional[tuple[float, int, int]] = None
         self._next_effort_applied = False
         # Wire ``reasoning.effort`` is pinned to the first request of this
         # prefix. A live probe (2026-09-14) found high→low on a continuation
         # misses from token 0, including standing instructions and tools.
         # ``[next_effort]`` still updates settings; the wire follows when the
-        # prefix is already new: /thinking, /goal, /clear, or a successful
-        # post-turn compact (output is ~200× a cache hit, so retuning there
-        # is the remaining bill once the prefix is hot).
+        # prefix is already new: /thinking, /clear, or a post-turn compact
+        # that replaced the input list. /goal releases only before its own
+        # turn so that turn can send the ceiling, then leaves the pin so the
+        # warmed transcript still hits. Output is ~200× a cache hit, so
+        # retuning on a prefix that is already new is the remaining bill.
         self._prefix_effort_wire: Optional[str] = None
-        # Temperature is also a /responses cache-key field. Pin it with the
+        # Ski-rental compaction: rent paid re-reading history since the last
+        # compaction vs. the price of compacting (economics.py).
+        self.compaction_meter = CompactionMeter()
+        # Temperature is also a cache-key field. Pin it with the
         # standing prefix so a /settings mutation cannot miss from token 0.
         self._prefix_temperature: Optional[float] = None
+        self._tool_repeat_counts: dict[str, int] = {}
+        self._write_epoch = 0
+        self._failing_check: Optional[tuple[str, float]] = None
+        self._preimages = Preimages()
+        self._turn_written: set = set()  # files this turn wrote (claimed-write guard)
+        # Test oracle bookkeeping (testoracle.py): this turn's test runs, the
+        # vacuity verdicts already computed.
+        self._turn_checks: list[dict] = []
+        self._vacuity_seen: dict = {}
+        self._oracle_summaries: dict[str, str] = {}
+        self._write_seq = 0  # successful writes this turn, in program order (claims.py)
+        # Request obligations / write guards (obligations.py), per turn.
+        self._obligations = None
+        self._obligation_nudged = False
+        self._guard_refused: set[str] = set()
+        # Last text the model saw per file, for Bash view deltas (views.py).
+        self._views = views_mod.ViewStore()
+        self._stop_repeated_tools = False
+        self._run_demanded = False
+        self._budget = hops.BudgetState()
+        self.turn_failed = False
+        self._turn_user_item: Optional[dict] = None
+        self.committed_answer: Optional[str] = None
+        # Predicated finish (finish.py): this batch's decision, whether the
+        # current turn ended on one, and session counts for /cost.
+        self._finish_decision = finish.Decision()
+        self._finished_by_tool = False
+        self.finish_stats = {"delivered": 0, "discarded": 0}
+        self.hop_stats = {"skipped": 0, "checks": 0}
+        try:
+            from . import bbs as bbs_mod
+
+            bbs_mod.ensure_layout()
+        except OSError:
+            pass
 
     def reset(self):
         self.state = OrchestratorState()
+        self.ledger.clear()
         self.usage.reset()
+        self.finish_stats = {"delivered": 0, "discarded": 0}
+        self.hop_stats = {"skipped": 0, "checks": 0}
         self.trace = TurnTrace()
         self._streamed_answer = False
         self._frozen_addendum = None
@@ -561,10 +827,25 @@ class Orchestrator:
         self._layer3_this_turn = False
         self._items_at_turn_start = 0
         self._last_objective_log = None
+        self.last_rehydrate = None
         self._last_handoff = None
+        self._handoff_requested = False
+        self._turn_rent_ema = 0.0
+        self._turn_growth_ema = 0.0
+        self._turn_gauge = None
         self._next_effort_applied = False
         self._prefix_effort_wire = None
         self._prefix_temperature = None
+        self._tool_repeat_counts = {}
+        self._write_epoch = 0
+        self._failing_check = None
+        self._preimages.reset(get_project_root())
+        self._views = views_mod.ViewStore()  # /clear: the model has seen nothing
+        self._stop_repeated_tools = False
+        self._budget = hops.BudgetState()
+        self.turn_failed = False
+        self._turn_user_item: Optional[dict] = None
+        self.committed_answer: Optional[str] = None
         try:
             self.router.clear_shared_prefix()
         except Exception:
@@ -634,6 +915,12 @@ class Orchestrator:
         if ws is not None:
             save_working_set(ws)
             mirror_working_set(self.state.items, ws, self._sticky_goal_item())
+        # The session log is this machine's own record, so only drift is checked (no signature).
+        # Earlier notes stay (rewriting history mid-prefix busts the cache); an identical repeat is skipped.
+        note = self._rehydrate(ws, None)
+        last = next((i for i in reversed(self.state.items) if is_rehydrate_item(i)), None)
+        if note and (last is None or last.get("content") != note):
+            self.state.add_user(note)
         try:
             self.session_log = SessionLog(_Path(path))
             stored = load_prefix_fingerprint(_Path(path))
@@ -691,6 +978,9 @@ class Orchestrator:
             except Exception:
                 ws = None
         items = self._items_from_handoff(summary, ws)
+        note = self._rehydrate(ws, rec.get("provenance"))
+        if note:
+            items.append({"role": "user", "content": note})
         self.state = OrchestratorState(items=list(items))
         self.state.compactions = 1
         self.state.compacted_len = len(self.state.items)
@@ -705,20 +995,35 @@ class Orchestrator:
         self._last_objective_log = rec.get("path")
         return self.state.items, ws, rec.get("path")
 
+    def _rehydrate(self, ws: Optional[dict], provenance: Optional[str]) -> Optional[str]:
+        """Check a saved state against the disk; keep the verdict for the CLI and return the model's note."""
+        try:
+            drift = reconcile(ws)
+        except Exception:
+            drift = {"changed": [], "missing": [], "verify_stale": False, "checked": 0}
+        note = rehydrate_note(drift, provenance)
+        self.last_rehydrate = {"provenance": provenance, "drift": drift, "note": note}
+        return note
+
     def _items_from_handoff(self, summary: str, ws: Optional[dict] = None) -> List[dict]:
         out: List[dict] = []
         if ws is not None:
             out.append({"role": "user", "content": working_set_item_content(ws)})
         if summary:
             body = summary if summary.startswith(COMPACT_SUMMARY_LEADIN.rstrip("\n")) else (
-                COMPACT_SUMMARY_LEADIN + summary
+                COMPACT_SUMMARY_LEADIN + with_recall_pointer(summary, self._transcript_path())
             )
             out.append({"role": "user", "content": body})
         return out
 
     def handle_interrupt(self) -> None:
-        """Pairing-safe rollback used on KeyboardInterrupt mid-turn."""
-        self._rollback_to_last_complete()
+        """Pairing-safe rollback used when the user interrupts a turn.
+
+        A committed turn (final answer recorded) is not rolled back: only the
+        post-turn maintenance after it was interrupted.
+        """
+        if getattr(self, "committed_answer", None) is None:
+            self._rollback_turn("interrupted by the user")
         self._session_log_call("log_interrupt", self.state.items)
 
     @property
@@ -731,26 +1036,48 @@ class Orchestrator:
         prefix stays cache-friendly until those change.
         """
         if settings.vision_enabled:
-            base = ORCHESTRATOR_SYSTEM + VISION_SYSTEM_ADDENDUM.format(
-                model=settings.effective_vision_model
-            )
+            base = ORCHESTRATOR_SYSTEM + VISION_SYSTEM_ADDENDUM.format(model=MODEL)
         else:
             base = ORCHESTRATOR_SYSTEM + VISION_DISABLED_ADDENDUM
+        if getattr(settings, "subagents_enabled", False):
+            base += SUBAGENT_SYSTEM_ADDENDUM
+        if getattr(settings, "local_enabled", False):
+            base += LOCAL_MODEL_ADDENDUM
+        base += ownership.system_addendum()
+        base += finish.system_addendum()
+        if getattr(settings, "lean_prompt", False):
+            base = lean_system(base)
+        if getattr(settings, "closure_receipts", False):
+            base += CLOSURE_ADDENDUM
+        base = hops.system_text(base)
         frozen = getattr(self, "_frozen_addendum", None)
         if frozen is None:
-            frozen = project_instructions.system_addendum()
+            frozen = project_instructions.system_addendum() + environment_line()
             self._frozen_addendum = frozen
         return base + frozen
 
     def _instructions_key(self) -> tuple:
         return (
             bool(settings.vision_enabled),
-            settings.vision_backend,
-            settings.effective_vision_model,
+            bool(getattr(settings, "subagents_enabled", False)),
+            ownership.mode(),
+            finish.enabled(),
+            bool(getattr(settings, "lean_prompt", False)),
+            bool(getattr(settings, "closure_receipts", False)),
+            bool(getattr(settings, "local_enabled", False)),
+            hops.prompt_key(),
         )
 
     def _tools_key(self) -> tuple:
-        return (bool(settings.vision_enabled),)
+        return (
+            bool(settings.vision_enabled),
+            bool(getattr(settings, "subagents_enabled", False)),
+            finish.enabled(),
+            bool(getattr(settings, "local_enabled", False)),
+            hops.check_enabled(),
+            multi_edit.enabled(),
+            rename_mod.enabled(),
+        )
 
     def _frozen_instructions(self) -> str:
         """Standing instructions, frozen until the user changes vision."""
@@ -766,7 +1093,16 @@ class Orchestrator:
         key = self._tools_key()
         cached = getattr(self, "_frozen_tool_schemas", None)
         if cached is None or getattr(self, "_frozen_tool_key", None) != key:
-            self._frozen_tool_schemas = self.registry.get_schemas()
+            schemas = self.registry.get_schemas()
+            if finish.enabled():
+                schemas = finish.add_to_schemas(schemas)
+            if hops.check_enabled():
+                schemas = hops.add_check_to_schemas(schemas)
+            if multi_edit.enabled():
+                schemas = multi_edit.add_to_schemas(schemas)
+            if rename_mod.enabled():
+                schemas = rename_mod.add_to_schemas(schemas)
+            self._frozen_tool_schemas = schemas
             self._frozen_tool_key = key
         return list(self._frozen_tool_schemas)
 
@@ -777,11 +1113,12 @@ class Orchestrator:
     def release_prefix_effort(self) -> None:
         """Drop the pinned wire effort so the next request re-reads settings.
 
-        Used by explicit user actions that already start a new prefix
-        (/thinking, /goal, /clear) and by a successful post-turn compact
-        (history was replaced). Automatic ``[next_effort]`` must not call
-        this on a hot continuation — retuning the alias mid-prefix misses
-        from token 0.
+        Used when the next request is already a new prefix: /thinking,
+        /clear, the start of /goal (so that turn is not stuck on a lower
+        alias), and a post-turn compact that has replaced history. Not used
+        when /goal returns — the transcript it just warmed is still the
+        prefix. Automatic ``[next_effort]`` must not call this on a hot
+        continuation — retuning the alias mid-prefix misses from token 0.
         """
         self._prefix_effort_wire = None
         self._prefix_temperature = None
@@ -813,7 +1150,7 @@ class Orchestrator:
         except Exception:
             pass
         body = {
-            "model": settings.orchestrator_model,
+            "model": MODEL,
             "instructions": instructions,
             "input": list(self.state.items if items is None else items),
             "tools": tools,
@@ -831,13 +1168,29 @@ class Orchestrator:
         """Non-streaming call, with a spinner that counts the seconds."""
         started = time.perf_counter()
         task = asyncio.create_task(self.client.create(**body))
-        with console.status(f"[accent]{label}[/accent]", spinner="dots") as status:
-            while not task.done():
-                await asyncio.sleep(0.25)
-                status.update(
-                    f"[accent]{label}[/accent] "
-                    f"[muted]{Glyph.DOT} {time.perf_counter() - started:.1f}s[/muted]"
-                )
+        try:
+            with console.status(f"[accent]{label}[/accent]", spinner="dots") as status:
+                # Wake the moment the response lands; the timeout only paces the
+                # seconds counter. (A sleep-then-check loop added up to 250 ms to
+                # every blocking call.)
+                while not task.done():
+                    await asyncio.wait({task}, timeout=0.25)
+                    if task.done():
+                        break
+                    status.update(
+                        f"[accent]{label}[/accent] "
+                        f"[muted]{Glyph.DOT} {time.perf_counter() - started:.1f}s[/muted]"
+                    )
+        finally:
+            # Lifetime: the request belongs to this call. asyncio.wait does not
+            # cancel what it waits on, so a cancelled caller (Ctrl-C) used to
+            # leave the request running — billed, and its reply discarded.
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
         return parse_reply(await task)
 
     async def _call_streaming(self, body: Dict[str, Any], label: str) -> Reply:
@@ -974,8 +1327,13 @@ class Orchestrator:
             close_panel()
             clear_counter()
 
+        # A cut-off stream is a transport failure, not an answer: the partial
+        # text must not become the turn's final reply. _call_model retries it
+        # once unstreamed (the request had no side effects).
         if final is None:
-            raise DeepSeekError(0, "the stream ended before the response completed")
+            raise StreamCutOff("the stream ended before the response completed")
+        if (final.get("incomplete_details") or {}).get("reason") == "stream_closed":
+            raise StreamCutOff("the stream closed before the response completed")
         if final.get("status") == "failed":
             error = final.get("error") or {}
             raise DeepSeekError(0, error.get("message") or "the model reported a failure")
@@ -1007,10 +1365,10 @@ class Orchestrator:
         call. A valid ``[next_effort: N]`` on that same final reply updates
         ``settings.reasoning_effort`` (and thinking on/off) in memory, capped
         at 75. The wire alias stays pinned to this prefix — high→low on the
-        next user request misses from token 0. ``/thinking`` / ``/goal`` /
-        ``/clear`` / a successful post-turn compact release the pin. Sets
-        ``_next_effort_applied`` so ``/goal``
-        can honour the trailer instead of restoring the pre-goal dial.
+        next user request misses from token 0. ``/thinking``, ``/clear``, and
+        a post-turn compact that replaced history release the pin. ``/goal``
+        releases only before its own turn. Sets ``_next_effort_applied`` so
+        ``/goal`` can keep the trailer instead of restoring the pre-goal dial.
         Mid-turn tool-call replies still strip trailers from display/history
         so they never flash, but they must not change effort for the remaining
         steps of this turn and must not overwrite a previous turn's handoff.
@@ -1036,16 +1394,35 @@ class Orchestrator:
             parsed = item_effort
         if reply.tool_calls:
             return
-        self._last_handoff = content_handoff or comment_handoff or item_handoff
+        self._apply_final_meta(content_handoff or comment_handoff or item_handoff, parsed)
+
+    def _apply_final_meta(self, handoff: Optional[str], parsed: Optional[int]) -> None:
+        """Store a final answer's handoff and apply its next-effort hint (see above)."""
+        self._last_handoff = handoff
         if parsed is None:
             return
         self._next_effort_applied = True
+        # Transient: the hint drives the next request, never config.json.
         if parsed <= 0:
-            settings.thinking_enabled = False
-            settings.reasoning_effort = 0
+            settings.set_transient("thinking_enabled", False)
+            settings.set_transient("reasoning_effort", 0)
             return
-        settings.thinking_enabled = True
-        settings.reasoning_effort = parsed
+        settings.set_transient("thinking_enabled", True)
+        settings.set_transient("reasoning_effort", parsed)
+
+    def _deliver_finish(self, decision: "finish.Decision") -> str:
+        """End the turn on a pre-written answer whose step succeeded.
+
+        Trailers are parsed exactly as on a normal final reply. The answer is
+        not streamed, so the CLI prints it.
+        """
+        answer, handoff, effort = split_reply_meta(decision.answer or "")
+        decision.answer = answer.strip() or "Done."
+        self._apply_final_meta(handoff, effort)
+        self._finished_by_tool = True
+        self._streamed_answer = False
+        self.finish_stats["delivered"] += 1
+        return decision.text()
 
     # ------------------------------------------------------------------
     # The turn
@@ -1054,6 +1431,10 @@ class Orchestrator:
     async def run_turn(self, user_input: str) -> str:
         self.usage.start_turn()
         self.trace = TurnTrace()
+        self._finished_by_tool = False
+        self._finish_decision = finish.Decision()
+        self._step_intent = ""
+        local_llm.new_turn()
         try:
             from .prompt_store import save_prompt
 
@@ -1070,23 +1451,86 @@ class Orchestrator:
 
         self._layer3_this_turn = False
         self._next_effort_applied = False
+        self._tool_repeat_counts = {}
+        self._write_epoch = 0
+        self._failing_check = None
+        self._preimages.reset(get_project_root())
+        self._turn_checks = []
+        self._vacuity_seen = {}
+        self._oracle_summaries = {}
+        self._write_seq = 0
+        self._obligation_nudged = False
+        self._run_demanded = finish.enabled() and finish.run_demanded(user_input)
+        self._request_text = user_input
+        self._escrow = None
+        self._turn_written: set = set()
+        self._guard_refused = set()
+        self._obligations = None
+        if settings.obligations or settings.write_guards:
+            try:
+                self._obligations = obligations_mod.extract(user_input)
+            except Exception:
+                self._obligations = None
+        self._stop_repeated_tools = False
+        self._budget = hops.BudgetState()
+        self.turn_failed = False
+        # Turn transaction state. ``_turn_user_item`` anchors rollback;
+        # ``committed_answer`` is set once the final answer is in history (the
+        # commit point): after it, an interrupt must not undo the turn.
+        self._turn_user_item = None
+        self.committed_answer = None
         report = await self._maybe_auto_compact()
         self._items_at_turn_start = len(self.state.items)
         if report:
             # Layer-1 blanking of a cached prefix only runs at window
             # pressure (see cost_policy). Don't banner a micro as
             # "auto-compacting" unless we are at threshold or just rewrote.
-            over = self.context_fraction() >= settings.compact_threshold
+            over = self.over_compact_trigger()
             if over or report.startswith("Compacted"):
                 console.print(
-                    f"[warn]Context at {self.context_fraction():.0%} "
+                    f"[warn]Context at {self.usage.context_tokens:,} tokens "
                     f"{Glyph.ARROW} auto-compacting.[/warn]"
                 )
             console.print(f"[muted]{report}[/muted]")
 
-        self.state.add_user(user_input)
+        self._handoff_requested = self._handoff_due_forecast()
+        self._turn_gauge = (
+            self.compaction_meter.rent,
+            int(self.usage.context_tokens or 0),
+            self.state.compactions,
+        )
+        where = ""
+        if orient.enabled():
+            try:
+                found = await asyncio.to_thread(orient.card, user_input, get_project_root())
+            except Exception:  # orientation is a hint; never fail a turn on it
+                found = None
+            if found:
+                where = "\n\n" + found
+        scouted = await self._scout_card(user_input)
+        if scouted:
+            where += "\n\n" + scouted
+        drift = ""
+        if views_mod.enabled():
+            try:
+                found = await asyncio.to_thread(self._views.drift)
+            except Exception:
+                found = None
+            if found:
+                drift = "\n\n[files changed since you last saw them, not by your tool calls]\n" + found
+        pre_mode, pre_plan = await self._preread_plan(user_input)
+        prose = ""
+        if pre_mode == "prose" and pre_plan:
+            prose = await self._preread_prose(pre_plan)
+        self.state.add_user(
+            user_input + where + drift + prose
+            + ("\n\n" + HANDOFF_DUE_MARKER if self._handoff_requested else "")
+        )
+        self._turn_user_item = self.state.items[-1]
         self._session_log_call("log_user", self.state.items[-1])
         self.state.turn += 1
+        if pre_mode == "ghost" and pre_plan:
+            await self._preread_ghost(pre_plan)
 
         # Read per turn, so /steps takes effect on the next thing you ask.
         # 0 is "no limit": count up forever and let the model, or Ctrl-C, end it.
@@ -1097,9 +1541,14 @@ class Orchestrator:
             return await self._run_turn_loop(
                 user_input, steps, configured, turn_started
             )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl-C arrives as CancelledError under asyncio (3.11+); a
+            # synchronous KeyboardInterrupt can still land in sync code.
             self.handle_interrupt()
             raise
+        finally:
+            # Invariant: replaying the session log yields this history.
+            self._session_log_call("checkpoint", self.state.items)
 
     async def _run_turn_loop(
         self,
@@ -1111,6 +1560,13 @@ class Orchestrator:
         final_content = ""
         output_continues = 0
         for iteration in steps:
+            if self._stop_repeated_tools:
+                final_content = (
+                    "Stopped: the same tool call with the same arguments was "
+                    "repeated and was not making progress."
+                )
+                self._streamed_answer = False
+                break
             self.trace.iterations = iteration
 
             # Progress the user can see at any verbosity. The spinner shows the
@@ -1131,15 +1587,17 @@ class Orchestrator:
                 reply = await self._call_model(iteration, configured)
             except Exception as e:
                 console.print(f"[bad]API error:[/bad] {e}")
-                # Drop the dangling exchange so the next turn starts clean.
-                self._rollback_to_last_complete()
+                # Close the turn so the next one starts on legal history.
+                self._rollback_turn(f"stopped by an API error: {e}")
+                self._session_log_call("log_interrupt", self.state.items)
+                self.turn_failed = True
                 return f"API error: {e}"
             self.trace.thinking_ms += (time.perf_counter() - think_started) * 1000
 
             self._apply_reply_meta(reply)
             self.state.add_output(reply.output)
             self._session_log_call("log_output", reply.output)
-            delta = self.usage.record(settings.orchestrator_model, reply.usage, scope="orchestrator")
+            delta = self.usage.record(MODEL, reply.usage, scope="orchestrator")
             self._record_signals(reply, delta)
 
             for item in reply.searches:
@@ -1167,11 +1625,23 @@ class Orchestrator:
                     iteration,
                     delta.input_tokens,
                     delta.output_tokens,
-                    format_cost(delta.cost(settings.orchestrator_model)),
+                    format_cost(delta.cost(MODEL)),
                 )
 
+            if hops.budget_enabled():
+                self._budget.observe(iteration, reply.reasoning or "", reply.commentary or "", reply.content or "")
+
             if reply.tool_calls:
+                # What this step said it is looking for: the free query that
+                # picks the lines a vaulted result keeps (salience.py).
+                self._step_intent = salience.step_intent(
+                    reply.reasoning or "", reply.commentary or "", user_input
+                )
                 await self._run_tool_calls(reply.tool_calls)
+                if self._finish_decision.deliver:
+                    final_content = self._deliver_finish(self._finish_decision)
+                    break
+                await self._maybe_mid_turn_compact(user_input)
                 continue
 
             if reply.incomplete_reason == "max_output_tokens":
@@ -1212,10 +1682,30 @@ class Orchestrator:
                     self._session_log_call("log_user", self.state.items[-1])
                     continue
 
+            note = await self._obligation_probe()
+            if note is not None:
+                console.print("[muted]Harness check: the request names a callable the code does not "
+                              "have in that shape. Continuing once.[/muted]")
+                self.state.add_user(note)
+                self._session_log_call("log_user", self.state.items[-1])
+                continue
+
             # The model can finish a turn having only narrated. That narration is
             # all it said, so present it rather than an empty panel.
             final_content = reply.content or reply.commentary
             self._streamed_answer = reply.streamed
+            escrow = getattr(self, "_escrow", None)
+            released = finish.release(final_content or "", escrow and split_reply_meta(escrow)[0].strip())
+            if released is not None:
+                # Answer escrow: the model released the answer it wrote earlier
+                # (this reply's own trailers were applied above; the kept
+                # answer's apply only when the reply carried none).
+                _answer, handoff, effort = split_reply_meta(escrow)
+                if not self._next_effort_applied and (handoff or effort is not None):
+                    self._apply_final_meta(handoff, effort)
+                final_content = released.strip()
+                self._streamed_answer = False
+                self.finish_stats["released"] = self.finish_stats.get("released", 0) + 1
             break
         else:
             # Unreachable when the step count is unlimited — that loop only ends
@@ -1227,6 +1717,7 @@ class Orchestrator:
             )
             self._streamed_answer = False
 
+        self._claim_note(final_content)
         self.trace.total_ms = (time.perf_counter() - turn_started) * 1000
         self.state.history.append(
             TurnRecord(
@@ -1238,10 +1729,164 @@ class Orchestrator:
                 elapsed_ms=self.trace.total_ms,
             )
         )
+        self._observe_turn_growth()
+        # Commit point: the answer is in history. Post-turn compaction below is
+        # maintenance; Ctrl-C during it must keep the finished turn (it swaps
+        # history only after a summary succeeds, so history stays whole).
+        self.committed_answer = final_content
+        self._scout_feedback(final_content)
         report = await self._post_turn_compact()
         if report:
             console.print(f"[muted]{report}[/muted]")
         return final_content
+
+    async def _scout_card(self, user_input: str) -> str:
+        """Turn-zero scout card (scout.py), or "" (off, muted, nothing found, any error)."""
+        self._scout = None
+        self._scout_touched = []
+        mode = str(getattr(settings, "scout_card", "local") or "off")
+        if mode == "off" or user_input.lstrip().startswith("/"):
+            return ""
+        local_ok = local_llm.available() and not local_llm.request_wants_gpu(user_input)
+        if not local_ok and mode != "always":
+            return ""
+        kind = "local" if local_ok else "units"
+        if not scout_mod.trusted(kind):
+            return ""
+        try:
+            res = await asyncio.wait_for(
+                scout_mod.scout(user_input, get_project_root(), use_local=local_ok),
+                scout_mod.LOCAL_TIMEOUT_S * 2,
+            )
+        except Exception:  # a hint; never fail a turn on it
+            res = None
+        if not res or (res["mode"] == "units" and mode != "always"):
+            return ""  # "local" never falls back to a keyword card (e.g. the server is still loading)
+        self._scout = res
+        if settings.verbose != "low":
+            console.print(
+                f"[muted]scout ({res['mode']}, {res['secs']:.1f}s): {', '.join(res['files'][:3])}[/muted]"
+            )
+        return scout_mod.card_text(res)
+
+    async def _preread_plan(self, user_input: str) -> tuple[str, list]:
+        """Pre-emptive reads (preread.py): (mode, ReadFile arg dicts), or ("off", [])."""
+        self._ghost_paths = []
+        pre_mode = preread_mod.mode()
+        if pre_mode == "off" or user_input.lstrip().startswith("/"):
+            return "off", []
+        try:
+            planned = await asyncio.to_thread(preread_mod.plan, user_input, get_project_root())
+        except Exception:  # a prediction; never fail a turn on it
+            planned = []
+        return pre_mode, planned
+
+    async def _preread_prose(self, planned: list) -> str:
+        """Run the planned reads and return them as text for the request (prose form)."""
+        pairs = []
+        for i, args in enumerate(planned):
+            name = preread_mod.tool_of(args)
+            tc = ToolCall(id=preread_mod.ghost_id(self.state.turn, i), name=name, arguments=json.dumps(args))
+            try:
+                result = await self._invoke_tool(tc, dict(args))
+            except Exception:
+                continue
+            if name == "ReadFile":
+                self._note_view(name, args, result)
+            pairs.append((args, encode_tool_result(name, result)))
+            if name == "ReadFile":
+                self._ghost_paths.append(str(args.get("path")))
+        self.hop_stats["ghost_reads"] = self.hop_stats.get("ghost_reads", 0) + len(pairs)
+        return ("\n\n" + preread_mod.prose_block(pairs)) if pairs else ""
+
+    async def _preread_ghost(self, planned: list) -> None:
+        """Run the planned reads as the model's own tool exchange before call 1 (ghost form)."""
+        calls = [
+            ToolCall(id=preread_mod.ghost_id(self.state.turn, i), name=preread_mod.tool_of(args),
+                     arguments=json.dumps(args))
+            for i, args in enumerate(planned)
+        ]
+        items = [
+            {"type": "function_call", "call_id": tc.id, "name": tc.name, "arguments": tc.arguments}
+            for tc in calls
+        ]
+        self.state.add_output(items)
+        self._session_log_call("log_output", items)
+        self._ghost_running = True
+        try:
+            await self._run_tool_calls(calls)
+        finally:
+            self._ghost_running = False
+        # DeepSeek's thinking mode rejects an assistant tool_use turn without a
+        # thinking block (HTTP 400) unless a user text block follows the
+        # results: this note closes the exchange (verified live) and says
+        # where the reads came from, without putting thinking in the model's mouth.
+        self.state.add_user(preread_mod.GHOST_NOTE)
+        self._session_log_call("log_user", self.state.items[-1])
+        self._ghost_paths = [str(a.get("path")) for a in planned if preread_mod.tool_of(a) == "ReadFile"]
+        self.hop_stats["ghost_reads"] = self.hop_stats.get("ghost_reads", 0) + len(calls)
+
+    def _scout_feedback(self, answer: str) -> None:
+        """Use-confirmed precision: the turn's tool arguments or answer named a scouted file or symbol."""
+        res = getattr(self, "_scout", None)
+        if not res:
+            return
+        seen = "\n".join(getattr(self, "_scout_touched", [])) + "\n" + (answer or "")
+        try:
+            scout_mod.record_use(res["files"], scout_mod.used_files(res, seen), res["mode"])
+        except Exception:
+            pass
+        self._scout = None
+
+    def _handoff_due_forecast(self) -> bool:
+        """Will a compaction that reads [handoff] run before or after the next turn?
+
+        Window: the context plus the forecast growth reaches the trigger or the
+        post-turn window threshold. Economic: the rent plus the forecast rent
+        reaches the price of a compaction *with* a handoff (the one this
+        request makes possible). A gauge estimated after a compaction is not
+        a forecast basis; that context is small.
+        """
+        if getattr(self.usage, "context_tokens_estimated", False):
+            return False
+        ctx = int(self.usage.context_tokens or 0)
+        if ctx <= 0:
+            return False
+        nxt = ctx + HANDOFF_FORECAST_TURNS * max(self._turn_growth_ema, 0.0)
+        trigger = self.compact_trigger_tokens()
+        if trigger and nxt >= trigger * HANDOFF_WINDOW_MARGIN:
+            return True
+        window = int(settings.max_context_tokens or 0)
+        if window and nxt / window >= float(settings.compact_threshold) * HANDOFF_WINDOW_MARGIN:
+            return True
+        if getattr(settings, "compact_policy", "economic") != "economic":
+            return False
+        meter = self._sync_compaction_meter()
+        if nxt < meter.floor_tokens:
+            return False
+        rent = meter.rent + HANDOFF_FORECAST_TURNS * max(self._turn_rent_ema, 0.0)
+        return rent >= meter.price(int(nxt), inline_handoff=True)
+
+    def _observe_turn_growth(self) -> None:
+        """Fold this turn's rent and context growth into the forecast EMAs."""
+        start = self._turn_gauge
+        self._turn_gauge = None
+        if start is None or getattr(self.usage, "context_tokens_estimated", False):
+            return
+        rent0, ctx0, compactions0 = start
+        if self.state.compactions != compactions0:
+            return  # a compaction reset the meter mid-turn
+        meter = self._sync_compaction_meter()
+        rent = max(meter.rent - rent0, 0.0)
+        growth = max(int(self.usage.context_tokens or 0) - ctx0, 0)
+        if ctx0 <= 0:
+            # First turn: no prior gauge, the whole context is "growth".
+            growth = 0
+        a = 0.5
+        self._turn_rent_ema = rent if not self._turn_rent_ema else a * rent + (1 - a) * self._turn_rent_ema
+        self._turn_growth_ema = (
+            growth if not self._turn_growth_ema else a * growth + (1 - a) * self._turn_growth_ema
+        )
 
     def _record_signals(self, reply: Reply, delta) -> None:
         """Log what looked off about a response, and bank the hit rate.
@@ -1268,7 +1913,7 @@ class Orchestrator:
         if delta.calls and (delta.cache_hit_tokens or delta.cache_miss_tokens):
             try:
                 get_cache().record_prefix_stats(
-                    settings.orchestrator_model,
+                    MODEL,
                     delta.cache_hit_tokens,
                     delta.cache_miss_tokens,
                     delta.calls,
@@ -1285,20 +1930,67 @@ class Orchestrator:
     async def _invoke_tool(self, tc: ToolCall, args: dict) -> str:
         """Run one permitted tool. Tests stub this to control await overlap."""
         if tc.name in SUBAGENT_TOOLS:
-            return await self.router.delegate(tc.name, args)
-        return await self.registry.execute(tc.name, args, tc.id)
+            result = await self.router.delegate(tc.name, args)
+        else:
+            result = await self.registry.execute(tc.name, args, tc.id)
+        return ownership.mark_result(tc.name, args, result)
 
     def _maybe_parallel(self, name: str) -> bool:
         return name in READ_ONLY_PARALLEL and self.registry.policy.get(name) == ALLOW
 
+    async def _local_salience_picks(self, stored: str, intent: str) -> list:
+        """Local-model rerank of a bulky result's lines (salience.py). [] when off/slow/busy.
+
+        Never blocks on a model load: the first use starts the server in the
+        background and this result keeps the deterministic picks.
+        """
+        if not (settings.salience_excerpt and local_llm.available()):
+            return []
+        try:
+            from .cache import _json_header
+
+            first = stored.partition("\n")[0]
+            rel = _json_header(first).get("full_output")
+            text = (salience.read_vault_file(str(rel)) if rel else None) or stored
+            lines = text.splitlines()
+            pool = salience.rerank_pool(lines, intent)
+            return await asyncio.wait_for(
+                local_llm.pick_lines(lines, pool, intent), local_llm.RERANK_TIMEOUT_S + 1
+            )
+        except Exception:
+            return []
+
     async def _run_tool_calls(self, calls: List[ToolCall]) -> None:
         prepared: list[tuple[str, ToolCall, dict, Optional[str]]] = []
+        # Predicated finish: the answer is taken out of the arguments before
+        # display, permission, repeat keys or execution see them. History keeps
+        # it in the tool_use input (that is where the model wrote it).
+        self._finish_decision = finish.Decision()
+        finish_texts: dict[str, str] = {}
+        # Write checks (hops.py): taken off like final_answer; run after the batch.
+        offered_checks: list[tuple[str, str]] = []
         for tc in calls:
             args = tc.parsed()
+            if finish.enabled() and tc.name in finish.FINISH_TOOLS:
+                offered = finish.take(args)
+                if offered and getattr(self, "_escrow", None):
+                    # Answer escrow: "[deliver]" re-offers the kept answer.
+                    offered = finish.release(offered, split_reply_meta(self._escrow)[0].strip()) or offered
+                if offered:
+                    finish_texts[tc.id] = offered
+            if hops.check_enabled() and tc.name in hops.CHECK_TOOLS:
+                command = hops.take_check(args)
+                if command:
+                    offered_checks.append((tc.id, command))
             problem = tc.argument_error()
             if problem is not None:
                 console.print(f"  [bad]{Glyph.CROSS} {tc.name}: {problem}[/bad]")
                 prepared.append(("error", tc, args, problem))
+                continue
+            guard = self._write_guard(tc, args)
+            if guard is not None:
+                console.print(f"  [warn]{Glyph.CROSS} {tc.name}: held by the request's constraint \"{guard}\"[/warn]")
+                prepared.append(("guard", tc, args, guard))
                 continue
             self.printer.tool_start(tc.name, args)
             allowed = await self.registry.check_permission(tc.name, args)
@@ -1308,7 +2000,36 @@ class Orchestrator:
                 continue
             prepared.append(("run", tc, args, None))
 
+        skipped_repeat = False
+        for index, entry in enumerate(prepared):
+            status, tc, args, _problem = entry
+            if status != "run":
+                continue
+            fingerprint = _repeat_key(tc.name, args, self._write_epoch)
+            seen = self._tool_repeat_counts.get(fingerprint, 0) + 1
+            self._tool_repeat_counts[fingerprint] = seen
+            if seen >= REPEAT_TOOL_WARN:
+                prepared[index] = ("repeat", tc, args, None)
+                skipped_repeat = True
+            if seen >= REPEAT_TOOL_STOP:
+                self._stop_repeated_tools = True
+        if skipped_repeat:
+            console.print(
+                "[warn]Skipped a repeated tool call with the same arguments. "
+                "The earlier result still stands.[/warn]"
+            )
+
         serial_lock = asyncio.Lock()
+        bash_wrote: set[str] = set()
+        # Ordered batches (hops.py): writes of this response that failed, as
+        # (tool, normalised path). Later Bash / same-file writes are skipped.
+        ordered = hops.ordered_enabled()
+        failed_writes: list[tuple[str, str]] = []
+        hop = int(getattr(self.trace, "iterations", 0) or 0)
+
+        def norm_path(args: dict) -> str:
+            raw = str(args.get("path") or "")
+            return os.path.normpath(raw) if raw else ""
         path_locks: dict[str, asyncio.Lock] = {}
         path_guard = asyncio.Lock()
 
@@ -1324,8 +2045,27 @@ class Orchestrator:
             entry: tuple[str, ToolCall, dict, Optional[str]],
         ) -> tuple[ToolCall, dict, str, float, bool, bool]:
             status, tc, args, problem = entry
+            if ordered and tc.name in WRITE_TOOLS and status in ("denied", "guard", "error"):
+                failed_writes.append((tc.name, norm_path(args)))
             if status == "error":
                 return tc, args, json.dumps({"error": problem}), 0.0, False, False
+            if status == "guard":
+                return (
+                    tc,
+                    args,
+                    json.dumps({
+                        "error": "write_guard",
+                        "constraint": problem,
+                        "hint": (
+                            "The user's request says this file must not change; nothing was "
+                            "written. Fix the cause elsewhere. If this exact write is still "
+                            "required, repeat the identical call and it will run."
+                        ),
+                    }),
+                    0.0,
+                    False,
+                    False,
+                )
             if status == "denied":
                 return (
                     tc,
@@ -1335,12 +2075,80 @@ class Orchestrator:
                     False,
                     True,
                 )
+            if status == "repeat":
+                return (
+                    tc,
+                    args,
+                    json.dumps(
+                        {
+                            "error": "repeated_tool",
+                            "tool": tc.name,
+                            "hint": (
+                                "This exact call already ran this turn and no file "
+                                "has changed since. Use the earlier result and take "
+                                "the next step. Do not call it again."
+                            ),
+                        }
+                    ),
+                    0.0,
+                    False,
+                    False,
+                )
+            if ordered and hops.should_skip(tc.name, norm_path(args), failed_writes, WRITE_TOOLS):
+                # Planned on top of a write that failed: do not run it, and do
+                # not count it toward the repeat guard (it never ran).
+                key = _repeat_key(tc.name, args, self._write_epoch)
+                if self._tool_repeat_counts.get(key):
+                    self._tool_repeat_counts[key] -= 1
+                self.hop_stats["skipped"] += 1
+                return tc, args, hops.skipped_result(tc.name, failed_writes), 0.0, False, False
+            if tc.name in WRITE_TOOLS:
+                for wpath in _write_paths(args):
+                    self._preimages.capture(wpath)
+            elif tc.name == rename_mod.NAME:
+                # A multi-file write: capture each file it will change, as an
+                # Edit captures its one path (failure attribution).
+                for rel in await asyncio.to_thread(
+                    rename_mod.planned_files, str(args.get("old") or ""), str(args.get("new") or ""),
+                    str(args.get("path") or "."), str(args.get("include") or ""),
+                ):
+                    self._preimages.capture(rel)
+            # Every Bash runs between two stat fingerprints: files it changes
+            # taint attribution and count as working-set files (TodoWrite
+            # evidence), as Edit/WriteFile writes do.
+            watch = tc.name == "Bash"
+            before = await asyncio.to_thread(self._preimages.snapshot) if watch else None
             started = time.perf_counter()
             try:
                 result = await self._invoke_tool(tc, args)
             except Exception as e:
                 result = json.dumps({"error": str(e), "tool": tc.name})
             elapsed = (time.perf_counter() - started) * 1000
+            if ordered and tc.name in WRITE_TOOLS and hops.write_failed(result):
+                failed_writes.append((tc.name, norm_path(args)))
+            if watch:
+                oracle = self.registry.last_oracle
+                self.registry.last_oracle = None
+                if oracle is not None and testoracle.enabled():
+                    result = await self._attach_oracle(result, oracle, elapsed, tc.id)
+                after = await asyncio.to_thread(self._preimages.snapshot)
+                wrote = self._preimages.note_bash(before, after)
+                if wrote:
+                    # Observed, not guessed: `python gen.py` / `make` changed
+                    # files, so the next identical call runs in a new world.
+                    bash_wrote.add(tc.id)
+                for rel in wrote[:8]:
+                    self._note_bash_write(rel)
+                if views_mod.enabled():
+                    result = self._attach_view_deltas(result, before, after)
+            elif tc.name in VIEW_TOOLS and views_mod.enabled():
+                self._note_view(tc.name, args, result)
+            elif tc.name == rename_mod.NAME:
+                self._note_rename(result)
+            if tc.name == "ReadFile" and callees_mod.enabled():
+                result = await asyncio.to_thread(
+                    callees_mod.attach, result, str(args.get("path") or ""), get_project_root()
+                )
             return tc, args, result, elapsed, True, False
 
         async def guarded(
@@ -1358,24 +2166,78 @@ class Orchestrator:
                         return await execute_prepared(entry)
                 return await execute_prepared(entry)
 
-        results = await asyncio.gather(*[guarded(e) for e in prepared])
+        results, interrupted = await self._execute_in_program_order(prepared, guarded)
+        if offered_checks and not interrupted:
+            results = await self._run_write_checks(results, offered_checks, execute_prepared)
+        if not interrupted:
+            results = await self._after_batch(results, bash_wrote)
+            if finish_texts:
+                decision = finish.decide(
+                    ((tc.id, tc.name, args, result, ran, finish_texts.get(tc.id))
+                     for tc, args, result, _elapsed, ran, _denied in results),
+                    require_run=getattr(self, "_run_demanded", False),
+                    request=getattr(self, "_request_text", ""),
+                )
+                if decision.deliver and finish.claimed_write_enabled():
+                    claims = finish.unwritten_claims(getattr(self, "_request_text", ""), decision.answer,
+                                                     getattr(self, "_turn_written", set()), get_project_root())
+                    if claims:
+                        self.finish_stats["claim_held"] = self.finish_stats.get("claim_held", 0) + 1
+                        decision = finish.Decision(discarded=True, carrier=decision.carrier,
+                                                   held_note=finish.claimed_write_note(claims))
+                self._finish_decision = decision
+                if decision.caveats and decision.deliver:
+                    self.finish_stats["licensed"] = self.finish_stats.get("licensed", 0) + 1
+                if (decision.discarded and decision.offered and not decision.held_for_run
+                        and finish.escrow_enabled()):
+                    self._escrow = decision.offered
+                if decision.discarded:
+                    self.finish_stats["discarded"] += 1
+                    console.print(
+                        "[muted]Prepared final answer held back: "
+                        + ("the request asks for a test run and none ran. "
+                           if decision.held_for_run else
+                           "it names a change no call made. " if decision.held_note else
+                           "a step in that batch did not succeed. ")
+                        + "Continuing.[/muted]"
+                    )
 
         # Record every function_call_output first, then mirror the working
         # set. Appending a user-role working-set item after the first write
         # of a parallel batch splits the remaining outputs from their calls
         # and DeepSeek 400s with "No tool output found for tool call …".
         pending_ws: list[tuple[ToolCall, dict, str]] = []
-        for tc, args, result, elapsed, ran, denied in results:
+        tracker = ""
+        if hops.budget_enabled() and results and not getattr(self, "_ghost_running", False):
+            tracker = "\n" + self._budget.tracker(
+                hop, format_cost(self.usage.turn_cost)
+            )
+        last_index = len(results) - 1
+        for index, (tc, args, result, elapsed, ran, denied) in enumerate(results):
             if not ran:
+                if denied:
+                    summary = "denied"
+                elif '"error": "interrupted"' in (result or ""):
+                    summary = "interrupted"
+                elif "repeated_tool" in (result or ""):
+                    summary = "repeated call skipped"
+                elif '"write_guard"' in (result or ""):
+                    summary = "held by a request constraint"
+                elif '"error": "skipped"' in (result or ""):
+                    summary = "skipped: an earlier write in this response failed"
+                else:
+                    summary = "bad arguments"
                 self.trace.events.append(
                     ToolEvent(
                         name=tc.name,
                         args=args,
                         ok=False,
                         denied=denied,
-                        summary="denied" if denied else "bad arguments",
+                        summary=summary,
                     )
                 )
+                if index == last_index and tracker:
+                    result = result + tracker
                 self.state.add_tool_result(tc.id, result)
                 self._session_log_call("log_tool_result", tc.id, result)
                 continue
@@ -1400,10 +2262,16 @@ class Orchestrator:
                 and not args.get("start_line")
                 and not args.get("end_line")
             )
-            stored = result
+            # Densest faithful form for history (tool_codec). UI and working
+            # set keep the raw payload; the vault sees the encoded one.
+            stored = encode_tool_result(tc.name, result)
             if should_vault_tool_output(tc.name, stored, raw_read=full_read):
                 try:
-                    stored = get_cache().offload_tool_output(stored)
+                    intent = salience.call_intent(getattr(self, "_step_intent", ""), args)
+                    extra = await self._local_salience_picks(stored, intent)
+                    stored = get_cache().offload_tool_output(
+                        stored, intent=intent, extra=extra, salient=settings.salience_excerpt
+                    )
                 except Exception:
                     stored = result
             # Compact payloads (ReadFile summaries, Agent JSON) *are* the
@@ -1431,11 +2299,502 @@ class Orchestrator:
                     extra = None
                 if extra:
                     stored = stored + "\n" + extra
+            if self._finish_decision.deliver and tc.id == self._finish_decision.carrier:
+                stored = stored + "\n" + finish.DELIVERED_NOTE
+            elif self._finish_decision.held_for_run and tc.id == self._finish_decision.carrier:
+                stored = stored + "\n" + finish.RUN_HELD_NOTE
+            elif self._finish_decision.held_note and tc.id == self._finish_decision.carrier:
+                stored = stored + "\n" + self._finish_decision.held_note
+            elif (self._finish_decision.discarded and tc.id == self._finish_decision.carrier
+                  and getattr(self, "_escrow", None) == self._finish_decision.offered
+                  and self._finish_decision.offered):
+                stored = stored + "\n" + finish.escrow_note(self._finish_decision.reason)
+            if index == last_index and tracker:
+                stored = stored + tracker
             self.state.add_tool_result(tc.id, stored)
             self._session_log_call("log_tool_result", tc.id, stored)
             pending_ws.append((tc, args, result))
         for tc, args, result in pending_ws:
             self._apply_working_set_from_tool(tc, args, result)
+            if self._scout and not getattr(self, "_ghost_running", False):
+                self._scout_touched.append(json.dumps(args, ensure_ascii=False)[:2000])
+            if settings.exploration_ledger:
+                self.ledger.note(tc.name, args, result, get_project_root())
+        if interrupted:
+            raise asyncio.CancelledError()
+
+    def _batch_segments(self, prepared: list) -> list[list[int]]:
+        """Split a batch into program-order segments.
+
+        Invariant: a call observes every earlier call of the same batch. Runs
+        of parallel-safe reads (and instant non-run entries) share a segment
+        and overlap; any other call (a write, Bash, an ASK tool) is a barrier
+        that runs alone after everything before it and before everything
+        after it. An all-read batch is still one fully parallel segment.
+        """
+        segments: list[list[int]] = []
+        current: list[int] = []
+        for i, (status, tc, _args, _problem) in enumerate(prepared):
+            if status != "run" or self._maybe_parallel(tc.name):
+                current.append(i)
+                continue
+            if current:
+                segments.append(current)
+                current = []
+            segments.append([i])
+        if current:
+            segments.append(current)
+        return segments
+
+    async def _execute_in_program_order(self, prepared: list, run_one) -> tuple[list, bool]:
+        """Run ``prepared`` by segment; on cancellation keep what finished.
+
+        Returns (results in call order, interrupted). When the batch is
+        cancelled (Ctrl-C), calls that completed keep their real results and
+        every other call gets an ``interrupted`` error, so each call still
+        has exactly one output and history matches what actually ran. The
+        caller records the outputs and then re-raises the cancellation.
+        """
+        results: list = [None] * len(prepared)
+        interrupted = False
+        for segment in self._batch_segments(prepared):
+            tasks = {i: asyncio.ensure_future(run_one(prepared[i])) for i in segment}
+            try:
+                # wait, not gather: one failing call must not abandon its
+                # siblings mid-flight; each failure becomes that call's output.
+                await asyncio.wait(tasks.values())
+            except asyncio.CancelledError:
+                interrupted = True
+            for i, task in tasks.items():
+                if not task.done():
+                    task.cancel()
+            if interrupted:
+                pending = [t for t in tasks.values() if not t.done()]
+                if pending:
+                    try:
+                        await asyncio.wait(pending, timeout=5)
+                    except asyncio.CancelledError:
+                        pass
+            for i, task in tasks.items():
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    results[i] = task.result()
+                elif task.done() and not task.cancelled():
+                    status, tc, args, _problem = prepared[i]
+                    results[i] = (
+                        tc, args,
+                        json.dumps({"error": str(task.exception()), "tool": tc.name}),
+                        0.0, False, False,
+                    )
+            if interrupted:
+                break
+        for i, entry in enumerate(prepared):
+            if results[i] is None:
+                _status, tc, args, _problem = entry
+                results[i] = (
+                    tc,
+                    args,
+                    json.dumps(
+                        {
+                            "error": "interrupted",
+                            "tool": tc.name,
+                            "hint": "The user interrupted the turn before this call "
+                            "finished; it may have partly run.",
+                        }
+                    ),
+                    0.0,
+                    False,
+                    False,
+                )
+        return results, interrupted
+
+    async def _run_write_checks(self, results: list, offered: list, execute) -> list:
+        """Run the checks Edit/WriteFile carried (hops.py), ``&&`` after all of the batch's writes.
+
+        A check runs through the normal Bash path (permission, oracle, view
+        deltas) and its result is merged into the carrying
+        write's result, so the history keeps exactly one output per call.
+        """
+        failed = [
+            f"{tc.name} {args.get('path') or ''}".strip()
+            for tc, args, result, _e, ran, _d in results
+            if tc.name in WRITE_TOOLS and (not ran or hops.write_failed(result))
+        ]
+        index = {tc.id: i for i, (tc, *_rest) in enumerate(results)}
+        for carrier, command in hops.plan_checks(offered):
+            i = index.get(carrier)
+            if i is None:
+                continue
+            tc, args, result, elapsed, ran, denied = results[i]
+            check_result: Optional[str] = None
+            reason = ""
+            if failed:
+                reason = f"not run: {failed[0]} failed"
+            else:
+                bash_args = {"command": command}
+                synthetic = ToolCall(id=f"{tc.id}#check", name="Bash", arguments=json.dumps(bash_args))
+                self.printer.tool_start("Bash", bash_args)
+                if not await self.registry.check_permission("Bash", bash_args):
+                    self.printer.tool_denied("Bash")
+                    reason = "User denied permission"
+                else:
+                    _tc, _a, check_result, check_ms, _ran, _den = await execute(("run", synthetic, bash_args, None))
+                    elapsed += check_ms
+                    self.hop_stats["checks"] = self.hop_stats.get("checks", 0) + 1
+                    summary, ok = ui.describe_result("Bash", check_result)
+                    event = ToolEvent(name="Bash", args=bash_args, elapsed_ms=check_ms,
+                                      result_chars=len(check_result), ok=ok, summary=summary)
+                    self.trace.events.append(event)
+                    if settings.show_answer_detail:
+                        self.printer.tool_end(event, show_timing=settings.show_tool_timing)
+            results[i] = (tc, args, hops.merge_check(result, command, check_result, reason), elapsed, ran, denied)
+        return results
+
+    async def _after_batch(self, results: list, bash_wrote: Optional[set] = None) -> list:
+        """Advance the write epoch, track the failing check, and replay it after a fix."""
+        last_write = None
+        ran_check = False
+
+        async def bash_done(call_id: str, command: str, data: dict, elapsed: float) -> bool:
+            """Epoch/check bookkeeping for one Bash run; True if ``data`` gained an attribution."""
+            nonlocal ran_check
+            if (bash_may_write(command) and data.get("exit_code") == 0) or call_id in (bash_wrote or ()):
+                self._write_epoch += 1
+            if call_id in (bash_wrote or ()):
+                self._write_seq += 1
+            if not looks_like_test_command(command):
+                return False
+            ran_check = True
+            code = data.get("exit_code")
+            self._turn_checks.append({
+                "command": command, "exit": code,
+                "summary": self._oracle_summaries.pop(call_id, ""), "seq": self._write_seq,
+            })
+            if code not in (0, None):
+                self._failing_check = (command, elapsed)
+                note = await self._attribute_failure(command, data, elapsed)
+                if note is not None:
+                    data["attribution"] = note
+                    return True
+            elif code == 0 and self._failing_check and self._failing_check[0] == command:
+                self._failing_check = None
+            return False
+
+        for i, (tc, args, result, elapsed, ran, _denied) in enumerate(results):
+            if not ran:
+                continue
+            data = _json_dict(result)
+            if tc.name in WRITE_TOOLS or tc.name == rename_mod.NAME:
+                if data.get("ok") and not data.get("unchanged"):
+                    last_write = i
+                    self._write_seq += 1
+                    if tc.name in WRITE_TOOLS:
+                        self._note_turn_write(str(data.get("path") or args.get("path") or ""))
+                        for rel in (data.get("files") or {}) if isinstance(data.get("files"), dict) else ():
+                            self._note_bash_write(rel)  # cross-file Edit: working set + written
+                check = data.get("check")
+                if isinstance(check, dict) and "exit_code" in check:
+                    # A write-carried check (hops.py) is a Bash run like any other.
+                    if await bash_done(f"{tc.id}#check", str(check.get("command") or ""), check, elapsed):
+                        results[i] = (tc, args, json.dumps(data, ensure_ascii=False), elapsed, ran, _denied)
+                continue
+            if tc.name != "Bash":
+                continue
+            command = str(args.get("command") or "")
+            if await bash_done(tc.id, command, data, elapsed):
+                results[i] = (tc, args, json.dumps(data, ensure_ascii=False), elapsed, ran, _denied)
+        if last_write is None:
+            return results
+        self._write_epoch += 1
+        replay = None if ran_check else await self._verify_replay()
+        if replay is None:
+            return results
+        tc, args, result, elapsed, ran, denied = results[last_write]
+        data = _json_dict(result)
+        data["verify"] = replay
+        results[last_write] = (tc, args, json.dumps(data, ensure_ascii=False), elapsed, ran, denied)
+        return results
+
+    def _claim_note(self, answer: str) -> None:
+        """Claim check (claims.py): a visible note when "tests pass" is not what the run said."""
+        if not claims_mod.enabled() or not answer:
+            return
+        try:
+            note = claims_mod.check(answer, self._turn_checks, self._write_seq)
+        except Exception:
+            return
+        if note is None:
+            return
+        self.trace.events.append(ToolEvent(name="claim_check", args={}, ok=False, summary=note[:120]))
+        console.print(f"[warn]Note:[/warn] [muted]{escape(note)}[/muted]")
+
+    async def _obligation_probe(self) -> Optional[str]:
+        """Commit probe (obligations.py): one corrective note when a named callable is missing."""
+        obs = self._obligations
+        if not settings.obligations or self._obligation_nudged or not obs or not obs.callables:
+            return None
+        if not self._preimages.files and not self._write_epoch:
+            return None  # nothing was written: an answer-only turn owes no code
+        try:
+            problems = await asyncio.to_thread(obligations_mod.unmet, obs, get_project_root())
+        except Exception:
+            return None
+        self._obligation_nudged = True
+        if not problems:
+            return None
+        self.trace.events.append(
+            ToolEvent(name="obligations", args={}, ok=False, summary="unmet: " + problems[0][:80])
+        )
+        return obligations_mod.corrective_note(problems)
+
+    def _write_guard(self, tc: ToolCall, args: dict) -> Optional[str]:
+        """Quote of the request constraint that protects this write, the first time only."""
+        obs = self._obligations
+        if not settings.write_guards or not obs or not obs.guards or tc.name not in WRITE_TOOLS:
+            return None
+        root = Path(get_project_root()).resolve()
+        raw = Path(str(args.get("path") or ""))
+        p = raw if raw.is_absolute() else root / raw
+        try:
+            p = p.resolve()
+            rel = p.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            return None
+        guard = obligations_mod.guarded_by(obs.guards, rel, p.is_file())
+        if guard is None:
+            return None
+        key = _tool_call_fingerprint(tc.name, args)
+        if key in self._guard_refused:
+            return None  # repeated on purpose: the model decided
+        self._guard_refused.add(key)
+        return guard.quote
+
+    async def _attach_oracle(self, result: str, oracle: dict, elapsed: float, call_id: str = "") -> str:
+        """Add ``tests`` rows (testoracle.py) for what the command's own view hid."""
+        report = oracle.get("report") or {}
+        command = str(oracle.get("command") or "")
+        data = _json_dict(result)
+        if not data or data.get("error") and "exit_code" not in data:
+            return result
+        root = get_project_root()
+        visible = str(data.get("stdout") or "") + "\n" + str(data.get("stderr") or "")
+        filtered = strip_view_filters(command) != command
+        try:
+            novel = testoracle.novel_tests(self._preimages.files, root)
+        except Exception:
+            novel = set()
+        new = testoracle.novel_ids(report, novel, root)
+        vacuous = await self._vacuity(command, report, new, elapsed)
+        self._oracle_summaries[call_id] = testoracle.summary_line(report)
+        rows = testoracle.render(report, visible, filtered, new=new, vacuous=vacuous)
+        if not rows:
+            return result
+        data["tests"] = rows
+        return json.dumps(data, ensure_ascii=False)
+
+    async def _vacuity(self, command: str, report: dict, new: dict, elapsed: float) -> list:
+        """New passing tests that also pass with the turn's source edits reverted."""
+        if not settings.vacuity_check or not new:
+            return []
+        passing = sorted(i for i, o in new.items() if o == "passed")
+        if not passing or elapsed > VERIFY_REPLAY_MAX_MS or self.registry.policy.get("Bash") != ALLOW:
+            return []
+        if self._preimages.tainted:
+            return []
+        root = get_project_root()
+        try:
+            if Path(str(report.get("rootdir") or "")).resolve() != Path(root).resolve():
+                return []
+        except OSError:
+            return []
+        source = testoracle.source_preimages(self._preimages.changed())
+        if not source:
+            return []  # tests-only turn: nothing to be vacuous against
+        key = (tuple(passing), tuple(sorted(source)))
+        if key in self._vacuity_seen:
+            return self._vacuity_seen[key]
+        cmd = testoracle.vacuity_command(command, passing)
+        verdict: list = []
+        if cmd is not None:
+            probe = testoracle.Probe()
+            try:
+                run = await shadow_run(cmd, root, source, max(5, int(elapsed / 1000 * 3) + 5), probe=probe)
+                shadow = probe.collect() if run is not None else None
+            finally:
+                probe.close()
+            if shadow is not None:
+                outcomes = shadow.get("tests") or {}
+                verdict = [i for i in passing if outcomes.get(i) == "passed"]
+                self.trace.events.append(
+                    ToolEvent(
+                        name="Bash",
+                        args={"command": cmd, "shadow": True},
+                        elapsed_ms=run[2] if run else 0.0,
+                        result_chars=len(run[1]) if run else 0,
+                        ok=True,
+                        summary=f"vacuity: {len(verdict)}/{len(passing)} pass without the edits",
+                    )
+                )
+        self._vacuity_seen[key] = verdict
+        return verdict
+
+    def _note_view(self, name: str, args: dict, result: str) -> None:
+        """A successful ReadFile/Edit/WriteFile: the model now knows this file's text."""
+        data = _json_dict(result)
+        if data.get("error") or (name in WRITE_TOOLS and not data.get("ok")):
+            return
+        try:
+            for path in (_write_paths(args) if name in WRITE_TOOLS else [str(args.get("path") or "")]):
+                self._views.see(path)
+        except Exception:
+            pass
+
+    def _attach_view_deltas(self, result: str, before: Optional[dict], after: Optional[dict]) -> str:
+        """Add ``changed``: diffs of files the command changed, against the model's view."""
+        changed, removed = views_mod.changed_and_removed(before, after, self._views.root_dir())
+        if not changed and not removed:
+            return result
+        data = _json_dict(result)
+        if not data or data.get("error"):
+            return result
+        try:
+            text = self._views.deltas(changed, removed)
+        except Exception:
+            return result
+        if not text:
+            return result
+        data["changed"] = text
+        return json.dumps(data, ensure_ascii=False)
+
+    def _note_rename(self, result: str) -> None:
+        """A Rename that landed: each file it changed is a working-set write."""
+        data = _json_dict(result)
+        if not data.get("ok"):
+            return
+        for rel in list(data.get("files") or {})[:50]:
+            self._note_bash_write(rel)
+            if views_mod.enabled():
+                try:
+                    if self._views.has(rel):  # its view now includes the rename
+                        self._views.see(rel)
+                except Exception:
+                    pass
+
+    def _note_turn_write(self, path: str) -> None:
+        """Remember a file this turn wrote (claimed-write guard), project-relative."""
+        if not path:
+            return
+        try:
+            from .paths import rel_to_root
+
+            if not hasattr(self, "_turn_written"):
+                self._turn_written = set()
+            self._turn_written.add(rel_to_root(path))
+        except Exception:
+            pass
+
+    def _note_bash_write(self, rel: str) -> None:
+        """Record a file a shell command wrote, like an Edit/WriteFile write."""
+        if not hasattr(self, "_turn_written"):
+            self._turn_written = set()
+        self._turn_written.add(rel)
+        try:
+            p = self._preimages.root / rel
+            note_file(str(p), hashlib.sha256(p.read_bytes()).hexdigest())
+        except Exception:
+            pass
+
+    async def _attribute_failure(self, command: str, data: dict, elapsed: float) -> Optional[dict]:
+        """Label a failing check's failures new / pre-existing (g023_code/attribution.py).
+
+        Same gate as verify replay: setting on, Bash allowed without asking,
+        the check took < 30 s. Needs at least one file this turn changed, and
+        no Bash command this turn that may have written files.
+        """
+        if not settings.failure_attribution or not self._preimages.usable():
+            return None
+        if elapsed > VERIFY_REPLAY_MAX_MS or self.registry.policy.get("Bash") != ALLOW:
+            return None
+        timeout = max(5, int(elapsed / 1000 * 3) + 5)
+        root = get_project_root()
+        full = strip_view_filters(command)
+        if full != command:
+            # The model's view (| tail) can hide different ids on each side:
+            # compare full outputs, the current tree also run in a shadow.
+            now, run = await asyncio.gather(
+                shadow_run(full, root, {}, timeout),
+                shadow_run(full, root, self._preimages.changed(), timeout),
+            )
+            if now is None or run is None:
+                return None
+            after, after_code = now[1], now[0]
+        else:
+            run = await shadow_run(command, root, self._preimages.changed(), timeout)
+            if run is None:
+                return None
+            after = str(data.get("stdout") or "") + "\n" + str(data.get("stderr") or "")
+            after_code = data.get("exit_code")
+        code, text, ms = run
+        note = attribute(after, after_code, text, code)
+        self.trace.events.append(
+            ToolEvent(
+                name="Bash",
+                args={"command": command, "shadow": True},
+                elapsed_ms=ms,
+                result_chars=len(text),
+                ok=True,
+                summary="attribution: " + str(note.get("verdict", ""))[:80],
+            )
+        )
+        return note
+
+    async def _verify_replay(self) -> Optional[dict]:
+        if not self._failing_check or not settings.verify_replay:
+            return None
+        command, elapsed = self._failing_check
+        if elapsed > VERIFY_REPLAY_MAX_MS or self.registry.policy.get("Bash") != ALLOW:
+            return None
+        timeout = max(5, int(elapsed / 1000 * 3) + 5)
+        started = time.perf_counter()
+        try:
+            raw = await self.registry._exec_bash(command, timeout=timeout)
+        except Exception:
+            return None
+        ms = (time.perf_counter() - started) * 1000
+        oracle = self.registry.last_oracle
+        self.registry.last_oracle = None
+        data = _json_dict(raw)
+        code = data.get("exit_code")
+        tail = (str(data.get("stdout") or "") + str(data.get("stderr") or "")).strip()
+        if len(tail) > VERIFY_REPLAY_TAIL_CHARS:
+            tail = Glyph.ELLIPSIS + tail[-VERIFY_REPLAY_TAIL_CHARS:]
+        if oracle is not None and testoracle.enabled():
+            report = oracle.get("report") or {}
+            self._turn_checks.append({
+                "command": command, "exit": code,
+                "summary": testoracle.summary_line(report), "seq": self._write_seq,
+            })
+        if code == 0:
+            self._failing_check = None
+        else:
+            self._failing_check = (command, ms)
+        self.trace.events.append(
+            ToolEvent(
+                name="Bash",
+                args={"command": command, "replay": True},
+                elapsed_ms=ms,
+                result_chars=len(raw),
+                ok=code == 0,
+                summary=f"verify replay exit {code}",
+            )
+        )
+        # Seed the working set exactly as a model-run check would.
+        self._apply_working_set_from_tool(_ReplayCall(), {"command": command}, raw)
+        return {
+            "command": command,
+            "exit_code": code,
+            "output_tail": tail,
+            "note": "Re-ran automatically after this write; no need to run it again.",
+        }
 
     def _apply_working_set_from_tool(self, tc: ToolCall, args: dict, result: str) -> None:
         """Local working-set updater. Compact does not maintain this object."""
@@ -1471,6 +2830,56 @@ class Orchestrator:
                 self._session_log_call("log_working_set", ws)
         except Exception:
             pass
+
+    def _rollback_turn(self, reason: str) -> None:
+        """Close an unfinished turn as a transaction.
+
+        Invariants: (1) every function_call has exactly one output; (2)
+        history never forgets a tool call that completed — its side effects
+        (writes, Bash) are already in the world, so dropping its record would
+        let the next turn act on a world it cannot see.
+
+        The turn is located by identity (``_turn_user_item``), not by "the
+        last user-role item", which may be a working-set mirror or a nudge.
+        No completed call: the whole turn is removed (re-sending is a clean
+        retry). Otherwise the completed pairs stay, dangling halves go, and a
+        short note says the request was not finished.
+        """
+        items = self.state.items
+        anchor = getattr(self, "_turn_user_item", None)
+        idx = None
+        if anchor is not None:
+            for k in range(len(items) - 1, -1, -1):
+                if items[k] is anchor:
+                    idx = k
+                    break
+        if idx is None:
+            self._rollback_to_last_complete()
+            return
+        tail = items[idx + 1:]
+        called = {i.get("call_id") for i in tail if i.get("type") == "function_call"}
+        answered = {
+            i.get("call_id") for i in tail if i.get("type") == "function_call_output"
+        }
+        completed = called & answered
+        if not completed:
+            self.state.items = items[:idx]
+            self._repair_pairing()
+            return
+        kept = [
+            i
+            for i in tail
+            if i.get("type") not in ("function_call", "function_call_output")
+            or i.get("call_id") in completed
+        ]
+        self.state.items = items[: idx + 1] + kept
+        self._repair_pairing()
+        self._reseat_items_splitting_tool_pairs()
+        self.state.add_user(
+            f"[turn {reason}] The request above was not finished. The tool "
+            "results above are real (files may already have changed). Do not "
+            "resume it unless asked."
+        )
 
     def _rollback_to_last_complete(self) -> None:
         """
@@ -1544,6 +2953,60 @@ class Orchestrator:
     # Context accounting
     # ------------------------------------------------------------------
 
+    def compact_trigger_tokens(self) -> int:
+        """Token count at which auto-compaction fires.
+
+        ``compact_at_tokens`` (default 200k) is the normal trigger; the
+        window fraction still caps it when a smaller window is configured.
+        """
+        window = int(settings.max_context_tokens or 0)
+        by_fraction = int(window * float(settings.compact_threshold)) if window else 0
+        absolute = int(getattr(settings, "compact_at_tokens", 0) or 0)
+        candidates = [n for n in (absolute, by_fraction) if n > 0]
+        return min(candidates) if candidates else 0
+
+    def over_compact_trigger(self) -> bool:
+        trigger = self.compact_trigger_tokens()
+        return bool(trigger) and self.usage.context_tokens >= trigger
+
+    def _orchestrator_calls(self) -> int:
+        return sum(u.calls for u in self.usage.orchestrator.values())
+
+    def _sync_compaction_meter(self) -> CompactionMeter:
+        meter = self.compaction_meter
+        if not meter.standing_tokens:
+            try:
+                standing = len(self._frozen_instructions()) + len(
+                    json.dumps(self._frozen_tools())
+                )
+                meter.standing_tokens = standing // 4
+            except Exception:
+                pass
+        meter.floor_tokens = int(getattr(settings, "compact_floor_tokens", 0) or 0)
+        if not getattr(self.usage, "context_tokens_estimated", False):
+            meter.observe(self._orchestrator_calls(), int(self.usage.context_tokens or 0))
+        return meter
+
+    def economic_compact_due(self) -> bool:
+        """Re-reading the history has cost more than compacting it would."""
+        if getattr(settings, "compact_policy", "economic") != "economic":
+            return False
+        if getattr(self.usage, "context_tokens_estimated", False):
+            return False
+        meter = self._sync_compaction_meter()
+        return meter.due(
+            int(self.usage.context_tokens or 0), inline_handoff=bool(self._inline_handoff())
+        )
+
+    def _transcript_path(self) -> Optional[str]:
+        log = self.session_log
+        if log is None:
+            return None
+        try:
+            return str(log.path.relative_to(get_project_root()))
+        except Exception:
+            return str(log.path)
+
     def context_fraction(self) -> float:
         """How full the context window is, 0.0–1.0, from the last real call."""
         if not settings.max_context_tokens:
@@ -1560,7 +3023,7 @@ class Orchestrator:
             session_cost=format_cost(self.usage.cost()),
             hit_rate=self.usage.totals().hit_rate(),
             elapsed_ms=self.trace.total_ms,
-            model=settings.orchestrator_model,
+            model=MODEL,
         )
 
     def turn_summary(self) -> Text:
@@ -1583,15 +3046,35 @@ class Orchestrator:
                 f"  {model:<20} {mu.calls:>3} calls  {mu.total_tokens:>10,} tok  "
                 f"{format_cost(mu.cost(model))}"
             )
+        if total.web_searches or total.fetches:
+            lines.append(
+                f"Tools     {total.web_searches} web searches {Glyph.DOT} "
+                f"{total.fetches} fetches  {format_cost(total.tool_cost)} "
+                "($0.75 per 1,000 successful requests each)"
+            )
+        all_tokens = total.input_tokens + total.output_tokens
+        if total.peak_tokens and all_tokens:
+            lines.append(
+                f"Peak      {total.peak_tokens / all_tokens:.0%} of tokens billed in a "
+                "DeepSeek peak window (2x rate) — priced as such below"
+            )
         lines.append(
             f"Est. cost {format_cost(u.cost())}  "
             f"(orchestrator {format_cost(u.scope_cost('orchestrator'))} {Glyph.DOT} "
             f"subagents {format_cost(u.scope_cost('subagent'))})"
         )
+        if (
+            getattr(settings, "compact_policy", "economic") == "economic"
+            and u.context_tokens
+            and not getattr(u, "context_tokens_estimated", False)
+        ):
+            meter = self._sync_compaction_meter()
+            lines.append(
+                "Compact   "
+                + meter.describe(u.context_tokens, inline_handoff=bool(self._inline_handoff()))
+                + f" {Glyph.DOT} ceiling {self.compact_trigger_tokens():,} tok"
+            )
         return lines
-
-    def cost_summary(self) -> str:
-        return "\n".join(self.cost_lines())
 
     # ------------------------------------------------------------------
     # Compaction (SPEC §10)
@@ -1685,11 +3168,46 @@ class Orchestrator:
             return False
         if getattr(self.usage, "context_tokens_estimated", False):
             return False
-        if self.context_fraction() < settings.compact_threshold:
+        if not (self.over_compact_trigger() or self.economic_compact_due()):
             return False
         if self._already_compacted_short():
             return False
         return True
+
+    async def _maybe_mid_turn_compact(self, user_input: str) -> Optional[str]:
+        """Compact between steps of one long agentic turn.
+
+        Turn-start compaction alone lets a 100-step turn grow toward the 1M
+        ceiling, paying full price for every re-read token. This runs after a
+        tool batch (so every tool_use already has its tool_result), on the
+        same real-gauge trigger. The in-flight request is pinned: the
+        summarizer is told to keep it, and if the request item fell out of the
+        kept tail it is restated after the summary so the model keeps going.
+        """
+        if not self._should_auto_compact():
+            return None
+        console.print(
+            f"[warn]Context at {self.usage.context_tokens:,} tokens mid-turn "
+            f"{Glyph.ARROW} compacting before the next step.[/warn]"
+        )
+        report = await self.compact(
+            instructions=(
+                "this turn is still in progress. Keep the user's current request "
+                "verbatim, what has been done for it so far, and the next step."
+            )
+        )
+        console.print(f"[muted]{report}[/muted]")
+        if not report.startswith("Compacted"):
+            return report
+        current = getattr(self, "_turn_user_item", None)
+        if current is not None and not any(it is current for it in self.state.items):
+            self.state.add_user(
+                MID_TURN_RESTATE_LEADIN + user_input + MID_TURN_RESTATE_TAIL
+            )
+            # The restated request is this turn's anchor from now on.
+            self._turn_user_item = self.state.items[-1]
+            self._session_log_call("log_user", self.state.items[-1])
+        return report
 
     async def _maybe_auto_compact(self) -> Optional[str]:
         """Auto path: window-pressure Layer 1, then Layer 3.
@@ -1705,7 +3223,10 @@ class Orchestrator:
 
         tool_heavy = self._tool_result_share() > TOOL_SHARE_MICRO_THRESHOLD
         reclaimed = 0
-        window_pressure = self._should_auto_compact()
+        due = self._should_auto_compact()
+        # Only the ceiling is window pressure; an economic trigger compacts
+        # (Layer 3) without blanking cached tool results first.
+        window_pressure = due and self.over_compact_trigger()
         if not self._already_compacted_short() and should_micro_cached_prefix(
             window_pressure=window_pressure
         ):
@@ -1717,7 +3238,7 @@ class Orchestrator:
                 f"(~{reclaimed // 4:,} tokens, no API cost)."
             )
 
-        if not window_pressure:
+        if not due:
             return micro_report
 
         # Tool-result bloat was the problem: wait for a real input_tokens
@@ -1762,6 +3283,7 @@ class Orchestrator:
                 self._is_user_item(item)
                 and not self._is_compact_summary_item(item)
                 and not self._is_working_set_item(item)
+                and not is_rehydrate_item(item)
             ):
                 return item
         return None
@@ -1835,7 +3357,7 @@ class Orchestrator:
             ws_item["content"] = current
         summary_item = {
             "role": "user",
-            "content": COMPACT_SUMMARY_LEADIN + summary,
+            "content": COMPACT_SUMMARY_LEADIN + with_recall_pointer(summary, self._transcript_path()),
         }
         tail = self._compact_tail_items(head)
         out: List[dict] = []
@@ -1843,8 +3365,20 @@ class Orchestrator:
             out.append(head)
         out.append(ws_item)
         out.append(summary_item)
+        ledger_item = self._ledger_item()
+        if ledger_item is not None:
+            out.append(ledger_item)
         out.extend(x for x in tail if x is not ws_item)
         return out
+
+    def _ledger_item(self) -> Optional[dict]:
+        """Exploration notes for a compacted prefix (None when off or empty)."""
+        if not settings.exploration_ledger:
+            return None
+        try:
+            return self.ledger.item()
+        except Exception:
+            return None
 
     def _build_post_turn_items(self, summary: str) -> List[dict]:
         """Next request ``input``: compact summary, not the prior transcript.
@@ -1861,9 +3395,10 @@ class Orchestrator:
             ws_item["content"] = current
         summary_item = {
             "role": "user",
-            "content": COMPACT_SUMMARY_LEADIN + summary,
+            "content": COMPACT_SUMMARY_LEADIN + with_recall_pointer(summary, self._transcript_path()),
         }
-        return [ws_item, summary_item]
+        ledger_item = self._ledger_item()
+        return [ws_item, summary_item] + ([ledger_item] if ledger_item else [])
 
     def _render_transcript(self, max_chars: int = COMPACT_TRANSCRIPT_MAX_CHARS) -> str:
         """Flatten the item list into something a summarizer can read.
@@ -1927,14 +3462,14 @@ class Orchestrator:
         from .api import output_text
 
         delta = self.usage.record(
-            settings.orchestrator_model, resp.get("usage"), scope="subagent"
+            MODEL, resp.get("usage"), scope="subagent"
         )
-        summary_cost = delta.cost(settings.orchestrator_model)
+        summary_cost = delta.cost(MODEL)
         if any(it.get("type") == "function_call" for it in (resp.get("output") or [])):
             return None, "Compaction called a tool — history left untouched.", summary_cost
         summary = output_text(resp)
         if not summary.strip():
-            return None, "Compaction produced an empty summary — history left untouched.", 0.0
+            return None, "Compaction produced an empty summary — history left untouched.", summary_cost
         visible, handoff, _ = split_reply_meta(summary)
         summary = (handoff or visible or summary).strip()
         if len(summary) > COMPACT_SUMMARY_STORE_CHARS:
@@ -1946,6 +3481,7 @@ class Orchestrator:
         self._repair_pairing()
         self.state.compactions += 1
         self.state.compacted_len = len(self.state.items)
+        self.compaction_meter.reset(self._orchestrator_calls())
         try:
             self._session_log_call("log_compact", self.state.items, load_working_set())
         except Exception:
@@ -2043,37 +3579,49 @@ class Orchestrator:
             return text
         return None
 
-    def _conversation_excerpt(self, items: List[dict]) -> str:
-        parts: List[str] = []
+    def _exchanges(self, items: List[dict]) -> List[tuple[str, str]]:
+        """``(user request, last assistant text)`` per user turn in ``items``; tool rows are dropped."""
+        out: List[tuple[str, str]] = []
         for item in items:
             kind = item.get("type")
             if kind in POST_TURN_COMPACT_TOOL_TYPES or kind == "reasoning":
                 continue
-            if self._is_compact_summary_item(item) or self._is_working_set_item(item):
+            if (
+                self._is_compact_summary_item(item)
+                or self._is_working_set_item(item)
+                or is_rehydrate_item(item)
+            ):
                 continue
             text = self._item_plain_text(item)
             if not text.strip():
                 continue
-            role = item.get("role") or "assistant"
-            parts.append(f"[{role}] {text[:4000]}")
-        return "\n\n".join(parts)
+            if self._is_user_item(item):
+                if text.startswith(MID_TURN_RESTATE_LEADIN):
+                    request = text[len(MID_TURN_RESTATE_LEADIN):].split(MID_TURN_RESTATE_TAIL, 1)[0]
+                    if out:  # the same request, restated after a mid-turn compaction
+                        continue
+                    text = request
+                out.append((text, ""))
+            elif (item.get("role") or "assistant") == "assistant":
+                if out:
+                    out[-1] = (out[-1][0], text)
+                else:
+                    out.append(("(continued)", text))
+        return out
 
     def _local_handoff_summary(self) -> str:
-        """Build a handoff summary without a model call.
+        """Fold this turn into the carried state without a model call (checkpoint.fold_summary).
 
-        Reuses a compact-summary item when one exists and appends this turn's
-        user/assistant text. Tool rows are omitted — they are what the handoff
-        exists to drop.
+        The existing summary's narrative is kept byte-for-byte (prefix cache); this turn's exchange enters a
+        bounded ring of recent turns and the oldest leaves as a one-line digest. Before the first summary
+        exists, every exchange so far is folded, so the result is bounded either way. Tool rows are omitted —
+        they are what the handoff exists to drop.
         """
-        existing = (self._existing_compact_summary_text() or "").strip()
+        existing = (self._existing_compact_summary_text() or "").split(RECALL_MARKER, 1)[0].strip()
         start = getattr(self, "_items_at_turn_start", 0) or 0
-        this_turn = self._conversation_excerpt(self.state.items[start:])
-        if existing:
-            if this_turn:
-                return f"{existing}\n\n## Latest turn\n{this_turn}"
-            return existing
-        whole = self._conversation_excerpt(self.state.items).strip()
-        return whole or "(empty session)"
+        source = self.state.items[start:] if existing else self.state.items
+        folded = fold_summary(existing, self._exchanges(source)).strip()
+        return folded or "(empty session)"
 
     def _this_turn_added_tools(self) -> bool:
         new_items = self.state.items[self._items_at_turn_start :]

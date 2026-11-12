@@ -121,21 +121,17 @@ if defined FATAL goto abort
 
 call :need prompt_toolkit "prompt_toolkit>=3.0.0" recommended
 
-REM Optional extras: vision preprocessing and browser-grade fetching. Asked for
+REM Optional extras: vision preprocessing. Asked for
 REM as a group, installed one at a time so a package with no wheel for this
 REM Python cannot take the rest down with it.
 set "MISSING_OPTIONAL="
 call :probe PIL         "pillow>=10.0.0"
-call :probe curl_cffi   "curl_cffi>=0.7.0"
-call :probe h2          "h2>=4.1.0"
-call :probe brotli      "brotli>=1.1.0"
-call :probe zstandard   "zstandard>=0.22.0"
 
 if defined MISSING_OPTIONAL (
     set "WANT_OPT=0"
     if /I "%DO_OPTIONAL%"=="yes" set "WANT_OPT=1"
     if /I "%DO_OPTIONAL%"=="auto" (
-        call :ask "Install the optional extras (vision + browser-grade fetching)?" y
+        call :ask "Install the optional extras (vision image downscaling)?" y
         if "!ANSWER!"=="y" set "WANT_OPT=1"
     )
     if "!WANT_OPT!"=="1" (
@@ -212,55 +208,14 @@ if exist "%CFG%" (
     )
 )
 if not exist "%CFG%" (
-    > "%CFG%" (
-        echo {
-        echo   "verbose": "low",
-        echo   "auto_compact": true,
-        echo   "show_tool_timing": true,
-        echo   "show_context_bar": true,
-        echo   "permission_default": "ask",
-        echo   "max_iterations": 255,
-        echo   "max_tokens": 0,
-        echo   "max_context_tokens": 256000,
-        echo   "compact_threshold": 0.85,
-        echo   "orchestrator_model": "deepseek-flash",
-        echo   "subagent_model": "deepseek-flash",
-        echo   "reasoning_effort": 75,
-        echo   "thinking_enabled": true,
-        echo   "vision_backend": "none",
-        echo   "vision_model": null,
-        echo   "vision_host": null,
-        echo   "vision_max_image_dim": 800,
-        echo   "vision_timeout": 180,
-        echo   "vision_num_ctx": 4096,
-        echo   "vision_keep_alive": "5m",
-        echo   "vision_endpoint": "responses",
-        echo   "deepseek_vision_model": "deepseek-flash",
-        echo   "or_default_model": "google/gemma-4-26b-a4b-it:free",
-        echo   "or_vision_models": null,
-        echo   "or_credits": false,
-        echo   "or_sub_enabled": false,
-        echo   "surge_notify": true,
-        echo   "surge_pause": false,
-        echo   "surge_pause_buffer_minutes": 5,
-        echo   "write_backup": true,
-        echo   "write_backup_keep": 5
-        echo }
+    REM Generated from the Settings defaults in g023_code\config.py,
+    REM so the installer can never write a stale copy.
+    "%PYTHON%" -c "import sys; sys.path.insert(0, sys.argv[1]); from g023_code.config import write_default_config; write_default_config(sys.argv[2])" "%HERE%" "%CFG%"
+    if errorlevel 1 (
+        call :warn "could not write config.json; the built-in defaults apply until you save settings"
+    ) else (
+        call :ok "wrote default config.json"
     )
-    call :ok "wrote default config.json"
-)
-
-REM ---------------------------------------------------------------------------
-call :step "Vision backend (optional)"
-REM ---------------------------------------------------------------------------
-REM Vision is off by default and stays off - this only reports what is around,
-REM so /vision has something to offer when you want it.
-where ollama >nul 2>&1
-if %ERRORLEVEL% equ 0 (
-    call :ok "ollama found - enable image analysis inside g023 with /vision"
-) else (
-    call :skip "no ollama on this machine - image analysis stays off (everything else works)"
-    call :skip "install it from https://ollama.com if you want /vision"
 )
 
 REM ---------------------------------------------------------------------------

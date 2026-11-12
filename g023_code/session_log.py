@@ -1,18 +1,35 @@
-"""Append-only JSONL session log. Ancestry lives here; compact records a view."""
+"""Append-only JSONL session log. Ancestry lives here; compact records a view.
+
+Invariants:
+
+* replay == memory: ``replay_log(file)`` reproduces the orchestrator's history.
+  ``SessionLog`` keeps a shadow of the replay (same reducer, ``_reduce``) and
+  ``checkpoint(items)`` appends an ``output`` tail or a ``view`` record when
+  memory diverged (rollback, interrupt), so a crash never resumes into a
+  history the model did not see.
+* Single writer per file. Resuming attaches to an existing file; two live REPLs
+  resuming the *same* session would interleave appends. Each record is one
+  ``write`` of one line (O_APPEND), so the file stays parseable, but the
+  replayed history then mixes both conversations. New sessions get unique
+  names via ``O_EXCL`` and never collide.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .checkpoint import sign as sign_handoff
+from .checkpoint import verify as verify_handoff
 from .config import get_project_root
+from .fsutil import atomic_write_text, create_exclusive
 from .working_set import (
     dumps_working_set,
-    is_working_set_item,
     normalize as normalize_working_set,
 )
 
@@ -51,7 +68,14 @@ def _strip_write_bodies(args: dict) -> dict:
 
 
 def sanitize_item(item: dict) -> dict:
-    """Copy an item for disk. Large write bodies become hash + byte count."""
+    """Copy an item for disk. Large *re-derivable* bodies become hash + byte count.
+
+    Invariant: only text that can be recovered elsewhere is ever elided —
+    tool outputs (re-run the tool) and WriteFile/Edit payloads (the file on
+    disk holds them). Message ``content`` (user prompts, the compaction
+    summary, the mid-turn restatement, assistant text) has no other copy, so
+    it is always written in full; eliding it made /resume restore a hash.
+    """
     out = dict(item)
     if out.get("type") == "function_call" and out.get("name") in WRITE_TOOLS:
         raw = out.get("arguments")
@@ -74,15 +98,6 @@ def sanitize_item(item: dict) -> dict:
             out["output"] = json.dumps(
                 {"omitted": True, "hash": _sha(output), "bytes": len(output)}
             )
-    content = out.get("content")
-    if (
-        isinstance(content, str)
-        and len(content) > LARGE_LOG_CHARS
-        and not is_working_set_item(out)
-    ):
-        out["content"] = json.dumps(
-            {"omitted": True, "hash": _sha(content), "bytes": len(content)}
-        )
     return out
 
 
@@ -93,29 +108,92 @@ def sanitize_output_text(output: str) -> Any:
 
 
 class SessionLog:
+    """Append-only event log whose replay must equal the in-memory history.
+
+    The log keeps a shadow of what :func:`replay_log` would rebuild (the same
+    reducer, applied to each record as it is written). :meth:`checkpoint`
+    compares that shadow with the live history and appends only what is
+    missing: an ``output`` record for a pure tail extension, a ``view``
+    record when something was rewritten in place. Every history mutation
+    that is not an append (rollback, reseat, micro-compaction, the
+    working-set mirror) is therefore captured, and /resume sees the same
+    history the process had.
+    """
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.touch()
-        pointer = self.path.parent / "CURRENT"
-        pointer.write_text(self.path.name, encoding="utf-8")
+        self._terminate_torn_tail()
+        atomic_write_text(self.path.parent / "CURRENT", self.path.name)
+        self._shadow_items: list[dict] = []
+        self._shadow_ws: Optional[dict] = None
+        if self.path.stat().st_size:
+            self._shadow_items, self._shadow_ws = replay_log(self.path)
+
+    def _terminate_torn_tail(self) -> None:
+        """A crash mid-append can leave a last line without its newline.
+
+        Appending after it would glue the next record onto the torn bytes and
+        replay would drop both. Terminating it first confines the loss to the
+        record that was already torn.
+        """
+        try:
+            size = self.path.stat().st_size
+            if not size:
+                return
+            with open(self.path, "rb") as fh:
+                fh.seek(size - 1)
+                last = fh.read(1)
+            if last != b"\n":
+                fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND)
+                try:
+                    os.write(fd, b"\n")
+                finally:
+                    os.close(fd)
+        except OSError:
+            pass
 
     @classmethod
     def open_new(cls, root: Optional[Path] = None) -> "SessionLog":
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        path = sessions_dir(root) / f"{stamp}.jsonl"
-        # Two sessions in the same second: suffix.
-        if path.exists():
-            path = sessions_dir(root) / f"{stamp}-{int(time.time() * 1000) % 1000}.jsonl"
+        # O_EXCL: two processes starting in the same second get two files.
+        path = create_exclusive(sessions_dir(root), stamp, ".jsonl")
         return cls(path)
 
     def append(self, kind: str, **fields: Any) -> None:
         rec = {"ts": time.time(), "kind": kind}
         rec.update(fields)
         line = json.dumps(rec, ensure_ascii=False, default=str)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        data = (line + "\n").encode("utf-8")
+        # One O_APPEND write per record: concurrent appenders cannot tear a line.
+        fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        # Reduce the record exactly as replay will read it back.
+        self._shadow_items, self._shadow_ws = _reduce(
+            self._shadow_items, self._shadow_ws, json.loads(line)
+        )
+
+    def checkpoint(self, items: Iterable[dict]) -> Optional[str]:
+        """Make replay equal ``items``; returns the record kind written, if any."""
+        expected = json.loads(
+            json.dumps([sanitize_item(i) for i in items], ensure_ascii=False, default=str)
+        )
+        shadow = self._shadow_items
+        if expected == shadow:
+            return None
+        n = len(shadow)
+        if len(expected) > n and expected[:n] == shadow:
+            self.append("output", items=expected[n:])
+            return "output"
+        self.append("view", items=expected)
+        return "view"
 
     def log_user(self, item: dict) -> None:
         self.append("user", item=sanitize_item(item))
@@ -148,7 +226,7 @@ class SessionLog:
 
 
 def prefix_hashes(instructions: str, tools: list) -> tuple[str, str]:
-    """Stable sha256 of the static prefix pieces sent on /responses."""
+    """Stable sha256 of the static prefix pieces sent on every request."""
     inst = hashlib.sha256((instructions or "").encode("utf-8")).hexdigest()
     dumped = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
     tools_h = hashlib.sha256(dumped.encode("utf-8")).hexdigest()
@@ -293,6 +371,43 @@ def _as_output_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _reduce(
+    items: list[dict], ws: Optional[dict], rec: dict
+) -> tuple[list[dict], Optional[dict]]:
+    """Apply one log record. The single definition of the log's semantics.
+
+    Appends mutate ``items`` in place (O(1) per record); view records replace it.
+    """
+    kind = rec.get("kind")
+    if kind == "user" and isinstance(rec.get("item"), dict):
+        items.append(rec["item"])
+    elif kind == "output":
+        chunk = rec.get("items") or []
+        if isinstance(chunk, list):
+            items.extend(i for i in chunk if isinstance(i, dict))
+    elif kind == "tool_result":
+        items.append(
+            {
+                "type": "function_call_output",
+                "call_id": rec.get("call_id") or "",
+                "output": _as_output_text(rec.get("output")),
+            }
+        )
+    elif kind == "compact_boundary":
+        view = rec.get("view") or []
+        if isinstance(view, list):
+            items = [i for i in view if isinstance(i, dict)]
+        if isinstance(rec.get("working_set"), dict):
+            ws = rec["working_set"]
+    elif kind == "working_set" and isinstance(rec.get("working_set"), dict):
+        ws = rec["working_set"]
+    elif kind in ("interrupt", "view"):
+        view = rec.get("items")
+        if isinstance(view, list):
+            items = [i for i in view if isinstance(i, dict)]
+    return items, ws
+
+
 def replay_log(path: Path) -> tuple[list[dict], Optional[dict]]:
     items: list[dict] = []
     ws: Optional[dict] = None
@@ -307,42 +422,50 @@ def replay_log(path: Path) -> tuple[list[dict], Optional[dict]]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            kind = rec.get("kind")
-            if kind == "user" and isinstance(rec.get("item"), dict):
-                items.append(rec["item"])
-            elif kind == "output":
-                chunk = rec.get("items") or []
-                if isinstance(chunk, list):
-                    items.extend(i for i in chunk if isinstance(i, dict))
-            elif kind == "tool_result":
-                items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": rec.get("call_id") or "",
-                        "output": _as_output_text(rec.get("output")),
-                    }
-                )
-            elif kind == "compact_boundary":
-                view = rec.get("view") or []
-                if isinstance(view, list):
-                    items = [i for i in view if isinstance(i, dict)]
-                if isinstance(rec.get("working_set"), dict):
-                    ws = rec["working_set"]
-            elif kind == "working_set" and isinstance(rec.get("working_set"), dict):
-                ws = rec["working_set"]
-            elif kind == "interrupt":
-                view = rec.get("items")
-                if isinstance(view, list):
-                    items = [i for i in view if isinstance(i, dict)]
+            if isinstance(rec, dict):
+                items, ws = _reduce(items, ws, rec)
     return items, ws
 
 
+# How many older logs /resume looks through when the newest one is empty.
+RESUME_LOOKBACK = 20
+
+
 def load_latest_view(root: Optional[Path] = None) -> tuple[list[dict], Optional[dict], Optional[Path]]:
+    """The newest session view that has items.
+
+    /clear (and a process that only ran slash commands) opens a fresh log that
+    becomes CURRENT. Resuming that empty log made "/clear, then /resume" a dead
+    end, so an empty newest log falls back to the newest one with content.
+    """
     path = latest_session_file(root)
     if path is None:
         return [], None, None
     items, ws = replay_log(path)
+    if items:
+        return items, ws, path
+    others = [p for p in path.parent.glob("*.jsonl") if p != path]
+    others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for other in others[:RESUME_LOOKBACK]:
+        try:
+            o_items, o_ws = replay_log(other)
+        except Exception:
+            continue
+        if o_items:
+            return o_items, o_ws, other
     return items, ws, path
+
+
+def _signed_fields(ts: str, completed: str, goal: str, ws_json: str, summary: str) -> dict[str, Any]:
+    """What a handoff signature covers: every field a resume reads back (checkpoint.sign)."""
+    return {
+        "v": 1,
+        "ts": ts,
+        "completed": completed,
+        "goal": goal.strip(),
+        "working_set": ws_json.strip(),
+        "summary": summary.strip(),
+    }
 
 
 def _objective_log_stamp() -> str:
@@ -364,9 +487,6 @@ def write_objective_log(
     """
     d = logs_dir(root)
     stamp = _objective_log_stamp()
-    path = d / f"{stamp}.log"
-    if path.exists():
-        path = d / f"{stamp}-{int(time.time() * 1000) % 1000}.log"
     goal_line = (goal or "").replace("\r", " ").replace("\n", " ").strip()
     if completed is True:
         done = "true"
@@ -374,20 +494,25 @@ def write_objective_log(
         done = "false"
     else:
         done = "unknown"
-    ws_json = dumps_working_set(normalize_working_set(working_set))
+    ws_json = dumps_working_set(normalize_working_set(working_set)).strip()
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    summary_text = (summary or "").strip()
+    signed = sign_handoff(_signed_fields(ts, done, goal_line, ws_json, summary_text))
+    sig_lines = f"key: {signed[0]}\nsig: {signed[1]}\n" if signed else ""
     body = (
         f"{OBJECTIVE_LOG_HEADER}\n"
         f"ts: {ts}\n"
         f"completed: {done}\n"
         f"goal: {goal_line}\n"
+        f"{sig_lines}"
         f"\n{OBJECTIVE_LOG_WS_MARK}\n"
         f"{ws_json}\n"
         f"\n{OBJECTIVE_LOG_SUMMARY_MARK}\n"
-        f"{(summary or '').rstrip()}\n"
+        f"{summary_text}\n"
     )
-    path.write_text(body, encoding="utf-8")
-    (d / "CURRENT").write_text(path.name, encoding="utf-8")
+    # Claim a fresh name atomically, then publish the pointer atomically.
+    path = create_exclusive(d, stamp, ".log", text=body)
+    atomic_write_text(d / "CURRENT", path.name)
     return path
 
 
@@ -419,6 +544,7 @@ def parse_objective_log(path: Path) -> dict[str, Any]:
         "completed": None,
         "ts": "",
         "path": Path(path),
+        "provenance": "unsigned",
     }
     if not text.startswith(OBJECTIVE_LOG_HEADER):
         out["summary"] = text.strip()
@@ -428,17 +554,23 @@ def parse_objective_log(path: Path) -> dict[str, Any]:
     if not _:
         out["summary"] = rest.strip()
         return out
+    completed_raw, kid, sig = "", "", ""
     for line in meta.splitlines():
         if line.startswith("ts:"):
             out["ts"] = line[3:].strip()
         elif line.startswith("completed:"):
-            raw = line.split(":", 1)[1].strip().lower()
+            completed_raw = line.split(":", 1)[1].strip()
+            raw = completed_raw.lower()
             if raw == "true":
                 out["completed"] = True
             elif raw == "false":
                 out["completed"] = False
         elif line.startswith("goal:"):
             out["goal"] = line.split(":", 1)[1].strip()
+        elif line.startswith("key:"):
+            kid = line[4:].strip()
+        elif line.startswith("sig:"):
+            sig = line[4:].strip()
     ws_raw, _, summary = tail.partition(f"\n{OBJECTIVE_LOG_SUMMARY_MARK}\n")
     if not _:
         ws_raw, _, summary = tail.partition(f"{OBJECTIVE_LOG_SUMMARY_MARK}\n")
@@ -451,6 +583,9 @@ def parse_objective_log(path: Path) -> dict[str, Any]:
         if isinstance(parsed, dict):
             out["working_set"] = normalize_working_set(parsed)
     out["summary"] = summary.strip()
+    out["provenance"] = verify_handoff(
+        _signed_fields(out["ts"], completed_raw, out["goal"], ws_raw, out["summary"]), kid, sig
+    )
     return out
 
 

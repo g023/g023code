@@ -4,14 +4,16 @@ Interactive CLI for g023 Code.
 Every slash command is declared in :mod:`g023_code.commands` and implemented
 here as a ``cmd_*`` method. Commands that take a fixed set of options open a
 picker when called bare, so nothing has to be memorised: ``/model`` is as
-usable as ``/model pro``.
+usable as ``/vision off``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 from rich.markdown import Markdown
@@ -21,27 +23,24 @@ from rich.text import Text
 
 from . import __version__
 from . import commands as registry
-from . import ollama_client
-from . import openrouter_client as or_client
-from . import or_subagents
 from . import project_instructions
 from . import surge
 from . import ui
 from .commands import Command
 from .effort import MAX_EFFORT, parse_effort_value
 from .config import (
-    AVAILABLE_MODELS,
     ITERATION_NOTICE_EVERY,
-    MODEL_ALIASES,
     MAX_COMPACT_THRESHOLD,
     MAX_CONTEXT_TOKENS,
+    MODEL,
+    MODEL_LABEL,
     MIN_COMPACT_THRESHOLD,
     MIN_CONTEXT_TOKENS,
     MIN_ITERATIONS,
     MIN_OUTPUT_TOKENS,
     PERSISTED_KEYS,
     Settings,
-    UNAVAILABLE_MODELS,
+    GOAL_CONTINUATION_CAP,
     UNLIMITED_ITERATIONS,
     UNLIMITED_OUTPUT_TOKENS,
     describe_compact_threshold,
@@ -54,14 +53,16 @@ from .config import (
     get_project_root,
     get_scratch_dir,
     load_config,
+    parse_setting,
     save_config,
     settings,
     load_api_key,
-    load_openrouter_key,
 )
+from .interrupts import UserInterrupt, controller as interrupt_controller
 from .orchestrator import Orchestrator
 from .cache import get_cache
 from .working_set import (
+    dumps_working_set,
     judge_goal_completion,
     load as load_working_set,
     mirror_working_set,
@@ -70,8 +71,50 @@ from .working_set import (
 from .signals import get_signals, hit_rate_verdict
 from .prompt import Reader, choose, confirm, install_hint
 from .tools.registry import ALLOW, ASK, BLOCK, get_registry, restore_newest_backup, _describe_age
-from .ui import Glyph, console, gauge, human_bytes, human_ms, kv_table, panel
+from .ui import Glyph, console, gauge, human_bytes, kv_table, panel
 from .usage import PRICING, format_cost, get_usage
+
+
+def _parse_token_count(value: str, *, small_is_fraction: bool = True):
+    """"200k" / "1m" / "150000" -> int tokens; a fraction or word -> None.
+
+    With ``small_is_fraction`` (the compact-threshold reading) a bare 1..100
+    is a percentage and returns None.
+    """
+    v = value.strip().lower().replace(",", "").replace("_", "")
+    if not v:
+        return None
+    mult = 1
+    if v.endswith("k"):
+        mult, v = 1_000, v[:-1]
+    elif v.endswith("m"):
+        mult, v = 1_000_000, v[:-1]
+    if not v.isdigit():
+        return None
+    n = int(v) * mult
+    if small_is_fraction and mult == 1 and 0 < n <= 100:
+        return None  # "85" reads as a percentage, handled by the fraction path
+    return n
+
+
+def tool_note(name: str, level: str) -> str:
+    """The `/tools` note column: what a tool costs or why it is absent, never a guess.
+
+    Agent and AnalyzeImage are not offered to the model while their switch is off;
+    ReadFile / SearchContent answer locally (ReadFile pays one model call only for a
+    semantic focus under /subagents on); FetchUrl's prompt offers the cached copy.
+    """
+    if name == "Agent":
+        return "isolated worker" if settings.subagents_enabled else "not offered (/subagents on)"
+    if name == "AnalyzeImage":
+        return "isolated model call" if settings.vision_enabled else "not offered (/vision on)"
+    if name == "ReadFile":
+        return "local index; semantic focus = 1 call" if settings.subagents_enabled else "local index, no API call"
+    if name == "SearchContent":
+        return "local, no API call"
+    if name == "FetchUrl" and level == ASK:
+        return "prompt offers the cached copy"
+    return ""
 
 
 class CLI:
@@ -86,6 +129,7 @@ class CLI:
         if missing:  # a wiring mistake, not a user error — fail loudly at startup
             raise RuntimeError(f"Commands without handlers: {', '.join(missing)}")
         self.last_goal_judgment: Optional[dict] = None
+        self._goal_interrupted = False
 
     # ------------------------------------------------------------------
     # Chrome
@@ -95,33 +139,25 @@ class CLI:
         """Bottom status bar (prompt_toolkit only) — plain text with HTML tags."""
         usage = get_usage()
         frac = self.orch.context_fraction()
-        vision = settings.effective_vision_model if settings.vision_enabled else "off"
+        vision = "on" if settings.vision_enabled else "off"
         surge_badge = " · SURGE 2×" if surge.is_surge() else ""
-        or_sub_badge = " · or-sub" if settings.or_sub_enabled else ""
         return (
-            f" {settings.orchestrator_model} · think {settings.reasoning_effort} "
+            f" {MODEL} · think {settings.reasoning_effort} "
             f"· ctx {frac:.0%} of {settings.max_context_tokens // 1000}k "
-            f"· {format_cost(usage.cost())} · vision {vision}{surge_badge}{or_sub_badge} · /help "
+            f"· {format_cost(usage.cost())} · vision {vision}{surge_badge} · /help "
         )
 
     def print_banner(self):
-        probe = ollama_client.probe(count_models=True, timeout=1.5)
-        ollama_line = (
-            f"[ok]{probe.host}[/ok] [muted]{Glyph.DOT} {probe.summary}[/muted]"
-            if probe.ok
-            else f"[muted]{probe.host} {Glyph.DOT} {probe.error}[/muted]"
-        )
         console.print()
         console.print(
             ui.banner(
                 version=__version__,
-                project=str(get_project_root()),
-                home=str(get_home()),
-                model=settings.orchestrator_model,
+                project=ui.display_path(get_project_root()),
+                home=ui.display_path(get_home()),
+                model=MODEL,
                 effort=str(settings.reasoning_effort) if settings.thinking_enabled else "off",
                 verbose=settings.verbose,
                 vision=self.vision_status(),
-                ollama=ollama_line,
             )
         )
         hint = install_hint()
@@ -139,7 +175,7 @@ class CLI:
 
         command = registry.lookup(token)
         if command is None:
-            console.print(f"[warn]Unknown command:[/warn] {token}")
+            console.print(f"[warn]Unknown command:[/warn] {escape(token)}")
             suggestions = registry.suggest(token)
             if suggestions:
                 console.print(f"[muted]Did you mean {', '.join(suggestions)}?[/muted]")
@@ -160,7 +196,7 @@ class CLI:
         if arg:
             command = registry.lookup(arg.split()[0])
             if command is None:
-                console.print(f"[warn]No such command:[/warn] {arg}")
+                console.print(f"[warn]No such command:[/warn] {escape(arg)}")
                 suggestions = registry.suggest(arg)
                 if suggestions:
                     console.print(f"[muted]Did you mean {', '.join(suggestions)}?[/muted]")
@@ -233,7 +269,7 @@ class CLI:
             [
                 (
                     "model",
-                    f"{settings.orchestrator_model} [muted]{Glyph.DOT} thinking "
+                    f"{MODEL} [muted]{Glyph.DOT} thinking "
                     f"{settings.reasoning_effort if settings.thinking_enabled else 'off'} "
                     f"{Glyph.DOT} verbose {settings.verbose}[/muted]",
                 ),
@@ -245,17 +281,7 @@ class CLI:
                     f"auto-compact {'on' if settings.auto_compact else 'off'}",
                 ),
                 ("vision", self.vision_status()),
-                (
-                    "or-sub",
-                    f"{'on' if settings.or_sub_enabled else 'off'} {Glyph.DOT} "
-                    f"primary {or_subagents.or_sub_primary() or 'none'} {Glyph.DOT} "
-                    f"/orsub to manage",
-                ),
-                (
-                    "ollama",
-                    f"{ollama_client.resolve_host()} [muted]({ollama_client.host_source()})[/muted]",
-                ),
-                ("project", str(get_project_root())),
+                ("project", ui.display_path(get_project_root())),
                 ("instructions", self._g023_status_line()),
                 ("cache", self._cache_size_line()),
             ]
@@ -297,6 +323,10 @@ class CLI:
         if token in ("log", "logs", "handoff"):
             self._resume_objective_log()
             return
+        if token:
+            console.print(f"[warn]Unknown argument:[/warn] {escape(arg.strip())}  "
+                          f"[muted](/resume | /resume log)[/muted]")
+            return
         items, ws, path = self.orch.resume_from_latest()
         if path is None:
             # Same-session JSONL missing: fall back to the last objective handoff.
@@ -305,12 +335,16 @@ class CLI:
             console.print("[muted]No session log under .g023/sessions/.[/muted]")
             return
         n = len(items)
+        if n == 0:
+            console.print("[muted]Nothing to resume: no session under .g023/sessions/ has history yet.[/muted]")
+            return
         console.print(
-            f"[ok]{Glyph.CHECK} Resumed {n} item(s) from [muted]{path}[/muted][/ok]"
+            f"[ok]{Glyph.CHECK} Resumed {n} item(s) from [muted]{ui.display_path(path)}[/muted][/ok]"
         )
         mismatch = getattr(self.orch, "prefix_mismatch", None)
         if mismatch:
             console.print(f"[warn]{mismatch}[/warn]")
+        self._print_rehydrate()
 
     def _resume_objective_log(self, quiet_if_missing: bool = False) -> bool:
         items, ws, path = self.orch.seed_from_objective_log()
@@ -321,9 +355,122 @@ class CLI:
         n = len(items)
         console.print(
             f"[ok]{Glyph.CHECK} New orchestration from handoff "
-            f"[muted]{path}[/muted] ({n} item(s))[/ok]"
+            f"[muted]{ui.display_path(path)}[/muted] ({n} item(s))[/ok]"
         )
+        self._print_rehydrate()
         return True
+
+    def _print_rehydrate(self) -> None:
+        """One status line: handoff provenance and what changed on disk since the saved state."""
+        info = getattr(self.orch, "last_rehydrate", None) or {}
+        drift = info.get("drift") or {}
+        bits = []
+        prov = info.get("provenance")
+        if prov:
+            bits.append("signature verified" if prov == "verified" else f"signature: {prov}")
+        changed, missing = drift.get("changed") or [], drift.get("missing") or []
+        if drift.get("checked"):
+            bits.append(
+                f"{len(changed)} changed, {len(missing)} missing of {drift['checked']} tracked file(s)"
+            )
+        if drift.get("verify_stale"):
+            bits.append("recorded verify is stale")
+        if not bits:
+            return
+        style = "warn" if info.get("note") else "muted"
+        console.print(f"[{style}]rehydrate {Glyph.DOT} {escape(f' {Glyph.DOT} '.join(bits))}[/{style}]")
+
+    def cmd_bbs(self, arg: str = "") -> None:
+        from . import bbs as bbs_mod
+
+        raw = (arg or "").strip()
+        if not raw:
+            bbs_mod.ensure_layout()
+            st = bbs_mod.status()
+            console.print(
+                f"bbs [muted]{st['root']} {Glyph.DOT} {st['topics']} topic(s) "
+                f"{Glyph.DOT} {st['posts']} post(s) {Glyph.DOT} "
+                f"index {st['index']} {Glyph.DOT} /bbs list|search|read|post[/muted]"
+            )
+            return
+        parts = raw.split(None, 1)
+        action = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if action == "list":
+            bbs_mod.ensure_layout()
+            if rest:
+                try:
+                    rows = bbs_mod.list_posts(rest)
+                except ValueError as exc:
+                    console.print(f"[warn]{exc}[/warn]")
+                    return
+                if not rows:
+                    console.print(f"[muted]No posts in topic {rest!r}.[/muted]")
+                    return
+                for row in rows:
+                    console.print(row["path"])
+                return
+            topics = bbs_mod.list_topics()
+            if not topics:
+                console.print("[muted]No topics yet. /bbs post <topic> <slug> <body>[/muted]")
+                return
+            for topic in topics:
+                console.print(f"{topic['topic']}/ ({topic['posts']})")
+            return
+        if action == "search":
+            if not rest:
+                console.print("[muted]Usage: /bbs search <query>[/muted]")
+                return
+            result = bbs_mod.search(rest)
+            if not result.get("ok"):
+                console.print(f"[warn]{result.get('error')}[/warn]")
+                return
+            samples = result.get("samples") or []
+            console.print(
+                f"[muted]{result.get('total', 0)} match(es) "
+                f"{Glyph.DOT} showing {len(samples)}[/muted]"
+            )
+            for sample in samples:
+                file = sample.get("file") or ""
+                line = sample.get("line") or ""
+                match = (sample.get("match") or sample.get("text") or "").strip()
+                console.print(f"{file}:{line} {match[:120]}")
+            return
+        if action == "read":
+            ref = rest.split()[0] if rest else ""
+            if not ref:
+                console.print("[muted]Usage: /bbs read <topic/slug>[/muted]")
+                return
+            result = bbs_mod.read_post(ref)
+            if not result.get("ok"):
+                console.print(f"[warn]{result.get('error')}[/warn]")
+                return
+            console.print(result.get("body") or "")
+            return
+        if action == "post":
+            bits = rest.split(None, 2)
+            if len(bits) < 3:
+                console.print(
+                    "[muted]Usage: /bbs post <topic> <slug> <body>[/muted]"
+                )
+                return
+            try:
+                result = bbs_mod.post(bits[0], bits[1], bits[2])
+            except ValueError as exc:
+                console.print(f"[warn]{exc}[/warn]")
+                return
+            verb = "created" if result.get("created") else "appended"
+            console.print(f"[ok]{Glyph.CHECK} {verb} {result.get('path')}[/ok]")
+            return
+        if action == "index":
+            result = bbs_mod.write_index()
+            console.print(
+                f"[ok]{Glyph.CHECK} {result.get('path')} "
+                f"({result.get('topics', 0)} topic(s), "
+                f"{result.get('posts', 0)} post(s))[/ok]"
+            )
+            return
+        console.print("[muted]Usage: /bbs [list|search|read|post|index][/muted]")
 
     def cmd_learn(self, arg: str = "") -> None:
         from . import learn
@@ -445,6 +592,11 @@ class CLI:
             f"[ok]{Glyph.CHECK} Restored [key]{result['path']}[/key] "
             f"from [muted]{result['restored_from']}[/muted][/ok]"
         )
+        if result.get("saved_current"):
+            console.print(
+                f"[muted]The replaced version was kept as {result['saved_current']}; "
+                "/undo again steps one version further back.[/muted]"
+            )
 
     def cmd_exit(self, arg: str = "") -> None:
         self.running = False
@@ -454,58 +606,28 @@ class CLI:
     # ------------------------------------------------------------------
 
     def cmd_model(self, arg: str = "") -> None:
-        aliases = {
-            "flash": "deepseek-flash",
-            "pro": "deepseek-v4-pro",
-            **MODEL_ALIASES,
-        }
-        raw = arg.strip().lower()
-        target = aliases.get(raw, raw) if raw else None
-
-        # Asking for a model the Responses API won't serve gets a reason, not a
-        # silent "unknown model" — the name is right, the endpoint just isn't
-        # ready for it, and that distinction is worth saying out loud.
-        if target in UNAVAILABLE_MODELS:
-            console.print(f"[warn]{target} is not available yet.[/warn]")
-            console.print(f"[muted]{UNAVAILABLE_MODELS[target]}[/muted]")
-            return
-
-        if target is not None and target not in AVAILABLE_MODELS:
-            choices = " | ".join(AVAILABLE_MODELS)
-            console.print(f"[warn]Unknown model:[/warn] {arg}  [muted]({choices})[/muted]")
-            return
-
-        if target is None:
-            options = []
-            for model in AVAILABLE_MODELS:
-                p = PRICING[model]
-                current = f"  [ok]{Glyph.CHECK} current[/ok]" if settings.orchestrator_model == model else ""
-                options.append(
-                    (
-                        f"{model}{current}",
-                        f"${p.cache_miss}/1M in {Glyph.DOT} ${p.output}/1M out",
-                    )
-                )
-            if len(options) == 1:
-                console.print(
-                    f"[muted]{AVAILABLE_MODELS[0]} is the only model the Responses API serves "
-                    f"today, so there is nothing to switch to.[/muted]"
-                )
-                for model, why in UNAVAILABLE_MODELS.items():
-                    console.print(f"[muted]{model}: {why}[/muted]")
-                return
-            try:
-                default = AVAILABLE_MODELS.index(settings.orchestrator_model) + 1
-            except ValueError:
-                default = 1
-            picked = choose("Orchestrator model", options, default=default)
-            if picked is None:
-                return
-            target = AVAILABLE_MODELS[picked - 1]
-
-        settings.orchestrator_model = target  # type: ignore[assignment]
-        save_config()
-        console.print(f"[ok]{Glyph.CHECK} Orchestrator {Glyph.ARROW} {target}[/ok] [muted]·saved[/muted]")
+        """Info only: there is exactly one model, so nothing to pick."""
+        if arg.strip():
+            console.print(
+                f"[muted]{MODEL_LABEL} ({MODEL}) is the only supported model; "
+                f"there is nothing to switch to.[/muted]"
+            )
+        p = PRICING[MODEL]
+        rows = [
+            ("model", f"[heading]{MODEL_LABEL}[/heading] [muted]({MODEL})[/muted]"),
+            ("endpoint", f"{settings.base_url.rstrip('/')}/anthropic/v1/messages"),
+            ("context", f"{describe_context_window(settings.max_context_tokens)} [muted](model max {MAX_CONTEXT_TOKENS:,})[/muted]"),
+            ("output", describe_max_tokens(settings.max_tokens)),
+            ("thinking", f"{settings.reasoning_effort if settings.thinking_enabled else 'off'} [muted]· /thinking[/muted]"),
+            ("vision", self.vision_status()),
+            (
+                "price /1M",
+                f"${p.cache_hit} hit {Glyph.DOT} ${p.cache_miss} miss {Glyph.DOT} ${p.output} out "
+                f"[muted](off-peak; peak 2×)[/muted]",
+            ),
+        ]
+        console.print()
+        console.print(panel(kv_table(rows), "Model"))
 
     def cmd_thinking(self, arg: str = "") -> None:
         value = arg.strip().lower()
@@ -535,11 +657,15 @@ class CLI:
                 return
             value = options[picked - 1][0]
 
+        if value in ("on", "enable", "enabled"):
+            # Back on at the saved effort (off keeps it; 0 would mean off again).
+            n0 = parse_effort_value(settings.reasoning_effort)
+            value = str(n0) if n0 else "high"
         if value == "off":
             settings.thinking_enabled = False
             save_config()
             self.orch.release_prefix_effort()
-            console.print(f"[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
+            console.print("[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
             return
         named = {"low": 50, "high": 75, "max": MAX_EFFORT}
         if value in named:
@@ -548,15 +674,15 @@ class CLI:
             n = parse_effort_value(value)
             if n is None:
                 console.print(
-                    f"[warn]Unknown effort:[/warn] {arg}  "
-                    f"[muted](1-100 | low | high | max | off; 75 is the ceiling)[/muted]"
+                    f"[warn]Unknown effort:[/warn] {escape(arg.strip())}  "
+                    f"[muted](1-100 | low | high | max | on | off; 75 is the ceiling)[/muted]"
                 )
                 return
             if n == 0:
                 settings.thinking_enabled = False
                 save_config()
                 self.orch.release_prefix_effort()
-                console.print(f"[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
+                console.print("[warn]Thinking disabled.[/warn] [muted]·saved[/muted]")
                 return
 
         settings.reasoning_effort = n
@@ -582,7 +708,8 @@ class CLI:
     }
 
     def cmd_verbose(self, arg: str = "") -> None:
-        aliases = {"off": "low", "on": "high", "medium": "mid", "max": "high", "quiet": "low"}
+        aliases = {"off": "low", "on": "high", "medium": "mid", "max": "high", "quiet": "low",
+                   "1": "low", "2": "mid", "3": "high"}  # the picker's numbers
         level = aliases.get(arg.strip().lower(), arg.strip().lower())
 
         if not level:
@@ -594,7 +721,7 @@ class CLI:
             level = options[picked - 1][0]
 
         if level not in ("low", "mid", "high"):
-            console.print(f"[warn]Unknown level:[/warn] {arg}  [muted](low | mid | high)[/muted]")
+            console.print(f"[warn]Unknown level:[/warn] {escape(arg)}  [muted](low | mid | high)[/muted]")
             return
 
         settings.verbose = level  # type: ignore[assignment]
@@ -675,7 +802,9 @@ class CLI:
             count = UNLIMITED_OUTPUT_TOKENS
         else:
             try:
-                count = int(value.replace(",", "").replace("_", ""))
+                count = _parse_token_count(value, small_is_fraction=False)
+                if count is None:  # "-5" still reaches the range message below
+                    count = int(value.replace(",", "").replace("_", ""))
             except ValueError:
                 console.print(
                     f"[warn]Not a number:[/warn] {escape(arg.strip())}  "
@@ -708,6 +837,59 @@ class CLI:
             f"[muted]{Glyph.DOT} replies longer than this are cut off ·saved[/muted]"
         )
 
+    def cmd_subagents(self, arg: str = "") -> None:
+        value = arg.strip().lower()
+        if value in ("on", "true", "yes", "1"):
+            settings.subagents_enabled = True
+        elif value in ("off", "false", "no", "0"):
+            settings.subagents_enabled = False
+        elif value:
+            console.print("[muted]Usage: /subagents on|off[/muted]")
+            return
+        else:
+            state = "on" if settings.subagents_enabled else "off (single-agent)"
+            console.print(f"[key]Subagents[/key] {Glyph.ARROW} {state}")
+            return
+        save_config()
+        console.print(
+            f"[ok]{Glyph.CHECK} Subagents {Glyph.ARROW} "
+            f"{'on' if settings.subagents_enabled else 'off'}[/ok] [muted]·saved[/muted]"
+        )
+
+    def cmd_ownership(self, arg: str = "") -> None:
+        from . import ownership
+
+        words = arg.strip().split(maxsplit=1)
+        value = words[0].lower() if words else ""
+        if value == "forget":
+            target = words[1].strip() if len(words) > 1 else ""
+            if not target:
+                console.print("[muted]Usage: /ownership forget <path>[/muted]")
+            elif ownership.forget(target):
+                console.print(f"[ok]{Glyph.CHECK} {escape(target)} {Glyph.ARROW} yours again (minimal-change)[/ok]")
+            else:
+                console.print(f"[muted]{escape(target)} is not on the created-by-g023 list.[/muted]")
+            return
+        if value in ownership.MODES:
+            settings.ownership = value
+            save_config()
+            console.print(f"[ok]{Glyph.CHECK} Ownership {Glyph.ARROW} {value}[/ok] [muted]·saved[/muted]")
+            return
+        if value:
+            console.print("[muted]Usage: /ownership [auto|user|agent] | /ownership forget <path>[/muted]")
+            return
+        files = ownership.listing()
+        meaning = {
+            "auto": "model tidies only files it created",
+            "user": "minimal-change everywhere",
+            "agent": "model tidies the whole project",
+        }[ownership.mode()]
+        console.print(f"[key]Ownership[/key] {Glyph.ARROW} {ownership.mode()} [muted]{Glyph.DOT} {meaning}[/muted]")
+        if files:
+            shown = ", ".join(escape(f) for f in files[:12])
+            more = f" (+{len(files) - 12} more)" if len(files) > 12 else ""
+            console.print(f"[muted]Created by g023 ({len(files)}): {shown}{more}[/muted]")
+
     def cmd_max_ctx(self, arg: str = "") -> None:
         value = arg.strip().lower()
 
@@ -726,7 +908,9 @@ class CLI:
             count = Settings.max_context_tokens
         else:
             try:
-                count = int(value.replace(",", "").replace("_", ""))
+                count = _parse_token_count(value, small_is_fraction=False)
+                if count is None:  # "-5" still reaches the range message below
+                    count = int(value.replace(",", "").replace("_", ""))
             except ValueError:
                 console.print(
                     f"[warn]Not a number:[/warn] {escape(arg.strip())}  "
@@ -755,9 +939,59 @@ class CLI:
     def cmd_compact_threshold(self, arg: str = "") -> None:
         value = arg.strip().lower()
 
+        if value in ("economic", "fixed"):
+            settings.compact_policy = value
+            save_config()
+            note = (
+                "also compacts once re-reading history costs more than compacting"
+                if value == "economic"
+                else "token trigger only"
+            )
+            console.print(f"[ok]{Glyph.CHECK} Compact policy {Glyph.ARROW} {value}[/ok] [muted]{note} ·saved[/muted]")
+            return
+        if value.startswith("floor"):
+            floor = _parse_token_count(value[5:].strip())
+            if floor is None or not 0 <= floor <= MAX_CONTEXT_TOKENS:
+                console.print(f"[muted]Usage: /compact-at floor 64k  (0–{MAX_CONTEXT_TOKENS:,} tokens)[/muted]")
+                return
+            settings.compact_floor_tokens = floor
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} Economic compaction floor {Glyph.ARROW} {floor:,} tokens[/ok] [muted]·saved[/muted]"
+            )
+            return
+
+        tokens = _parse_token_count(value)
+        if tokens is not None:
+            if tokens and not MIN_CONTEXT_TOKENS <= tokens <= MAX_CONTEXT_TOKENS:
+                console.print(
+                    f"[warn]Out of range:[/warn] {escape(arg.strip())}  "
+                    f"[muted]({MIN_CONTEXT_TOKENS:,}–{MAX_CONTEXT_TOKENS:,} tokens, or 0 for "
+                    f"fraction-only)[/muted]"
+                )
+                return
+            settings.compact_at_tokens = tokens
+            save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} Auto-compact at {Glyph.ARROW} "
+                + (f"{tokens:,} tokens" if tokens else "fraction of the window only")
+                + " [muted]·checked between every step ·saved[/muted]"
+            )
+            return
+
         if not value:
             console.print(
-                f"[key]Auto-compact trigger[/key] {Glyph.ARROW} "
+                f"[key]Auto-compact at[/key] {Glyph.ARROW} "
+                f"{settings.compact_at_tokens:,} tokens "
+                f"[muted](/compact-at 200k · 0 = fraction only)[/muted]"
+            )
+            console.print(
+                f"[key]Compact policy[/key] {Glyph.ARROW} {settings.compact_policy} "
+                f"[muted]{Glyph.DOT} floor {settings.compact_floor_tokens:,} tokens "
+                f"(/compact-at economic|fixed · /compact-at floor 64k)[/muted]"
+            )
+            console.print(
+                f"[key]Auto-compact ceiling[/key] {Glyph.ARROW} "
                 f"{describe_compact_threshold(settings.compact_threshold)} "
                 f"[muted]{Glyph.DOT} = "
                 f"{settings.compact_threshold * settings.max_context_tokens:,.0f} tokens "
@@ -868,26 +1102,29 @@ class CLI:
 
     @staticmethod
     def _g023_status_line() -> str:
+        from . import bbs as bbs_mod
         from . import memory_notes
 
         active = project_instructions.active_file()
         mem = memory_notes.status_line()
+        board = bbs_mod.status_line()
+        extra = f"memory {mem} {Glyph.DOT} bbs {board}"
         if active is None:
             return (
                 f"none [muted]{Glyph.DOT} add {project_instructions.FULL_NAME} "
-                f"for standing project instructions {Glyph.DOT} memory {mem}[/muted]"
+                f"for standing project instructions {Glyph.DOT} {extra}[/muted]"
             )
         freeze = "frozen for this process; file edits apply next process"
         if active.name == project_instructions.COMPACT_NAME:
             return (
                 f"{active.name} [muted]{Glyph.DOT} {freeze} "
-                f"{Glyph.DOT} memory {mem} "
+                f"{Glyph.DOT} {extra} "
                 f"{Glyph.DOT} /g023-compact to refresh from "
                 f"{project_instructions.FULL_NAME}[/muted]"
             )
         return (
             f"{active.name} [muted]{Glyph.DOT} {freeze} "
-            f"{Glyph.DOT} memory {mem} "
+            f"{Glyph.DOT} {extra} "
             f"{Glyph.DOT} /g023-compact to write "
             f"{project_instructions.COMPACT_NAME}[/muted]"
         )
@@ -993,7 +1230,7 @@ class CLI:
         if signals.unknown_types:
             for name, count in sorted(signals.unknown_types.items()):
                 console.print(
-                    f"[warn]{Glyph.BULLET} unknown item type[/warn] [key]{name}[/key] "
+                    f"[warn]{Glyph.BULLET} unknown item type[/warn] [key]{escape(str(name))}[/key] "
                     f"[muted]seen in {count} response(s) this session — echoed back "
                     f"verbatim, absent from the trace.[/muted]"
                 )
@@ -1023,8 +1260,8 @@ class CLI:
     def cmd_settings(self, arg: str = "") -> None:
         sub = arg.strip().lower()
         if sub == "save":
-            path = save_config()
-            console.print(f"[ok]{Glyph.CHECK} Settings saved {Glyph.ARROW}[/ok] [muted]{path}[/muted]")
+            path = save_config(full=True)
+            console.print(f"[ok]{Glyph.CHECK} Settings saved {Glyph.ARROW}[/ok] [muted]{ui.display_path(path)}[/muted]")
             return
         if sub == "reset":
             if not confirm("Restore the built-in defaults?", default=False):
@@ -1033,10 +1270,26 @@ class CLI:
             for key in PERSISTED_KEYS:
                 setattr(settings, key, getattr(defaults, key))
             path = save_config()
-            console.print(f"[ok]{Glyph.CHECK} Defaults restored[/ok] [muted]{path}[/muted]")
+            console.print(f"[ok]{Glyph.CHECK} Defaults restored[/ok] [muted]{ui.display_path(path)}[/muted]")
+            return
+        if sub == "set" or sub.startswith("set "):
+            parts = arg.strip().split(maxsplit=2)
+            if len(parts) < 3:
+                console.print("[muted]Usage: /settings set KEY VALUE  (a ·saved key; see /settings)[/muted]")
+                return
+            key, text = parts[1].strip().lower(), parts[2]
+            value, why = parse_setting(key, text)
+            if why:
+                console.print(f"[warn]Not set:[/warn] {why}")
+                return
+            setattr(settings, key, value)
+            path = save_config()
+            console.print(
+                f"[ok]{Glyph.CHECK} {key} {Glyph.ARROW} {value}[/ok] [muted]·saved to {ui.display_path(path)}[/muted]"
+            )
             return
         if sub:
-            console.print("[muted]Usage: /settings [save|reset][/muted]")
+            console.print("[muted]Usage: /settings [save|reset|set KEY VALUE][/muted]")
             return
         self.show_settings()
 
@@ -1050,8 +1303,7 @@ class CLI:
             saved = " [muted]·saved[/muted]" if name in PERSISTED_KEYS else ""
             table.add_row(name, f"{value}{saved}", note)
 
-        row("orchestrator_model", settings.orchestrator_model, "/model")
-        row("subagent_model", settings.subagent_model)
+        row("model", MODEL, "fixed · /model")
         row("reasoning_effort", settings.reasoning_effort, "/thinking")
         row("thinking_enabled", settings.thinking_enabled, "/thinking off")
         row("verbose", settings.verbose, self.VERBOSE_HELP[settings.verbose])
@@ -1075,25 +1327,50 @@ class CLI:
             "auto-compact trigger · /compact-threshold",
         )
         row("auto_compact", settings.auto_compact, "/compact auto on|off")
+        row("compact_at_tokens", f"{settings.compact_at_tokens:,}", "auto-compact trigger · /compact-at 200k")
+        row("compact_policy", settings.compact_policy, "economic | fixed · /compact-at economic")
+        row("compact_floor_tokens", f"{settings.compact_floor_tokens:,}", "economic floor · /compact-at floor 64k")
+        row("subagents_enabled", settings.subagents_enabled, "Agent tool + LLM ReadFile focus · /subagents")
+        row("ownership", settings.ownership, "who may tidy which files · /ownership")
         row(
             "max_iterations",
             describe_steps(settings.max_iterations),
             "tool steps per turn · /steps",
         )
+        row("exploration_ledger", settings.exploration_ledger, "carry files/searches seen across compaction")
+        row("write_backup", settings.write_backup, "copy a file before Edit/WriteFile changes it")
+        row("write_backup_keep", settings.write_backup_keep, "backups kept per file")
+        row("verify_replay", settings.verify_replay, "re-run the check that last failed, after an edit")
+        row("failure_attribution", settings.failure_attribution, "label check failures new or pre-existing")
+        row("finish_on_success", settings.finish_on_success, "end the turn on a passing final step")
+        row("finish_licensed", settings.finish_licensed, "finish despite pre-existing, unrelated test failures (⚠ noted)")
+        row("claimed_write_guard", settings.claimed_write_guard, "hold an answer that claims a change to a file no call wrote")
+        row("answer_escrow", settings.answer_escrow, "keep a held-back answer; the model replies [deliver] to send it")
+        row("closure_receipts", settings.closure_receipts, "Edit lists references left to removed names")
+        row("lean_codec", settings.lean_codec, "raw Bash output, no backup paths in history")
+        row("lean_prompt", settings.lean_prompt, "answers skip what the trace shows")
+        row("orient_card", settings.orient_card, "locate names the request mentions")
+        row("scope_count", settings.scope_count, "scoped searches count hits elsewhere")
+        row("search_tiers", settings.search_tiers, "search ranks definitions named by the query first")
+        row("def_peek", settings.def_peek, "search shows the top definition's body")
+        row("view_deltas", settings.view_deltas, "Bash shows diffs of files it changed that were read")
+        row("test_oracle", settings.test_oracle, "pytest runs report hidden failures, new tests, failure loci")
+        row("vacuity_check", settings.vacuity_check, "flag new tests that pass without the turn's source edits")
+        row("obligations", settings.obligations, "check callables the request names before answering")
+        row("write_guards", settings.write_guards, "\"don't change X\" in a request guards writes to X")
+        row("callee_digest", settings.callee_digest, "ReadFile lists signatures of imported project names")
+        row("claim_check", settings.claim_check, "note when an answer's test claim contradicts the last run")
+        row("ordered_batches", settings.ordered_batches, "write + its check in one response; failed write skips the rest")
+        row("preread", settings.preread, "run the reads the request makes predictable before the first call")
+        row("step_budget", settings.step_budget, "model declares [budget MIN-MAX +OVER]; hop tracker on results")
+        row("write_check", settings.write_check, "Edit/WriteFile carry a check command run after the response's writes")
+        row("multi_edit", settings.multi_edit, "Edit takes more_edits: several hunks, across files, all or nothing")
+        row("rename_tool", settings.rename_tool, "Rename tool: an identifier across the project in one call")
         row("max_search_matches", settings.max_search_matches)
         row("file_summary_max_tokens", settings.file_summary_max_tokens)
         row("permission_default", settings.permission_default, "/tools")
-        row("vision_backend", settings.vision_backend, "/vision")
-        row("vision_model", settings.vision_model or "—")
-        row("vision_host", settings.vision_host or f"(auto: {ollama_client.resolve_host()})", "/ollama host")
-        row("vision_max_image_dim", settings.vision_max_image_dim, "legacy; vision send is 800px")
-        row("vision_num_ctx", f"{settings.vision_num_ctx:,}")
+        row("vision_enabled", settings.vision_enabled, "AnalyzeImage · /vision on|off")
         row("vision_timeout", f"{settings.vision_timeout}s")
-        row("vision_keep_alive", settings.vision_keep_alive, "how long the model stays in VRAM")
-        row("vision_endpoint", settings.vision_endpoint, "/vision endpoint (deepseek backend)")
-        row("deepseek_vision_model", settings.deepseek_vision_model, "deepseek backend default")
-        row("or_default_model", settings.or_default_model, "openrouter backend default")
-        row("or_credits", settings.or_credits, "$10+ lifetime credits → 1000/24h · /or tier")
         row("surge_notify", settings.surge_notify, "/surge notify on|off")
         row("surge_pause", settings.surge_pause, "/surge on|off")
         row(
@@ -1102,18 +1379,19 @@ class CLI:
             "pause starts/ends around peak · /surge buffer",
         )
         row("base_url", settings.base_url)
-        row("project_root", settings.project_root)
-        row("home", settings.home)
+        row("project_root", ui.display_path(settings.project_root))
+        row("home", ui.display_path(settings.home))
         project_cfg = get_project_config_file()
-        cfg_line = str(get_config_file())
+        cfg_line = ui.display_path(get_config_file())
         if project_cfg.exists():
-            cfg_line += f" + project override {project_cfg}"
+            cfg_line += f" + project override {ui.display_path(project_cfg)}"
         row("config_file", cfg_line)
 
         console.print()
         console.print(panel(table, "Settings", subtitle="·saved keys persist to config.json"))
         console.print(
-            "[muted]/settings save to persist now · /settings reset for defaults · "
+            "[muted]/settings set KEY VALUE to change a ·saved key · /settings save to persist now · "
+            "/settings reset for defaults · "
             "/config to manage global vs project scope[/muted]"
         )
 
@@ -1161,17 +1439,16 @@ class CLI:
         return table
 
     def pricing_note(self) -> str:
-        # Only price what the Responses API will actually serve. Listing a model
-        # /model refuses to select reads as a menu, not a footnote.
+        p = PRICING[MODEL]
         parts = [
-            f"{model}: ${p.cache_hit}/1M hit {Glyph.DOT} ${p.cache_miss}/1M miss "
+            f"{MODEL}: ${p.cache_hit}/1M hit {Glyph.DOT} ${p.cache_miss}/1M miss "
             f"{Glyph.DOT} ${p.output}/1M out (surge {p.surge_output}/1M, 2×)"
-            for model, p in PRICING.items()
-            if model in AVAILABLE_MODELS
         ]
         return (
             "[muted]"
             + "\n".join(parts)
+            + "\nWebSearch / FetchUrl (DeepSeek Search and Fetch APIs): $0.75 per 1,000 successful requests each "
+            + "(failed and empty requests are free)."
             + "\nPrices are off-peak (regular); peak is 2× during surge hours. "
             + "Estimates only — actual billing is DeepSeek's.[/muted]"
         )
@@ -1188,7 +1465,7 @@ class CLI:
             name, level = parts[0], parts[1].lower()
             match = next((t for t in reg.policy if t.lower() == name.lower()), None)
             if match is None:
-                console.print(f"[warn]Unknown tool:[/warn] {name}  [muted](/tools lists them)[/muted]")
+                console.print(f"[warn]Unknown tool:[/warn] {escape(name)}  [muted](/tools lists them)[/muted]")
                 return
             if level not in (ALLOW, ASK, BLOCK):
                 console.print(f"[warn]Unknown level:[/warn] {level}  [muted](allow | ask | block)[/muted]")
@@ -1221,9 +1498,7 @@ class CLI:
         for name in sorted(reg.policy):
             style = ui.tool_style(name)
             level = reg.policy[name]
-            note = "subagent-isolated" if style.subagent else ""
-            if name == "FetchUrl":
-                note = "always prompts (cache vs network)"
+            note = tool_note(name, level)
             table.add_row(
                 f"[{style.color}]{style.icon}[/{style.color}]",
                 name,
@@ -1243,401 +1518,166 @@ class CLI:
     def _cache_size_line(self) -> str:
         db = get_cache().db_path
         try:
-            return f"{human_bytes(db.stat().st_size)} [muted]{db}[/muted]"
+            return f"{human_bytes(db.stat().st_size)} [muted]{ui.display_path(db)}[/muted]"
         except OSError:
             return "[muted]empty[/muted]"
 
     def cmd_cache(self, arg: str = "") -> None:
-        sub = arg.strip().lower()
+        from . import web
+        from .usage import FETCH_REQUEST_USD, SEARCH_REQUEST_USD
+
+        sub = " ".join(arg.strip().lower().split())
 
         if sub in ("", "stats", "status"):
-            cache = get_cache()
-            stats = cache.stats()
+            stats = get_cache().stats()
+            store = web.get_store()
+            ws = store.stats()
+            led = store.ledger()
+            srch = led.get("search", {})
+            ftch = led.get("fetch", {})
+            served_free = srch.get("cached", 0) + ftch.get("cached", 0) + ftch.get("primed", 0)
+            saved = srch.get("cached", 0) * SEARCH_REQUEST_USD + (
+                ftch.get("cached", 0) + ftch.get("primed", 0)
+            ) * FETCH_REQUEST_USD
             table = kv_table(
                 [
                     ("file summaries", f"{stats['files']:,}"),
                     ("vision answers", f"{stats['vision']:,}"),
-                    ("cached URLs", f"{stats['web']:,}"),
                     ("tool vault", f"{stats.get('vault', 0):,}"),
-                    ("database", self._cache_size_line()),
+                    ("project database", self._cache_size_line()),
+                    ("web searches", f"{ws['searches']:,} [muted](machine-wide)[/muted]"),
+                    ("web pages", f"{ws['pages']:,} ({human_bytes(ws['page_chars'])} text) · {ws['refusals']} refusals"),
+                    (
+                        "web requests",
+                        f"search {srch.get('network', 0)} paid / {srch.get('cached', 0)} cached · "
+                        f"fetch {ftch.get('network', 0)} paid / {ftch.get('cached', 0)} cached / "
+                        f"{ftch.get('primed', 0)} from search prefetch",
+                    ),
+                    ("web fees saved", f"${saved:.4f} [muted]({served_free} requests served free)[/muted]"),
+                    ("web database", f"{human_bytes(ws['bytes'])} [muted]{ui.display_path(store.path)}[/muted]"),
                 ]
             )
             console.print()
             console.print(panel(table, "Cache"))
-            console.print("[muted]/cache web to list URLs · /cache clear to purge everything[/muted]")
+            console.print("[muted]/cache web to list · /cache web clear · /cache clear purges this project[/muted]")
             return
 
         if sub == "clear":
             get_cache().clear_all()
-            console.print(f"[ok]{Glyph.CHECK} All caches purged.[/ok]")
+            console.print(f"[ok]{Glyph.CHECK} Project caches purged (the working set and the machine-wide web cache are kept).[/ok]")
             return
         if sub == "web":
             self.show_web_cache()
             return
         if sub in ("web clear", "clear web"):
-            n = get_cache().clear_web()
-            console.print(f"[ok]{Glyph.CHECK} URL cache purged ({n} entries).[/ok]")
+            n = web.get_store().clear()
+            console.print(f"[ok]{Glyph.CHECK} Machine-wide web cache purged ({n} entries).[/ok]")
             return
-        console.print("[muted]Usage: /cache [stats|clear|web|web clear][/muted]")
+        if sub == "web prune":
+            n = web.get_store().prune()
+            console.print(f"[ok]{Glyph.CHECK} Dropped {n} web entries unused for 90 days.[/ok]")
+            return
+        console.print("[muted]Usage: /cache [stats|clear|web|web clear|web prune][/muted]")
 
     def show_web_cache(self):
-        entries = get_cache().list_web()
-        if not entries:
-            console.print("[muted]No URLs cached yet.[/muted]")
+        from . import web
+
+        store = web.get_store()
+        searches = store.list_searches(15)
+        pages = store.list_pages(25)
+        if not searches and not pages:
+            console.print("[muted]Nothing in the web cache yet.[/muted]")
             return
-        table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
-        table.add_column("Fetched", style="muted")
-        table.add_column("St", justify="right")
-        table.add_column("Size", justify="right")
-        table.add_column("Hits", justify="right")
-        table.add_column("URL", overflow="fold")
-        for e in entries:
-            table.add_row(
-                _describe_age(time.time() - e["fetched_at"]),
-                str(e["status"]),
-                human_bytes(e["size"]),
-                str(e["hit_count"]),
-                e["url"][:90],
-            )
-        console.print()
-        console.print(panel(table, "Cached pages"))
-        console.print("[muted]/cache web clear purges these.[/muted]")
+        if searches:
+            table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
+            table.add_column("Searched", style="muted")
+            table.add_column("Hits", justify="right")
+            table.add_column("Results", justify="right")
+            table.add_column("Query", overflow="fold")
+            for e in searches:
+                table.add_row(_describe_age(time.time() - e["fetched_at"]), str(e["hits"]), str(e["n"]), e["query"][:90])
+            console.print()
+            console.print(panel(table, "Cached searches (machine-wide)"))
+        if pages:
+            table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
+            table.add_column("Fetched", style="muted")
+            table.add_column("St", justify="right")
+            table.add_column("Size", justify="right")
+            table.add_column("Hits", justify="right")
+            table.add_column("From")
+            table.add_column("URL", overflow="fold")
+            for e in pages:
+                table.add_row(
+                    _describe_age(time.time() - e["fetched_at"]),
+                    str(e["status"]),
+                    human_bytes(e["chars"]),
+                    str(e["hits"]),
+                    e["source"],
+                    e["url"][:90],
+                )
+            console.print()
+            console.print(panel(table, "Cached pages (machine-wide)"))
+        console.print("[muted]/cache web clear purges these for every project.[/muted]")
 
     # ------------------------------------------------------------------
-    # /fetch
+    # /fetch, /search
     # ------------------------------------------------------------------
 
     def cmd_fetch(self, arg: str = "") -> None:
-        from . import web_fetch
+        from . import web
 
-        low = arg.lower().strip()
-
-        if low in ("status", "info", ""):
-            report = web_fetch.fidelity_report()
-            table = kv_table(
-                [
-                    ("engine", report["engine"]),
-                    ("TLS fingerprint", report["tls_fingerprint"]),
-                    ("HTTP/2", "yes" if report["http2"] else "no"),
-                    ("header order", report["header_order"]),
-                    ("cookies", report["cookies"]),
-                    ("brotli / zstd", f"{report['brotli']} / {report['zstd']}"),
-                    ("JavaScript", "no (static fetch only)"),
-                ]
+        url = (arg.split() or [""])[0]
+        if not url or url.lower() in ("status", "info"):
+            store = web.get_store()
+            console.print(
+                f"[muted]FetchUrl uses DeepSeek's Fetch API; pages are cached machine-wide in {ui.display_path(store.path)}.[/muted]"
             )
-            console.print()
-            console.print(panel(table, "FetchUrl"))
-            console.print(f"[muted]{report['notes']}[/muted]")
-            if not arg:
-                console.print("[muted]Usage: /fetch <url>[/muted]")
+            console.print("[muted]Usage: /fetch <url>[/muted]")
             return
-
-        if low in ("cookies clear", "clear cookies"):
-            web_fetch.CookieStore().clear()
-            console.print(f"[ok]{Glyph.CHECK} Stored cookies cleared.[/ok]")
-            return
-
-        url = arg.split()[0]
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
         args = {"url": url, "cache_mode": "auto"}
         if not get_registry().confirm_fetch(args):
             console.print("[warn]Cancelled.[/warn]")
             return
-
-        cache = get_cache()
-        if args["cache_mode"] == "cache":
-            cached = cache.get_web(url)
-            if not cached:
-                console.print("[warn]Nothing cached for that URL.[/warn]")
-                return
-            result = web_fetch.FetchResult(
-                url=cached["url"],
-                final_url=cached["final_url"] or cached["url"],
-                status=cached["status"] or 0,
-                headers=cached["headers"],
-                body=cached["body"],
-                engine=cached["engine"] or "cache",
-                profile=cached["profile"] or "",
-                elapsed_ms=0,
-                fetched_at=cached["fetched_at"],
-                from_cache=True,
-            )
-        else:
-            try:
-                with console.status(f"[accent]Fetching[/accent] {url}", spinner="dots"):
-                    result = web_fetch.fetch(url)
-            except Exception as e:
-                console.print(f"[bad]Fetch failed:[/bad] {e}")
-                return
-            cache.put_web(
-                url,
-                body=result.body,
-                status=result.status,
-                headers=result.headers,
-                final_url=result.final_url,
-                engine=result.engine,
-                profile=result.profile,
-            )
-
-        data = web_fetch.extract(result, "text")
-        source = "cache" if result.from_cache else f"network {Glyph.DOT} {result.elapsed_ms} ms"
-        header = (
-            f"HTTP {result.status} {Glyph.DOT} {source} {Glyph.DOT} {result.engine} "
-            f"{Glyph.DOT} {human_bytes(len(result.body))}"
-        )
+        try:
+            with console.status(f"[accent]Fetching[/accent] {url}", spinner="dots"):
+                page = web.fetch(url, mode=args["cache_mode"])
+        except web.WebError as e:
+            console.print(f"[bad]Fetch failed:[/bad] {e}")
+            return
+        source = page.source if page.source == "network" else f"{page.source} ({_describe_age(page.age)})"
+        if page.cut:
+            source += f" {Glyph.DOT} cut at 20 KB by the web service; the rest of the page is missing"
+        elif page.note:
+            source += f" {Glyph.DOT} {escape(page.note)}"
         console.print()
         console.print(
             panel(
-                f"[heading]{data.get('title') or result.final_url}[/heading]\n"
-                f"[muted]{header}[/muted]\n\n" + (data.get("content") or "")[:3000],
-                result.final_url[:70],
+                f"[heading]{page.title or page.url}[/heading]\n"
+                f"[muted]{source} {Glyph.DOT} {human_bytes(len(page.body))}[/muted]\n\n" + page.body[:3000],
+                page.url[:70],
             )
         )
 
-    # ------------------------------------------------------------------
-    # /ollama
-    # ------------------------------------------------------------------
+    def cmd_search(self, arg: str = "") -> None:
+        from . import web
 
-    async def cmd_ollama(self, arg: str = "") -> None:
-        parts = arg.split(maxsplit=1)
-        sub = parts[0].lower() if parts else "status"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-
-        if sub in ("status", "", "info"):
-            self.ollama_status()
-        elif sub == "host":
-            self.ollama_set_host(rest)
-        elif sub in ("models", "list", "ls"):
-            self.ollama_models()
-        elif sub == "test":
-            await self.ollama_test(rest)
-        elif sub in ("ps", "running"):
-            self.ollama_ps()
-        else:
-            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
-            console.print("[muted]/ollama [status|host|models|test|ps]  ·  /help ollama[/muted]")
-
-    def ollama_status(self) -> None:
-        host = ollama_client.resolve_host()
-        with console.status(f"[accent]Contacting {host}…[/accent]", spinner="dots"):
-            probe = ollama_client.probe(host)
-
-        rows = [
-            ("host", f"[ok]{probe.host}[/ok]" if probe.ok else f"[bad]{probe.host}[/bad]"),
-            ("source", ollama_client.host_source()),
-            ("location", "local machine" if ollama_client.is_local(host) else "remote"),
-        ]
-        if probe.ok:
-            rows += [
-                ("status", f"[ok]{Glyph.CHECK} reachable[/ok]"),
-                ("version", probe.version or "unknown"),
-                ("latency", human_ms(probe.latency_ms)),
-                ("models", f"{probe.model_count} installed" if probe.model_count is not None else "—"),
-            ]
-        else:
-            rows.append(("status", f"[bad]{Glyph.CROSS} {probe.error}[/bad]"))
-        rows.append(("vision", self.vision_status()))
-
-        console.print()
-        console.print(panel(kv_table(rows), "Ollama"))
-        if not probe.ok:
-            console.print(f"[muted]{ollama_client.unreachable_hint(host)}[/muted]")
-        elif not settings.vision_enabled:
-            console.print("[muted]Vision is off — run [bold]/vision[/bold] to pick a model.[/muted]")
-
-    def ollama_set_host(self, value: str) -> None:
-        if not value:
-            console.print(f"[muted]Current host:[/muted] {ollama_client.resolve_host()}")
-            console.print(
-                "[muted]Usage: /ollama host <address|default>   e.g. 192.168.1.50, "
-                "gpu-box:11434, https://ollama.example.com[/muted]"
-            )
+        text = arg.strip()
+        fresh = False
+        if text.lower().startswith("fresh "):
+            fresh, text = True, text[6:].strip()
+        if not text:
+            console.print("[muted]Usage: /search [fresh] <query>[/muted]")
             return
-
-        if value.lower() in ("default", "auto", "reset", "none", "local", "localhost"):
-            settings.vision_host = None
-            save_config()
-            host = ollama_client.resolve_host()
-            console.print(
-                f"[ok]{Glyph.CHECK} Host override cleared[/ok] [muted]{Glyph.ARROW} {host} "
-                f"({ollama_client.host_source()}) ·saved[/muted]"
-            )
-            self._report_probe(host)
-            return
-
-        host = ollama_client.normalize_host(value)
-        with console.status(f"[accent]Testing {host}…[/accent]", spinner="dots"):
-            probe = ollama_client.probe(host)
-
-        if not probe.ok:
-            console.print(f"[bad]{Glyph.CROSS} {host} {Glyph.DOT} {probe.error}[/bad]")
-            console.print(f"[muted]{ollama_client.unreachable_hint(host)}[/muted]")
-            if not confirm("Save it anyway?", default=False):
-                console.print("[muted]Host unchanged.[/muted]")
-                return
-
-        settings.vision_host = host
-        save_config()
-        console.print(f"[ok]{Glyph.CHECK} Ollama host {Glyph.ARROW} {host}[/ok] [muted]·saved[/muted]")
-        if probe.ok:
-            console.print(f"[muted]{probe.summary}[/muted]")
-            if settings.vision_enabled:
-                self._warn_if_model_absent(host)
-            else:
-                console.print("[muted]Run [bold]/vision[/bold] to pick a model on this host.[/muted]")
-
-    def _report_probe(self, host: str) -> None:
-        probe = ollama_client.probe(host)
-        if probe.ok:
-            console.print(f"[muted]{Glyph.CHECK} {probe.summary}[/muted]")
-        else:
-            console.print(f"[warn]{Glyph.CROSS} {probe.error}[/warn]")
-
-    def _warn_if_model_absent(self, host: str) -> None:
-        """A saved model name means nothing on a machine that doesn't have it."""
         try:
-            models = ollama_client.list_models(host, probe_capabilities=False)
-        except Exception:
+            with console.status(f"[accent]Searching[/accent] {text}", spinner="dots"):
+                out = web.search(text, 10, fresh=fresh)
+        except web.WebError as e:
+            console.print(f"[bad]Search failed:[/bad] {e}")
             return
-        if settings.vision_model and ollama_client.find_model(models, settings.vision_model) is None:
-            console.print(
-                f"[warn]Note:[/warn] this host has no '{settings.vision_model}'. "
-                "Run [bold]/vision[/bold] to pick one of its models."
-            )
-
-    def ollama_models(self) -> None:
-        host = ollama_client.resolve_host()
-        try:
-            with console.status(f"[accent]Listing models on {host}…[/accent]", spinner="dots"):
-                models = ollama_client.list_models(host)
-        except Exception as e:
-            console.print(f"[bad]Could not list models:[/bad] {e}")
-            console.print(f"[muted]{ollama_client.unreachable_hint(host)}[/muted]")
-            return
-
-        if not models:
-            console.print(f"[warn]{host} is running but has no models installed.[/warn]")
-            console.print("[muted]Pull one there, e.g. [bold]ollama pull qwen2.5vl:7b[/bold][/muted]")
-            return
-
-        table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
-        table.add_column("Model", style="key")
-        table.add_column("Size", justify="right")
-        table.add_column("Params", justify="right", style="muted")
-        table.add_column("Quant", style="muted")
-        table.add_column("Vision", justify="center")
-        for m in models:
-            mark = {
-                "reported": f"[ok]{Glyph.CHECK}[/ok]",
-                "guessed": "[warn]likely[/warn]",
-                "no": "[muted]—[/muted]",
-            }[m.vision_certainty]
-            current = " [ok](in use)[/ok]" if m.name == settings.vision_model else ""
-            table.add_row(
-                f"{m.name}{current}",
-                f"{m.size_gb:.1f} GB" if m.size_bytes else "—",
-                m.parameter_size or "—",
-                m.quantization or "—",
-                mark,
-            )
         console.print()
-        console.print(panel(table, f"Models on {host}"))
-        console.print("[muted]/vision to enable one · 'likely' means we inferred it from the name[/muted]")
-
-    async def ollama_test(self, model: str = "") -> None:
-        """Round-trip a real request so a host is proven, not just pingable."""
-        host = ollama_client.resolve_host()
-        target = model.strip() or settings.vision_model
-        probe = ollama_client.probe(host)
-        if not probe.ok:
-            console.print(f"[bad]{Glyph.CROSS} {host} {Glyph.DOT} {probe.error}[/bad]")
-            console.print(f"[muted]{ollama_client.unreachable_hint(host)}[/muted]")
-            return
-
-        console.print(f"[ok]{Glyph.CHECK}[/ok] {host} [muted]{Glyph.DOT} {probe.summary}[/muted]")
-        if not target:
-            console.print(
-                "[muted]No model to test — pass one (/ollama test <model>) or enable "
-                "vision with /vision.[/muted]"
-            )
-            return
-
-        import base64
-        import io
-
-        try:
-            from PIL import Image
-        except ImportError:
-            console.print(
-                "[warn]Pillow is not installed, so no test image can be generated.[/warn]\n"
-                "[muted]pip install pillow — or just point /vision at an image.[/muted]"
-            )
-            return
-
-        # A 64x64 tile with one unmistakable feature: if the model describes it,
-        # the whole path works — image encoding, transport, and inference.
-        image = Image.new("RGB", (64, 64), "white")
-        for x in range(16, 48):
-            for y in range(28, 36):
-                image.putpixel((x, y), (255, 0, 0))
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        payload = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        try:
-            with console.status(
-                f"[accent]Running {target} on {host}…[/accent] [muted](a cold load can take a while)[/muted]",
-                spinner="dots",
-            ):
-                result = await ollama_client.vision_chat_detailed(
-                    model=target,
-                    prompt="What colour is the shape in this image? Answer in one word.",
-                    image_b64=payload,
-                    host=host,
-                    timeout=min(settings.vision_timeout, 120),
-                    num_ctx=settings.vision_num_ctx,
-                )
-        except Exception as e:
-            console.print(f"[bad]{Glyph.CROSS} Inference failed:[/bad] {e}")
-            console.print("[muted]/ollama models shows what this host actually has.[/muted]")
-            return
-
-        rows = [
-            ("model", target),
-            ("answer", result.answer[:200] or "[muted](empty)[/muted]"),
-            ("round trip", human_ms(result.elapsed_ms)),
-            ("model load", human_ms(result.load_ms) if result.load_ms else "already warm"),
-            ("tokens", f"{result.eval_count} out at {result.tokens_per_second:.1f}/s"),
-        ]
-        console.print()
-        console.print(panel(kv_table(rows), "Vision round-trip"))
-        if "red" in result.answer.lower():
-            console.print(f"[ok]{Glyph.CHECK} The model saw the image correctly.[/ok]")
-        else:
-            console.print(
-                "[warn]The model answered, but not with the expected colour (red) — "
-                "it may not actually be image-capable.[/warn]"
-            )
-
-    def ollama_ps(self) -> None:
-        host = ollama_client.resolve_host()
-        running = ollama_client.running_models(host)
-        if not running:
-            console.print(f"[muted]Nothing loaded on {host} right now.[/muted]")
-            return
-        table = Table(show_header=True, header_style="heading", box=None, padding=(0, 2, 0, 0))
-        table.add_column("Model", style="key")
-        table.add_column("VRAM", justify="right")
-        table.add_column("Expires", style="muted")
-        for m in running:
-            table.add_row(
-                str(m.get("name") or m.get("model") or "?"),
-                human_bytes(int(m.get("size_vram") or m.get("size") or 0)),
-                str(m.get("expires_at") or "—")[:19],
-            )
-        console.print()
-        console.print(panel(table, f"Loaded on {host}"))
+        console.print(panel(web.render_search(out, 10), f"search {Glyph.DOT} {out.source}"))
 
     # ------------------------------------------------------------------
     # /vision
@@ -1645,232 +1685,139 @@ class CLI:
 
     def vision_status(self) -> str:
         if not settings.vision_enabled:
-            return "[muted]disabled[/muted]"
-        model = settings.effective_vision_model or "(backend default)"
-        label = f"[ok]on[/ok] {Glyph.DOT} {settings.vision_backend} {Glyph.DOT} [heading]{model}[/heading]"
-        if settings.vision_backend == "deepseek":
-            label += f" [muted]({settings.vision_endpoint})[/muted]"
-        return label
+            return "[muted]off[/muted]"
+        return f"[ok]on[/ok] {Glyph.DOT} {MODEL} [muted](800 px cap)[/muted]"
 
-    def _disable_vision(self):
-        settings.vision_backend = "none"
-        settings.vision_model = None
-        save_config()
-        console.print(f"[warn]Vision disabled.[/warn] [muted]·saved[/muted]")
-
-    def _enable_vision(self, model: str, warn_no_vision: bool = False, backend: Optional[str] = None):
-        """Turn vision on for a backend+model and persist it."""
-        if backend is not None:
-            settings.vision_backend = backend
-        elif settings.vision_backend in ("", "none"):
-            settings.vision_backend = "deepseek"  # the sensible default backend
-        settings.vision_model = model or None
+    def _set_vision(self, enabled: bool) -> None:
+        settings.vision_enabled = enabled
         path = save_config()
-        if warn_no_vision:
-            console.print(
-                f"[warn]Note:[/warn] {model} does not advertise image support — "
-                "AnalyzeImage may fail at runtime."
-            )
-        console.print(
-            f"[ok]{Glyph.CHECK} Vision {Glyph.ARROW} {settings.vision_backend} "
-            f"{Glyph.DOT} [heading]{settings.effective_vision_model}[/heading][/ok] "
-            f"[muted]·saved to {path}[/muted]"
-        )
+        word = "[ok]on[/ok]" if enabled else "[warn]off[/warn]"
+        console.print(f"Vision {Glyph.ARROW} {word} [muted]·saved to {ui.display_path(path)}[/muted]")
+        if enabled:
+            console.print("[muted]AnalyzeImage is offered from the next request.[/muted]")
 
     def cmd_vision(self, arg: str = "") -> None:
         low = arg.lower().strip()
-
+        if low in ("on", "enable", "enabled", "1", "true", "yes"):
+            self._set_vision(True)
+            return
+        if low in ("off", "none", "disable", "disabled", "0", "false", "no"):
+            self._set_vision(False)
+            return
         if low in ("status", "show"):
             console.print(f"Vision: {self.vision_status()}")
-            console.print(f"[muted]endpoint: {settings.vision_endpoint} · config: {get_config_file()}[/muted]")
             return
-        if low in ("off", "none", "disable", "disabled", "0", "false"):
-            self._disable_vision()
+        if low:
+            console.print(f"[warn]Unknown option:[/warn] {escape(arg)}  [muted](on | off | status)[/muted]")
             return
-        if low in ("default", "reset"):
-            settings.vision_model = None
-            save_config()
+        console.print(f"Vision: {self.vision_status()}")
+        flip = not settings.vision_enabled
+        if confirm(f"Turn vision {'on' if flip else 'off'}?", default=False):
+            self._set_vision(flip)
+
+    # ------------------------------------------------------------------
+    # /local
+    # ------------------------------------------------------------------
+
+    def local_status(self) -> str:
+        from . import local_llm
+
+        st = local_llm.status()
+        auto = st["mode"] == "auto"
+        if not st["enabled"]:
+            if auto:
+                return f"[muted]auto {Glyph.ARROW} off: {escape(st['auto'])}[/muted]"
+            return "[muted]off[/muted]"
+        label = f"auto {Glyph.ARROW} on" if auto else "on"
+        if not st["binary"]:
+            return f"[warn]{label}, llama-server not found[/warn] [muted](local_llama_dir)[/muted]"
+        if not st["model"]:
+            return f"[warn]{label}, model file not found[/warn] [muted](local_models_dir / local_model_file)[/muted]"
+        state = f"running :{st['port']} pid {st['pid']}" if st["running"] else "starts on first use"
+        name = Path(st["model"]).name + (" + vision" if st["mmproj"] else "")
+        return f"[ok]{label}[/ok] {Glyph.DOT} {escape(name)} {Glyph.DOT} {state}"
+
+    def cmd_local(self, arg: str = "") -> None:
+        from . import local_llm
+
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower() if parts else "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if sub in ("on", "off", "auto"):
+            settings.local_model = sub
+            if not settings.local_enabled:
+                local_llm.release()
+            path = save_config()
+            console.print(f"Local model {Glyph.ARROW} {self.local_status()} [muted]·saved to {ui.display_path(path)}[/muted]")
+            return
+        if sub == "unload":
+            stopped = local_llm.release()
+            console.print("Local server stopped." if stopped else "[muted]No local server was running.[/muted]")
+            return
+        if sub == "models":
+            names = local_llm.list_models()
+            console.print("\n".join(names) if names else f"[muted]no .gguf files in {escape(settings.local_models_dir)}[/muted]")
+            return
+        if sub in ("model", "vision"):
+            if not rest:
+                console.print(f"[warn]Usage:[/warn] /local {sub} NAME")
+                return
+            if sub == "vision" and rest.lower() in ("off", "none"):
+                settings.local_vision_file = "off"
+            elif rest.lower() == "auto":
+                setattr(settings, "local_model_file" if sub == "model" else "local_vision_file", "")
+            else:
+                if local_llm.resolve_model(rest) is None:
+                    console.print(f"[bad]Not found:[/bad] {escape(rest)} [muted](see /local models)[/muted]")
+                    return
+                setattr(settings, "local_model_file" if sub == "model" else "local_vision_file", rest)
+            local_llm.release()  # next use loads the new model
+            path = save_config()
+            console.print(f"Local {sub} {Glyph.ARROW} {escape(rest)} [muted]·saved to {ui.display_path(path)}[/muted]")
+            return
+        if sub == "scout":
+            if rest.lower() not in ("local", "always", "off"):
+                console.print("[warn]Usage:[/warn] /local scout local | always | off")
+                return
+            settings.scout_card = rest.lower()
+            path = save_config()
+            console.print(f"Scout card {Glyph.ARROW} {settings.scout_card} [muted]·saved to {ui.display_path(path)}[/muted]")
+            return
+        if sub == "tune":
+            from . import autotune
+
+            prof = autotune.refresh()
+            gpu = f"{prof.gpu.name} ({prof.gpu.total_mib:,} MiB)" if prof.gpu.kind else "none found"
             console.print(
-                f"[ok]{Glyph.CHECK} Vision model reset to backend default "
-                f"([heading]{settings.effective_vision_model}[/heading])[/ok] [muted]·saved[/muted]"
+                f"Auto-tune: {'[ok]usable[/ok]' if prof.usable else '[warn]not usable[/warn]'}"
+                + (f" [muted]{escape(prof.reason)}[/muted]" if prof.reason else "")
+                + f"\n[muted]binary {escape(str(prof.binary or '-'))}\nmodels {escape(str(prof.models_dir or '-'))}"
+                + f"\nmodel  {escape(str(prof.model or '-'))}"
+                + (f" ({prof.picked_by})" if prof.picked_by else "")
+                + f"\nvision {escape(str(prof.mmproj)) if prof.mmproj else 'DeepSeek'}\ngpu    {escape(gpu)}"
+                + f"\nmode   {settings.local_model} (local_model; /local auto|on|off)[/muted]"
             )
             return
-        if low.startswith("backend"):
-            backend = low[len("backend"):].strip()
-            if not backend:
-                console.print(f"[muted]Current backend:[/muted] {settings.vision_backend}")
-                console.print("[muted]Usage: /vision backend none|ollama|deepseek|openrouter[/muted]")
-                return
-            if backend not in registry.BACKEND_CHOICES:
-                console.print(
-                    f"[warn]Unknown backend:[/warn] {backend}  "
-                    f"[muted]({' | '.join(registry.BACKEND_CHOICES)})[/muted]"
-                )
-                return
-            settings.vision_backend = backend
-            save_config()
-            console.print(f"[ok]{Glyph.CHECK} Vision backend {Glyph.ARROW} {backend}[/ok] [muted]·saved[/muted]")
-            if backend == "ollama" and not settings.vision_model:
-                console.print("[muted]No model selected — run [bold]/vision[/bold] to pick one.[/muted]")
-            elif backend == "deepseek":
-                console.print(
-                    f"[muted]Model [heading]{settings.effective_vision_model}[/heading] · "
-                    f"endpoint {settings.vision_endpoint} · /vision endpoint to change[/muted]"
-                )
-            elif backend == "openrouter":
-                console.print(
-                    f"[muted]Model [heading]{settings.effective_vision_model}[/heading] · "
-                    f"list {or_client.load_or_models()} · /or for key/tier/usage[/muted]"
-                )
+        if sub not in ("status", "show", ""):
+            console.print(f"[warn]Unknown option:[/warn] {escape(arg)}  [muted](status | auto | on | off | tune | unload | models | model NAME | vision NAME | scout MODE)[/muted]")
             return
-        if low.startswith("endpoint"):
-            endpoint = low[len("endpoint"):].strip()
-            if not endpoint:
-                console.print(f"[muted]Current endpoint:[/muted] {settings.vision_endpoint}")
-                console.print("[muted]Usage: /vision endpoint responses|chat_completions[/muted]")
-                return
-            if endpoint not in registry.ENDPOINT_CHOICES:
-                console.print(
-                    f"[warn]Unknown endpoint:[/warn] {endpoint}  "
-                    f"[muted]({' | '.join(registry.ENDPOINT_CHOICES)})[/muted]"
-                )
-                return
-            settings.vision_endpoint = endpoint
-            save_config()
-            console.print(f"[ok]{Glyph.CHECK} Vision endpoint {Glyph.ARROW} {endpoint}[/ok] [muted]·saved[/muted]")
-            if settings.vision_backend == "openrouter":
-                console.print(
-                    "[muted]OpenRouter always speaks chat_completions; the endpoint "
-                    "setting applies to the deepseek backend.[/muted]"
-                )
-            return
+        st = local_llm.status()
+        from . import scout
 
-        # --- backend-specific model selection ---------------------------------
-        # With no backend chosen yet, a bare model name belongs to the default
-        # backend (deepseek) rather than requiring an Ollama daemon to exist.
-        if settings.vision_backend in ("", "none"):
-            settings.vision_backend = "deepseek"
-            if not arg:
-                save_config()
-        if settings.vision_backend == "deepseek":
-            if arg:
-                self._enable_vision(arg)
-                return
-            console.print()
-            console.print(
-                panel(
-                    kv_table(
-                        [
-                            ("backend", "[ok]deepseek[/ok] (K.dat key)"),
-                            ("model", settings.effective_vision_model),
-                            ("endpoint", settings.vision_endpoint),
-                        ]
-                    ),
-                    "Configure Vision",
-                )
-            )
-            console.print(
-                "[muted]/vision <model> to override · /vision default to reset · "
-                "/vision endpoint chat_completions for the OpenAI wire format[/muted]"
-            )
-            return
-
-        if settings.vision_backend == "openrouter":
-            models = or_client.load_or_models()
-            if arg:
-                self._enable_vision(arg)
-                return
-            options = [(m, "OR_VISION.json") for m in models]
-            options.append(("[muted]Disable vision[/muted]", "the default"))
-            default = 1
-            for i, m in enumerate(models, start=1):
-                if m == settings.effective_vision_model:
-                    default = i
-            picked = choose("OpenRouter vision model", options, default=default)
-            if picked is None:
-                console.print("[muted]Vision setting unchanged.[/muted]")
-                return
-            if picked == len(options):
-                self._disable_vision()
-                return
-            self._enable_vision(models[picked - 1])
-            return
-
-        # --- ollama (local/remote daemon) -------------------------------------
-        host = ollama_client.resolve_host()
-        with console.status(f"[accent]Contacting {host}…[/accent]", spinner="dots"):
-            probe = ollama_client.probe(host, count_models=False)
-        if not probe.ok:
-            console.print(f"[bad]{Glyph.CROSS} No Ollama daemon at {host} {Glyph.DOT} {probe.error}[/bad]")
-            console.print(f"[muted]{ollama_client.unreachable_hint(host)}[/muted]")
-            return
-
-        try:
-            with console.status(f"[accent]Reading models from {host}…[/accent]", spinner="dots"):
-                models = ollama_client.list_models(host)
-        except Exception as e:
-            console.print(f"[bad]Could not list Ollama models:[/bad] {e}")
-            return
-
-        if not models:
-            console.print(f"[warn]{host} is running but has no models installed.[/warn]")
-            console.print("[muted]Try: [bold]ollama pull qwen2.5vl:7b[/bold][/muted]")
-            return
-
-        # One-shot: /vision <model name>
-        if arg:
-            match = ollama_client.find_model(models, arg)
-            if match is None:
-                console.print(f"[bad]Model not found on {host}:[/bad] {arg}")
-                console.print("[muted]/ollama models lists them · /vision alone opens a picker.[/muted]")
-                return
-            self._enable_vision(match.name, warn_no_vision=not match.supports_vision, backend="ollama")
-            return
-
-        vision_models = [m for m in models if m.supports_vision]
-        show_all = not vision_models
-        listed = models if show_all else vision_models
-
-        console.print()
+        scout_line = ""
+        for kind, row in sorted(scout.ledger().items()):
+            recent = row.get("recent") or []
+            scout_line += (f"\n  {kind} cards: {row.get('used', 0)}/{row.get('cards', 0)} used"
+                           + (f", last {len(recent)}: {sum(recent)}" if recent else "")
+                           + ("" if scout.trusted(kind) else " (muted: mostly ignored)"))
+        console.print(f"Local model: {self.local_status()}")
         console.print(
-            panel(
-                kv_table(
-                    [
-                        ("host", f"[ok]{host}[/ok] [muted]({ollama_client.host_source()})[/muted]"),
-                        ("current", self.vision_status()),
-                    ]
-                ),
-                "Configure Vision",
-            )
+            f"[muted]binary {escape(st['binary'] or '-')}\nmodel  {escape(st['model'] or '-')}"
+            + (f"\nmmproj {escape(st['mmproj'])}" if st["mmproj"] else "")
+            + (f"\nlast error: {escape(st['last_error'])}" if st["last_error"] else "")
+            + f"\nsalient vault excerpts: {'on' if settings.salience_excerpt else 'off'}"
+            + f"\nscout card: {settings.scout_card}{scout_line}[/muted]"
         )
-        if show_all:
-            console.print("[warn]No model reported image support — listing everything.[/warn]")
-
-        options = []
-        for m in listed:
-            current = f"  [ok]{Glyph.CHECK} in use[/ok]" if m.name == settings.vision_model else ""
-            size = f"{m.size_gb:.1f} GB" if m.size_bytes else "size unknown"
-            certainty = {
-                "reported": "vision: reported by Ollama",
-                "guessed": "vision: inferred from the name",
-                "no": "no image support reported",
-            }[m.vision_certainty]
-            options.append((f"{m.name}{current}", f"{size} {Glyph.DOT} {certainty}"))
-        options.append(("[muted]Disable vision[/muted]", "the default"))
-
-        default = 1
-        for i, m in enumerate(listed, start=1):
-            if m.name == settings.vision_model:
-                default = i
-        picked = choose("Vision model", options, default=default)
-        if picked is None:
-            console.print("[muted]Vision setting unchanged.[/muted]")
-            return
-        if picked == len(options):
-            self._disable_vision()
-            return
-        chosen = listed[picked - 1]
-        self._enable_vision(chosen.name, warn_no_vision=not chosen.supports_vision, backend="ollama")
 
     # ------------------------------------------------------------------
     # /surge
@@ -1941,7 +1888,7 @@ class CLI:
         lasts = surge.format_duration(next_end - next_start)
         kind, when = surge.next_transition(now)
         local_peak = " · ".join(
-            surge.clock_range(s, e) for s, e in surge.peak_windows_local(now)[:2]
+            surge.clock_range(s, e) for s, e in surge.upcoming_peak_windows(now)
         )
         pause_windows = " · ".join(
             surge.clock_range(s, e) for s, e in surge.pause_ranges(now)[:2]
@@ -1974,346 +1921,6 @@ class CLI:
         )
 
     # ------------------------------------------------------------------
-    # /or — OpenRouter vision
-    # ------------------------------------------------------------------
-
-    def cmd_or(self, arg: str = "") -> None:
-        parts = arg.split(maxsplit=1)
-        sub = parts[0].lower() if parts else "status"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-
-        if sub in ("status", ""):
-            self._or_status()
-        elif sub == "model":
-            if not rest:
-                console.print(f"[muted]Current OpenRouter model:[/muted] {settings.effective_vision_model}")
-                console.print("[muted]Usage: /or model <model-id> | default[/muted]")
-                return
-            if rest.lower() in ("default", "reset"):
-                settings.vision_model = None
-            else:
-                settings.vision_model = rest
-            settings.vision_backend = "openrouter"
-            save_config()
-            console.print(
-                f"[ok]{Glyph.CHECK} OpenRouter vision model {Glyph.ARROW} "
-                f"[heading]{settings.effective_vision_model}[/heading][/ok] [muted]·saved[/muted]"
-            )
-        elif sub in ("models", "list", "reload"):
-            models = or_client.load_or_models()
-            settings.or_vision_models = models
-            save_config()
-            console.print(f"[ok]{Glyph.CHECK} OpenRouter model list ({len(models)}):[/ok]")
-            for i, m in enumerate(models, 1):
-                mark = "  [ok]← in use[/ok]" if m == settings.effective_vision_model else ""
-                console.print(f"  {i}. {m}{mark}")
-            console.print(f"[muted]source: {or_client.or_models_file()}[/muted]")
-        elif sub == "tier":
-            if not rest:
-                console.print(
-                    f"[muted]Current tier:[/muted] {'credits ($10+ bought)' if settings.or_credits else 'free'} "
-                    f"[muted]· usage: /or tier free|credits[/muted]"
-                )
-                return
-            if rest not in ("free", "credits"):
-                console.print("[warn]Tier must be 'free' or 'credits'.[/warn]")
-                return
-            settings.or_credits = rest == "credits"
-            save_config()
-            console.print(
-                f"[ok]{Glyph.CHECK} OpenRouter tier {Glyph.ARROW} {rest}[/ok] "
-                f"[muted]· ceiling {or_client.active_daily_limit()}/24h ·saved[/muted]"
-            )
-        elif sub in ("usage", "quota"):
-            usage = or_client.get_or_usage()
-            limit = or_client.active_daily_limit()
-            console.print(
-                f"[muted]Today ({usage.date}):[/muted] {usage.requests}/{limit} requests "
-                f"{Glyph.DOT} {usage.remaining()} left {Glyph.DOT} {usage.rate_limits} rate-limit hits"
-            )
-        else:
-            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
-            console.print("[muted]/or [status|model <id>|models|tier free|credits|usage] · /help or[/muted]")
-
-    def _or_status(self) -> None:
-        key_ok = (get_home() / "OK.dat").exists()
-        models = or_client.load_or_models()
-        usage = or_client.get_or_usage()
-        limit = or_client.active_daily_limit()
-        free, credits = or_client.rate_limit_tier()
-        rows = [
-            ("key", f"[ok]{Glyph.CHECK} OK.dat present[/ok]" if key_ok else "[bad]OK.dat missing[/bad]"),
-            ("tier", f"{'credits' if settings.or_credits else 'free'} [muted]({usage.requests}/{limit} used today)[/muted]"),
-            ("ceiling", f"free accounts: {free}/24h · with $10+ credits: {credits}/24h"),
-            (
-                "model",
-                f"[heading]{settings.vision_model or settings.or_default_model}[/heading]",
-            ),
-            (
-                "models",
-                f"{len(models)} in OR_VISION.json: " + ", ".join(models[:3]) + (" …" if len(models) > 3 else ""),
-            ),
-            ("rate limits today", str(usage.rate_limits)),
-            ("vision backend", settings.vision_backend),
-        ]
-        console.print()
-        console.print(panel(kv_table(rows), "OpenRouter vision"))
-        console.print(
-            "[muted]/or model <id> · /or models (reload OR_VISION.json) · "
-            "/or tier credits if you bought $10+ · /or usage[/muted]"
-        )
-
-    # ------------------------------------------------------------------
-    # /orsub — OpenRouter subagent offload
-    # ------------------------------------------------------------------
-
-    async def cmd_orsub(self, arg: str = "") -> None:
-        parts = arg.split(maxsplit=2)
-        sub = parts[0].lower() if parts else "status"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        extra = parts[2].strip() if len(parts) > 2 else ""
-
-        if sub in ("status", ""):
-            self._orsub_status()
-        elif sub in ("on", "enable"):
-            settings.or_sub_enabled = True
-            save_config()
-            console.print(
-                f"[ok]{Glyph.CHECK} OpenRouter subagent offload {Glyph.ARROW} on[/ok] "
-                f"[muted]·saved[/muted]"
-            )
-            primary = or_subagents.or_sub_primary()
-            if primary:
-                console.print(f"[muted]Agent turns will start on [heading]{primary}[/heading].[/muted]")
-            else:
-                console.print("[muted]No models yet — /orsub add <model> to configure one.[/muted]")
-        elif sub in ("off", "disable"):
-            settings.or_sub_enabled = False
-            save_config()
-            console.print(
-                f"[ok]{Glyph.CHECK} OpenRouter subagent offload {Glyph.ARROW} off[/ok] "
-                f"[muted]·saved · Agent turns return to {settings.subagent_model}[/muted]"
-            )
-        elif sub == "primary":
-            if not rest:
-                console.print(f"[muted]Current primary:[/muted] {or_subagents.or_sub_primary() or 'none'}")
-                console.print("[muted]Usage: /orsub primary <model-id>[/muted]")
-                return
-            models = or_subagents.load_or_sub_config()["models"]
-            ids = {m["id"] for m in models}
-            if rest not in ids:
-                console.print(f"[warn]Unknown model:[/warn] {rest}")
-                console.print(f"[muted]Known: {', '.join(sorted(ids)) or 'none — add one with /orsub add'}[/muted]")
-                return
-            or_subagents.save_or_sub_config({"primary": rest, "models": models})
-            console.print(
-                f"[ok]{Glyph.CHECK} OpenRouter subagent primary {Glyph.ARROW} "
-                f"[heading]{rest}[/heading][/ok] [muted]· both OR_SUB_MODELS.json files[/muted]"
-            )
-        elif sub == "add":
-            if not rest:
-                console.print("[muted]Usage: /orsub add <model-id> (e.g. openai/gpt-5.2)[/muted]")
-                return
-            models = or_subagents.load_or_sub_config()["models"]
-            if any(m["id"] == rest for m in models):
-                console.print(f"[warn]{rest} is already in the list.[/warn]")
-                return
-            console.print(f"[muted]Looking up {rest} in the OpenRouter catalogue…[/muted]")
-            info = or_subagents.fetch_model_info(rest)
-            if info is None:
-                console.print(
-                    f"[warn]Could not verify {rest} against the OpenRouter catalogue.[/warn]"
-                )
-                console.print(
-                    "[muted]The id may be wrong, or the catalogue is unreachable. "
-                    "Adding with default limits anyway.[/muted]"
-                )
-                info = {
-                    "context_window": 200_000,
-                    "max_output_tokens": 32_768,
-                    "reasoning_levels": ["none", "low", "medium", "high"],
-                    "default_reasoning": "high",
-                }
-            entry = {"id": rest, **info, "notes": ""}
-            models.append(entry)
-            primary = or_subagents.load_or_sub_config().get("primary")
-            or_subagents.save_or_sub_config({"primary": primary, "models": models})
-            console.print(
-                f"[ok]{Glyph.CHECK} Added [heading]{rest}[/heading][/ok] "
-                f"[muted]· ctx {entry['context_window']:,} · max out {entry['max_output_tokens']:,} · "
-                f"reasoning {'/'.join(entry['reasoning_levels'])}[/muted]"
-            )
-            console.print(
-                "[muted]Written to this project's OR_SUB_MODELS.json and the main copy "
-                "next to OK.dat — every project can use it now.[/muted]"
-            )
-            if not settings.or_sub_enabled:
-                console.print("[muted]Enable the offload with [bold]/orsub on[/bold].[/muted]")
-        elif sub == "remove":
-            if not rest:
-                console.print("[muted]Usage: /orsub remove <model-id>[/muted]")
-                return
-            config = or_subagents.load_or_sub_config()
-            models = [m for m in config["models"] if m["id"] != rest]
-            if len(models) == len(config["models"]):
-                console.print(f"[warn]{rest} is not in the list.[/warn]")
-                return
-            primary = config["primary"]
-            if primary == rest:
-                primary = models[0]["id"] if models else None
-            or_subagents.save_or_sub_config({"primary": primary, "models": models})
-            console.print(
-                f"[ok]{Glyph.CHECK} Removed {rest}[/ok] [muted]· from both OR_SUB_MODELS.json files[/muted]"
-            )
-            if primary and primary != rest:
-                console.print(f"[muted]Primary is now [heading]{primary}[/heading].[/muted]")
-        elif sub in ("models", "list"):
-            self._orsub_status(detail=True)
-        elif sub == "priority":
-            if not rest or not extra:
-                console.print("[muted]Usage: /orsub priority <model-id> <rank>[/muted]")
-                return
-            try:
-                rank = int(extra)
-            except ValueError:
-                console.print(f"[warn]Priority must be a number, got:[/warn] {extra}")
-                return
-            config = or_subagents.load_or_sub_config()
-            models = list(config["models"])
-            ids = [m["id"] for m in models]
-            if rest not in ids:
-                console.print(f"[warn]Unknown model:[/warn] {rest}")
-                return
-            if rank < 1 or rank > len(models):
-                console.print(f"[warn]Priority must be 1–{len(models)}.[/warn]")
-                return
-            entry = next(m for m in models if m["id"] == rest)
-            models.remove(entry)
-            models.insert(rank - 1, entry)
-            or_subagents.save_or_sub_config({"primary": config["primary"], "models": models})
-            console.print(
-                f"[ok]{Glyph.CHECK} [heading]{rest}[/heading] priority {Glyph.ARROW} {rank}[/ok] "
-                f"[muted]· both OR_SUB_MODELS.json files[/muted]"
-            )
-        elif sub == "reasoning":
-            model_entry = or_subagents.get_model(rest)
-            if model_entry is None:
-                if not rest:
-                    console.print("[muted]Usage: /orsub reasoning <model-id> <level>[/muted]")
-                else:
-                    console.print(f"[warn]Unknown model:[/warn] {rest}")
-                return
-            if not extra:
-                console.print(
-                    f"[muted]{rest}: default reasoning[/muted] "
-                    f"[heading]{model_entry['default_reasoning']}[/heading] "
-                    f"[muted]· accepts {'/'.join(model_entry['reasoning_levels'])}[/muted]"
-                )
-                return
-            levels = model_entry["reasoning_levels"]
-            if extra not in levels:
-                console.print(
-                    f"[warn]{extra} is not a level {rest} accepts.[/warn] "
-                    f"[muted]({'/'.join(levels)})[/muted]"
-                )
-                return
-            config = or_subagents.load_or_sub_config()
-            models = list(config["models"])
-            for m in models:
-                if m["id"] == rest:
-                    m["default_reasoning"] = extra
-            or_subagents.save_or_sub_config({"primary": config["primary"], "models": models})
-            console.print(
-                f"[ok]{Glyph.CHECK} {rest} default reasoning {Glyph.ARROW} "
-                f"[heading]{extra}[/heading][/ok] [muted]· both OR_SUB_MODELS.json files[/muted]"
-            )
-        elif sub == "test":
-            await self._orsub_test(rest or None)
-        else:
-            console.print(f"[warn]Unknown subcommand:[/warn] {sub}")
-            console.print(
-                "[muted]/orsub [status|on|off|primary <id>|add <id>|remove <id>|models|"
-                "priority <id> <n>|reasoning <id> <level>|test] · /help orsub[/muted]"
-            )
-
-    def _orsub_status(self, detail: bool = False) -> None:
-        key_ok = (get_home() / "OK.dat").exists()
-        config = or_subagents.load_or_sub_config()
-        models = config["models"]
-        primary = config["primary"]
-        usage = or_subagents.get_or_sub_usage()
-        rows = [
-            ("backend", f"{'[ok]on[/ok]' if settings.or_sub_enabled else '[muted]off[/muted]'} · /orsub on"),
-            ("key", f"[ok]{Glyph.CHECK} OK.dat present[/ok]" if key_ok else "[bad]OK.dat missing[/bad]"),
-            ("primary", f"[heading]{primary}[/heading]" if primary else "[muted]none[/muted]"),
-            ("models", f"{len(models)} in OR_SUB_MODELS.json"),
-            ("requests today", str(usage.requests)),
-            ("rate limits today", str(usage.rate_limits)),
-            ("hops today", str(usage.hops)),
-        ]
-        console.print()
-        console.print(panel(kv_table(rows), "OpenRouter subagents"))
-        table = Table(show_header=True, box=None, padding=(0, 2, 0, 0))
-        table.add_column("", width=2, no_wrap=True)
-        table.add_column("model", style="heading", overflow="fold")
-        table.add_column("prio", justify="right", no_wrap=True)
-        table.add_column("ctx", justify="right", no_wrap=True)
-        table.add_column("max out", justify="right", no_wrap=True)
-        table.add_column("reasoning", overflow="fold")
-        for i, m in enumerate(models, start=1):
-            mark = "[accent]★[/accent]" if m["id"] == primary else ""
-            table.add_row(
-                mark,
-                m["id"],
-                str(m.get("priority", i)),
-                f"{int(m.get('context_window', 0)):,}",
-                f"{int(m.get('max_output_tokens', 0)):,}",
-                f"{'/'.join(m.get('reasoning_levels') or [])} · default {m.get('default_reasoning')}",
-            )
-        console.print(table)
-        console.print(
-            "[muted]/orsub on · primary <id> · add <id> · remove <id> · priority <id> <n> · "
-            "reasoning <id> <level> · test[/muted]"
-        )
-
-    async def _orsub_test(self, model_id: Optional[str] = None) -> None:
-        """Run one real offload, on a specific model or through the failover."""
-        if model_id:
-            console.print(f"[muted]Testing {model_id} directly…[/muted]")
-            try:
-                result = await or_subagents.or_sub_chat(
-                    model_id=model_id,
-                    system="You are a connectivity test. Reply with exactly: OK",
-                    prompt="Reply with exactly: OK",
-                    reasoning=None,
-                )
-                console.print(
-                    f"[ok]{Glyph.CHECK} {model_id} answered in {human_ms(result.elapsed_ms)}:[/ok] "
-                    f"{result.answer[:200]}"
-                )
-            except Exception as e:
-                console.print(f"[bad]✗ {model_id} failed:[/bad] {e}")
-            return
-        if not or_subagents.load_or_sub_models():
-            console.print("[warn]No models configured — /orsub add <model> first.[/warn]")
-            return
-        console.print(f"[muted]Testing offload (primary first, failover on rate limits)…[/muted]")
-        try:
-            result, attempts = await or_subagents.or_sub_with_failover(
-                system="You are a connectivity test. Reply with exactly: OK",
-                prompt="Reply with exactly: OK",
-                reasoning=None,
-            )
-            hop = f" after {len(attempts) - 1} hop(s)" if len(attempts) > 1 else ""
-            console.print(
-                f"[ok]{Glyph.CHECK} [heading]{result.model}[/heading] answered{hop} in "
-                f"{human_ms(result.elapsed_ms)}: {result.answer[:200]}[/ok]"
-            )
-            console.print(f"[muted]tried: {', '.join(attempts)}[/muted]")
-        except Exception as e:
-            console.print(f"[bad]✗ Offload failed:[/bad] {e}")
-
-    # ------------------------------------------------------------------
     # /config — global vs per-project
     # ------------------------------------------------------------------
 
@@ -2324,21 +1931,21 @@ class CLI:
             path = save_config(scope="global")
             console.print(
                 f"[ok]{Glyph.CHECK} Current settings saved as the global default[/ok] "
-                f"[muted]{Glyph.ARROW} {path}[/muted]"
+                f"[muted]{Glyph.ARROW} {ui.display_path(path)}[/muted]"
             )
             console.print("[muted]New projects inherit these settings unless they carry their own .g023/config.json.[/muted]")
             return
         if sub in ("project", "save-project", "save project"):
             path = save_config(scope="project")
             console.print(
-                f"[ok]{Glyph.CHECK} Settings pinned to this project[/ok] [muted]{Glyph.ARROW} {path}[/muted]"
+                f"[ok]{Glyph.CHECK} Settings pinned to this project[/ok] [muted]{Glyph.ARROW} {ui.display_path(path)}[/muted]"
             )
             return
         if sub == "save":
-            path = save_config()
+            path = save_config(full=True)
             scope = "project" if path == get_project_config_file() else "global"
             console.print(
-                f"[ok]{Glyph.CHECK} Settings saved ({scope})[/ok] [muted]{Glyph.ARROW} {path}[/muted]"
+                f"[ok]{Glyph.CHECK} Settings saved ({scope})[/ok] [muted]{Glyph.ARROW} {ui.display_path(path)}[/muted]"
             )
             return
         if sub == "clear":
@@ -2355,7 +1962,7 @@ class CLI:
             load_config(settings)
             console.print(
                 f"[ok]{Glyph.CHECK} Project override removed[/ok] [muted]{Glyph.ARROW} "
-                f"{get_config_file()} now applies[/muted]"
+                f"{ui.display_path(get_config_file())} now applies[/muted]"
             )
             return
         if sub in ("", "status", "show"):
@@ -2371,15 +1978,15 @@ class CLI:
             ("active scope", f"[heading]{active}[/heading]"),
             (
                 "global",
-                str(global_path) + (" [ok]· exists[/ok]" if global_path.exists() else " [muted]· missing[/muted]"),
+                ui.display_path(global_path) + (" [ok]· exists[/ok]" if global_path.exists() else " [muted]· missing[/muted]"),
             ),
             (
                 "project",
-                str(project_path)
+                ui.display_path(project_path)
                 + (" [ok]· overrides global[/ok]" if project_path.exists() else " [muted]· none — global applies[/muted]"),
             ),
-            ("orchestrator", settings.orchestrator_model),
-            ("vision", f"{settings.vision_backend} {Glyph.DOT} {settings.effective_vision_model}"),
+            ("model", MODEL),
+            ("vision", "on" if settings.vision_enabled else "off"),
             ("surge pause", f"{'on' if settings.surge_pause else 'off'} (buffer {settings.surge_pause_buffer_minutes} min)"),
         ]
         console.print()
@@ -2399,8 +2006,9 @@ class CLI:
             console.print("[muted]e.g. /goal add retry-with-backoff to every outbound HTTP call[/muted]")
             return
 
-        previous = settings.reasoning_effort
-        previous_enabled = settings.thinking_enabled
+        dial_snapshot = settings.snapshot(
+            ("reasoning_effort", "thinking_enabled", "max_iterations")
+        )
         # A goal is the one command whose whole point is "however many steps it
         # takes". The step cap is the backstop against a turn that tools forever
         # without answering; here it is the thing that would cut the job short,
@@ -2408,13 +2016,16 @@ class CLI:
         # what keep it watched. The saved /steps setting is untouched — this is
         # for the duration of this turn only, and is not written to config.
         # Effort is the harness ceiling (75 / high), not the API's max: max
-        # burns the output budget on thinking. A same-response [next_effort]
-        # on the final answer is kept for the next user request; only an
-        # omitted trailer restores the pre-goal dial.
-        previous_iterations = settings.max_iterations
-        settings.reasoning_effort = MAX_EFFORT
-        settings.thinking_enabled = True
-        settings.max_iterations = UNLIMITED_ITERATIONS
+        # burns the output budget on thinking. Release once, before the turn,
+        # so a session pinned at a lower alias is not stuck there. The turn
+        # re-pins the ceiling and warms this transcript at that alias.
+        # A same-response [next_effort] is stored for when the prefix is
+        # already new; only an omitted trailer restores the pre-goal dial.
+        # Transient overrides: a save_config() during the goal (any slash
+        # command) writes the pre-goal values, never these.
+        settings.set_transient("reasoning_effort", MAX_EFFORT)
+        settings.set_transient("thinking_enabled", True)
+        settings.set_transient("max_iterations", UNLIMITED_ITERATIONS)
         self.orch.release_prefix_effort()
         try:
             set_goal(arg)
@@ -2427,18 +2038,134 @@ class CLI:
             f"[accent]Goal[/accent] [muted]{Glyph.DOT} ceiling reasoning effort "
             f"({MAX_EFFORT}), no step limit for this turn[/muted]\n{arg}"
         )
+        self._goal_interrupted = False
         try:
-            await self.run_prompt(
-                f"High-level goal (use tools freely, break into steps):\n\n{arg}",
-                title=f"g023 {Glyph.DOT} goal",
-            )
+            await self.run_prompt(self._goal_prompt(arg), title=f"g023 {Glyph.DOT} goal")
+            await self._continue_goal_until_done_or_stalled()
         finally:
             if not getattr(self.orch, "_next_effort_applied", False):
-                settings.reasoning_effort = previous  # type: ignore[assignment]
-                settings.thinking_enabled = previous_enabled
-            settings.max_iterations = previous_iterations
-            self.orch.release_prefix_effort()
+                settings.restore(dial_snapshot, ("reasoning_effort", "thinking_enabled"))
+            settings.restore(dial_snapshot, ("max_iterations",))
+            # Do not release the pin here. The goal turn re-pinned the ceiling
+            # and that transcript is the prefix the next request should hit.
+            # high→low on it misses from token 0 (instructions, tools, and
+            # the transcript). Post-turn compact releases the pin only after
+            # it replaces the input list. /thinking and /clear release it
+            # because the user asked for a new prefix. A stored [next_effort]
+            # is what those later requests send.
             self._emit_goal_judgment()
+
+    _GAME_GOAL = re.compile(
+        r"\b(game|games|canvas|arcade|pong|snake|breakout|platformer)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _goal_prompt(objective: str) -> str:
+        # This text is the user message, the tail of the request. Standing
+        # instructions and tools stay the cached prefix. V4.1 Flash decode
+        # is the expensive side (output ~200× a cache hit), so the contract
+        # is short and forbids extra rounds: no web, learn, or board unless
+        # something actually failed.
+        text = (
+            "High-level goal (use tools freely, break into steps):\n\n"
+            f"{objective}\n\n"
+            "Finish this objective before you stop. Record the remaining steps "
+            "with TodoWrite, do those steps, and do not cancel them to make the "
+            "list look empty. Mark a leaf done only with evidence that cites a "
+            "file this session wrote or a verify command that already exited 0. "
+            "If a test fails, fix it and re-run that same command until it exits 0. "
+            "A different command passing does not clear a failed one.\n"
+            "Do not add files, docs, or features the objective did not ask for. "
+            "A polish idea is not an open issue. An open issue is a failing "
+            "command, a broken path, or a contradiction with the objective.\n"
+            "Do not search the web, the learn store, or the bulletin board unless "
+            "a tool failed or the objective depends on a current external fact."
+        )
+        if CLI._GAME_GOAL.search(objective or ""):
+            text += (
+                "\nThis is a playable game. Ship the smallest artifact that plays: "
+                "prefer one HTML file with a canvas and an inline script. "
+                "Then prove it. Extract each inline script and run node --check "
+                "on that script, and run one node smoke command that exits 1 "
+                "unless the file contains a canvas and a game loop. Fix until "
+                "that same command exits 0. Do not stop at a title screen."
+            )
+        return text
+
+    @staticmethod
+    def _goal_continuation_prompt(judgment: dict, n: int) -> str:
+        pending = ", ".join(judgment.get("pending") or []) or "(none)"
+        missing = ", ".join(judgment.get("done_without_evidence") or []) or "(none)"
+        reason = str(judgment.get("reason") or "not completed")
+        return (
+            f"Goal continuation {n}/{GOAL_CONTINUATION_CAP}. "
+            f"The objective is not completed: {reason}. "
+            f"Pending ids: {pending}. Done without evidence: {missing}. "
+            "Finish only those leaves. Do not add scope and do not cancel "
+            "leaves to look finished. Use tools. If a verify command failed, "
+            "fix the code and re-run that same command, then mark the leaf "
+            "done with that evidence."
+        )
+
+    async def _continue_goal_until_done_or_stalled(self) -> None:
+        """Extra turns only while the judge says the goal is still open.
+
+        One stalled continuation (working set unchanged) stops the loop.
+        A second turn is allowed only when the first one moved the working
+        set and the cap has not been hit. Output tokens are the expensive
+        side of the bill; repeating the same unfinished answer is not.
+        """
+        for n in range(1, GOAL_CONTINUATION_CAP + 1):
+            if self._goal_interrupted or self.orch.turn_failed:
+                return
+            try:
+                judgment = judge_goal_completion()
+            except Exception:
+                return
+            if judgment.get("completed"):
+                return
+            before = dumps_working_set(load_working_set())
+            reason = str(judgment.get("reason") or "")
+            console.print(
+                f"[muted]Goal still open ({escape(reason)}) — "
+                f"continuation {n}/{GOAL_CONTINUATION_CAP}.[/muted]"
+            )
+            # A continuation is not the user's next request. An omitted
+            # trailer on it must not throw away a [next_effort] the goal
+            # answer already stored — run_turn clears that flag on entry.
+            applied_before = bool(self.orch._next_effort_applied)
+            # A [next_effort] on the goal answer is stored for when the
+            # prefix is new. The continuation is still the goal. If compact
+            # already released the pin, sending that lower dial would think
+            # less on the unfinished work and would miss the new prefix the
+            # continuation is about to warm. Keep the stored dial; force the
+            # ceiling only for this call. The call re-pins the ceiling when
+            # the pin was clear.
+            dial = settings.snapshot(("reasoning_effort", "thinking_enabled"))
+            settings.set_transient("reasoning_effort", MAX_EFFORT)
+            settings.set_transient("thinking_enabled", True)
+            try:
+                await self.run_prompt(
+                    self._goal_continuation_prompt(judgment, n),
+                    title=f"g023 {Glyph.DOT} goal",
+                )
+            finally:
+                # In finally: a cancel of the /goal scope itself (not caught by
+                # run_prompt) must not leave the forced ceiling as the live dial.
+                if not self.orch._next_effort_applied:
+                    settings.restore(dial)
+                    if applied_before:
+                        self.orch._next_effort_applied = True
+            if self._goal_interrupted or self.orch.turn_failed:
+                return
+            after = dumps_working_set(load_working_set())
+            if after == before:
+                console.print(
+                    "[muted]No working-set change on that continuation — "
+                    "stopping so this does not repeat.[/muted]"
+                )
+                return
 
     def _emit_goal_judgment(self) -> None:
         """One completed/not-completed judgment after a /goal turn returns."""
@@ -2469,8 +2196,20 @@ class CLI:
 
     async def run_prompt(self, text: str, title: str = "g023") -> None:
         try:
-            result = await self.orch.run_turn(text)
-        except KeyboardInterrupt:
+            # A child task Ctrl-C can cancel: run_turn rolls the turn back in
+            # its CancelledError path, then UserInterrupt lands here.
+            result = await interrupt_controller.run(self.orch.run_turn(text))
+        except (UserInterrupt, KeyboardInterrupt):
+            self._goal_interrupted = True
+            committed = getattr(self.orch, "committed_answer", None)
+            if committed is not None:
+                # Ctrl-C landed after the commit point (post-turn compaction):
+                # the turn is kept, so its answer is still shown.
+                if not self.orch.answer_was_streamed:
+                    console.print()
+                    console.print(panel(Markdown(committed or "_(no answer)_"), title))
+                console.print("\n[warn]Interrupted after the answer; the turn is kept (compaction skipped).[/warn]")
+                return
             console.print("\n[warn]Interrupted.[/warn]")
             return
         except Exception as e:
@@ -2534,12 +2273,31 @@ class CLI:
     # ------------------------------------------------------------------
 
     async def loop(self):
+        installed = interrupt_controller.install()
+        try:
+            await self._loop()
+        finally:
+            if installed:
+                interrupt_controller.uninstall()
+            await _close_api_client()
+
+    async def _loop(self):
         self.print_banner()
         try:
             load_api_key()
         except Exception as e:
             console.print(f"[bad]{e}[/bad]")
             return
+
+        if settings.local_enabled:
+            # Load the local model while the user types, so the first turn's
+            # scout card and LocalAsk do not miss it (never blocks; fails open).
+            try:
+                from . import local_llm
+
+                await local_llm.ensure(wait=False)
+            except Exception:
+                pass
 
         # Surge monitor state: notify once per transition, pause around peak.
         self._surge_was_active: Optional[bool] = None
@@ -2568,9 +2326,9 @@ class CLI:
                         )
                         self._surge_pause_announced = True
                     try:
-                        await asyncio.sleep(5)
+                        await interrupt_controller.run(asyncio.sleep(5))
                         continue
-                    except KeyboardInterrupt:
+                    except (UserInterrupt, KeyboardInterrupt):
                         console.print(
                             "\n[warn]Bypassing surge pause — commands will run at peak prices.[/warn]"
                         )
@@ -2580,9 +2338,9 @@ class CLI:
 
             try:
                 console.print()
-                user = await self.reader.ask_async()
-            except (KeyboardInterrupt, EOFError):
-                console.print(f"\n[muted]Bye.[/muted]")
+                user = await interrupt_controller.run(self.reader.ask_async())
+            except (UserInterrupt, KeyboardInterrupt, EOFError):
+                console.print("\n[muted]Bye.[/muted]")
                 break
 
             line = user.strip()
@@ -2591,8 +2349,8 @@ class CLI:
 
             if line.startswith("/"):
                 try:
-                    await self.handle_slash(line)
-                except KeyboardInterrupt:
+                    await interrupt_controller.run(self.handle_slash(line))
+                except (UserInterrupt, KeyboardInterrupt):
                     console.print("\n[warn]Cancelled.[/warn]")
                 except Exception as e:
                     console.print(f"[bad]Command failed:[/bad] {e}")
@@ -2639,6 +2397,7 @@ def print_flag_help() -> None:
     console.print()
     console.print("With no prompt, starts the interactive REPL.")
     console.print("A prompt runs one turn and exits.")
+    console.print("A known slash command, such as /goal, runs that command and exits.")
     console.print(
         "--continue seeds from the latest .g023/logs/ handoff (system + summary)."
     )
@@ -2651,12 +2410,49 @@ def print_flag_help() -> None:
     console.print("Type /help inside the REPL for the same catalogue with detail.")
 
 
+async def _close_api_client() -> None:
+    """Close the shared HTTP client on the loop that owns it."""
+    try:
+        from .api import close_client
+
+        await close_client()
+    except Exception:
+        pass
+
+
 async def _run_oneshot(cli: "CLI", prompt: str) -> None:
+    installed = interrupt_controller.install()
+    try:
+        await _run_oneshot_body(cli, prompt)
+    finally:
+        if installed:
+            interrupt_controller.uninstall()
+        await _close_api_client()
+
+
+async def _run_oneshot_body(cli: "CLI", prompt: str) -> None:
+    """One prompt, or one known slash command.
+
+    ``python -m g023_code /goal …`` used to send the slash line to the model
+    as user text. The step cap stayed on, the working-set judge never ran,
+    and an unattended project build could not finish. A token the catalogue
+    knows is dispatched. Anything else, including an unknown ``/…``, stays
+    a prompt.
+    """
     try:
         load_api_key()
     except Exception as e:
         console.print(f"[bad]{e}[/bad]")
         return
+    stripped = (prompt or "").strip()
+    if stripped.startswith("/"):
+        token = stripped.split(maxsplit=1)[0]
+        if registry.lookup(token) is not None:
+            try:
+                await interrupt_controller.run(cli.handle_slash(stripped))
+            except UserInterrupt:
+                console.print("\n[warn]Cancelled.[/warn]")
+            return
     await cli.run_prompt(prompt)
 
 
@@ -2680,5 +2476,5 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             asyncio.run(cli.loop())
     except KeyboardInterrupt:
-        console.print(f"\n[muted]Bye.[/muted]")
+        console.print("\n[muted]Bye.[/muted]")
     return 0

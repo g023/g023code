@@ -7,11 +7,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 from ..api import (
-    ResponsesClient,
+    DeepSeekClient,
     get_client,
     incomplete_reason,
     output_text,
@@ -21,10 +20,9 @@ from ..api import (
 from ..cache import get_cache
 from ..cost_policy import should_vault_tool_output
 from ..effort import effort_to_wire, parse_effort_value
-from ..config import get_project_root, settings
+from ..config import MODEL, get_project_root, settings
 from ..tools.schemas import TOOL_SCHEMAS
 from ..usage import get_usage
-from .. import or_subagents
 from .file_reader import run_file_reader
 from .searcher import run_searcher
 from .vision import run_vision
@@ -48,8 +46,9 @@ _KIND_ALIASES = {"explore": "research", "plan": "planning"}
 AGENT_EXPLORE_SYSTEM = (
     "You are a Research Subagent. Inspect the real project with ReadFile, "
     "SearchContent, and ListDir only. You cannot write files, run a shell, "
-    "save learn guides, or spawn another Agent. Call those tools, then return "
-    "STRICT JSON: "
+    "save learn guides, or spawn another Agent. SearchContent can read "
+    ".g023/bbs/ for prior-session findings; do not dump the board. Call those "
+    "tools, then return STRICT JSON: "
     '{"kind":"research","files":["..."],"symbols":["..."],"findings":["..."],'
     '"research":"..."}. '
     "files and symbols must come from tool results, not from guessing. "
@@ -75,6 +74,8 @@ AGENT_TODOS_SYSTEM = (
 AGENT_TASK_SYSTEM = (
     "You are a Task Subagent. Implement ONE todo. If the previous task "
     "surfaced issues, fix those as well as implementing your todo. "
+    "You may append durable findings to .g023/bbs/ (topic-slug dir, slug.txt) "
+    "and must not leave a surfaced issue unrecorded. "
     "Return STRICT JSON: "
     '{"kind":"task","result":"...","issues":["..."]}. '
     "issues is a list of problems you hit or left for the next task; "
@@ -122,18 +123,16 @@ def _normalize_todos(tasks: Any) -> list[dict]:
 def clamp_ds_reasoning(kind: str, reasoning: Optional[str]) -> tuple[bool, str]:
     """Map the Agent schema's reasoning arg onto DeepSeek effort.
 
-    Schema: none|low|medium|high. The live ``/responses`` probe also accepts
-    minimal/xhigh/max, but this harness never sends ``xhigh`` or ``max``
-    (``MAX_EFFORT`` is 75 / ``high``). ``medium`` is a real DeepSeek variant,
-    so it is sent as ``medium`` rather than being rewritten to ``high``.
-    Unset defaults: todos = ``medium`` (a JSON list does not need max
-    thinking); everything else = ``high`` (the orchestrator sweetspot).
+    Schema: none|low|high (``medium`` is still accepted from older prompts and
+    maps to ``high``, as DeepSeek itself does). This harness never sends
+    ``max`` (``MAX_EFFORT`` is 75 / ``high``). Unset default: ``high`` for every
+    kind. (Todos used to default to ``medium``, which DeepSeek folds into
+    ``high`` server-side — so ``high`` is what it always really ran at.)
     ``max`` often burns the entire ``max_output_tokens`` budget on thinking
     and returns empty JSON. Returns (enabled, effort) for
     :func:`reasoning_param`.
     """
-    resolved = _KIND_ALIASES.get(kind, kind)
-    default = "medium" if resolved in ("todos", "todos_plan") else "high"
+    default = "high"
     if not reasoning:
         return True, default
     token = str(reasoning).strip().lower()
@@ -270,7 +269,7 @@ def _cap_agent_json(payload: dict) -> str:
 
 
 class SubagentRouter:
-    def __init__(self, client: Optional[ResponsesClient] = None):
+    def __init__(self, client: Optional[DeepSeekClient] = None):
         self.client = client
         # Frozen parent prefix (instructions, tools, reasoning). When set,
         # nested Agent calls reuse it so they hit the standing cache units
@@ -294,7 +293,7 @@ class SubagentRouter:
     def clear_shared_prefix(self) -> None:
         self._shared_prefix = None
 
-    def _get_client(self) -> ResponsesClient:
+    def _get_client(self) -> DeepSeekClient:
         if self.client is None:
             self.client = get_client()
         return self.client
@@ -329,6 +328,14 @@ class SubagentRouter:
             )
 
         if tool_name == "Agent":
+            if not getattr(settings, "subagents_enabled", False):
+                return json.dumps(
+                    {
+                        "error": "subagents are disabled",
+                        "note": "Do the work directly with your own tools. The user can "
+                        "enable subagents with /subagents on.",
+                    }
+                )
             kind = arguments.get("kind", "explore")
             objective = arguments.get("objective", "")
             reasoning = arguments.get("reasoning")
@@ -369,8 +376,6 @@ class SubagentRouter:
         if resolved == "task":
             todo = {"id": "1", "title": objective}
             return await self._run_task(objective, todo, list(issues or []), reasoning, prior=prior)
-        if settings.or_sub_enabled and or_subagents.load_or_sub_models():
-            return await self._run_agent_or(resolved, objective, reasoning, prior=prior)
         return await self._run_agent_ds(resolved, objective, reasoning, prior=prior)
 
     async def _exec_agent_tool(
@@ -421,60 +426,8 @@ class SubagentRouter:
             return await registry.execute(name, arguments, "subagent")
         return json.dumps({"error": f"{name} is not available to this subagent"})
 
-    # -- OpenRouter offload ------------------------------------------------
+    # -- nested DeepSeek loop ---------------------------------------------
 
-    async def _run_agent_or(
-        self, kind: str, objective: str, reasoning: Optional[str], prior: Any = None
-    ) -> str:
-        """OpenRouter-backed research / planning offload, with model failover.
-
-        or_sub_chat has no tools wire; a ListDir of the project root is
-        injected so the offload is not reasoning from the objective string
-        alone. A nested OpenRouter tool loop is a separate change.
-        """
-        system = AGENT_PLAN_SYSTEM if kind in ("plan", "planning") else AGENT_EXPLORE_SYSTEM
-        listing = await self._exec_agent_tool("ListDir", {"path": ".", "recursive": False})
-        prior_block = ""
-        if prior:
-            prior_text = prior if isinstance(prior, str) else json.dumps(prior, ensure_ascii=False)
-            prior_block = f"Prior relay payload:\n{prior_text[:8000]}\n\n"
-        user_prompt = (
-            f"Objective: {objective}\n\n"
-            f"{prior_block}"
-            f"Project listing (ListDir .):\n{listing[:6000]}\n\n"
-            "Name files that exist in that listing. Return the JSON object."
-        )
-
-        try:
-            result, attempts = await or_subagents.or_sub_with_failover(
-                system=system,
-                prompt=user_prompt,
-                reasoning=reasoning,
-                max_output_tokens=8192,
-            )
-            get_usage().record(result.model, result.usage, scope="subagent")
-            harvested: dict[str, list] = {
-                "files": [],
-                "symbols": [],
-                "findings": [],
-                "plan_steps": [],
-                "open_checks": [],
-            }
-            _harvest_from_tool(harvested, "ListDir", listing)
-            payload = _merge_agent_payload(kind, objective, result.answer, harvested)
-            payload["model"] = result.model
-            payload["backend"] = "openrouter"
-            payload["attempts"] = attempts
-            payload["reasoning_excerpt"] = (result.reasoning[:800] + "…") if result.reasoning else None
-            if result.truncated:
-                payload["truncated"] = "length"
-                if not result.answer:
-                    payload["error"] = "Subagent produced no answer: output stopped early (length)."
-            return _cap_agent_json(payload)
-        except Exception as e:
-            return json.dumps({"error": str(e), "kind": kind, "backend": "openrouter"})
-
-    # -- DeepSeek (default) -----------------------------------------------
 
     def _agent_system(self, kind: str, system_override: Optional[str] = None) -> str:
         if system_override:
@@ -640,7 +593,7 @@ class SubagentRouter:
         try:
             for _step in range(AGENT_MAX_STEPS):
                 create_kwargs: dict[str, Any] = {
-                    "model": settings.subagent_model,
+                    "model": MODEL,
                     "instructions": system,
                     "input": list(items),
                     "tools": schemas,
@@ -652,7 +605,7 @@ class SubagentRouter:
                 if not share:
                     create_kwargs["max_output_tokens"] = 8192
                 resp = await client.create(**create_kwargs)
-                get_usage().record(settings.subagent_model, resp.get("usage"), scope="subagent")
+                get_usage().record(MODEL, resp.get("usage"), scope="subagent")
                 reply = parse_reply(resp)
                 last_text = reply.content or reply.commentary or output_text(resp)
                 last_reasoning = reply.reasoning or reasoning_text(resp)
@@ -674,7 +627,15 @@ class SubagentRouter:
                     )
                     if should_vault_tool_output(tc.name, stored, raw_read=full_read):
                         try:
-                            stored = get_cache().offload_tool_output(stored)
+                            from .. import salience
+
+                            intent = salience.call_intent(
+                                salience.step_intent(last_reasoning or "", reply.commentary or "", objective),
+                                args,
+                            )
+                            stored = get_cache().offload_tool_output(
+                                stored, intent=intent, salient=settings.salience_excerpt
+                            )
                         except Exception:
                             stored = result
                     items.append(

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import get_project_root
+from .fsutil import atomic_write_text
 
 INDEX_NAME = "MEMORY.md"
 INDEX_CAP = 200
@@ -38,7 +39,7 @@ def write_index(text: str) -> dict:
         normalized += "\n"
     lines = normalized.splitlines()
     if len(lines) <= INDEX_CAP:
-        dest.write_text(normalized, encoding="utf-8")
+        atomic_write_text(dest, normalized)
         return {
             "ok": True,
             "path": str(dest),
@@ -50,8 +51,9 @@ def write_index(text: str) -> dict:
     topics = root / "topics"
     topics.mkdir(parents=True, exist_ok=True)
     overflow = topics / "overflow.md"
-    dest.write_text(head, encoding="utf-8")
-    overflow.write_text(tail, encoding="utf-8")
+    # Overflow first: a crash between the two writes must not drop the spilled lines.
+    atomic_write_text(overflow, tail)
+    atomic_write_text(dest, head)
     return {
         "ok": True,
         "path": str(dest),

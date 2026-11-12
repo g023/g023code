@@ -1,21 +1,21 @@
 # g023 Code — Release Media
 
-Screenshots captured from a real TUI session against a small demo project
-(a four-file in-memory todo service) launched from `/tmp/g023-shoot`.
-Nothing here is mocked up: every frame is actual terminal output.
+Screenshots of the real TUI, captured from a live session against a small demo
+project (a four-file in-memory todo service). Nothing is mocked up: every still
+is actual terminal output replayed through a terminal emulator and rendered
+cell by cell.
 
-> **The screenshots were re-shot on 1.3.4** from `/tmp/g023-shoot/...` —
-> see the banner in `01-startup-banner.png`. They show the current build:
-> the sent model id is `deepseek-flash`, `/model` has nothing to switch to,
-> thinking is the 0–100 dial (75 default), the window is 256k, and
-> `web_search` has no permission entry because DeepSeek runs it
-> server-side. Live agent turns use **only** `deepseek-flash`. Ollama and
-> OpenRouter models are not exercised; `/vision status` and `/or status`
-> are the default-off / no-key panels.
->
-> The captures use **sanitised paths** (`/tmp/g023-shoot/todo-api`,
-> `/tmp/g023-shoot/home`) so nothing in them exposes a machine's real home
-> directory, user name, or API keys — the shot set is safe to publish as-is.
+**Captured on 1.5.0.** The stills show the current build: `deepseek-flash` as the
+only model, thinking at 75, vision on, the 1,000,000-token window with
+auto-compaction at 200k, and the client-side `WebSearch` / `FetchUrl` price note
+in `/cost`.
+
+**What the captures do not contain.** The session ran with `HOME` pointed at a
+throwaway shoot folder, so every path prints as `~/todo-api` or `~/app` (the
+1.5.0 UI prints paths under the home directory as `~`). The user name was
+neutral, the clock was set to UTC so `/surge` does not reveal a time zone, and
+the API key file held a dummy value. The PNGs carry no text, EXIF or timestamp
+chunks, and the release's privacy gate scans them before an archive is built.
 
 Terminal: 100 × 32 cells, DejaVu Sans Mono, dark theme.
 
@@ -23,68 +23,39 @@ Terminal: 100 × 32 cells, DejaVu Sans Mono, dark theme.
 
 | File | Shows |
 |------|-------|
-| `01-startup-banner.png` | Launch banner — project/home paths, model, thinking level, Ollama probe |
-| `02-help-catalogue.png` | `/help` — the full command catalogue, grouped |
-| `03-tools-and-permissions.png` | `/tools` — every tool with its permission level and subagent isolation |
-| `04-status.png` | `/status` — session, vision, Ollama, project, cache summary |
-| `05-model.png` | `/model` — flash is the only model the Responses API serves, so there is nothing to switch to |
-| `06-thinking-picker.png` | `/thinking` — reasoning-effort picker (low / high / off; max aliases to 75) |
-| `09-usage-and-cost.png` | `/cost` — per-model call/token/cost breakdown, cache hit/miss split and price card |
-| `12-ollama-daemon.png` | `/ollama` — daemon host, reachability, version, latency, model count |
-| `13-vision-picker.png` | `/vision status` — vision disabled (the shipped default) |
-| `14-settings.png` | `/settings` — effective configuration and where each value came from |
-| `15-cache.png` | `/cache` — SQLite cache stats for the project |
-| `16-signals.png` | `/signals` — prefix hit-rate by day, unknown item types, empty responses |
-| `17-surge-pricing.png` | `/surge` — peak/off-peak windows on the local clock, countdown, pause window |
-| `18-openrouter.png` | `/or status` — OpenRouter vision with no `OK.dat` (the shipped default) |
-| `19-config-scopes.png` | `/config` — global vs project config files and which scope is active |
+| `01-startup-banner.png` | Launch banner: project and home paths, model, thinking level, vision (a surge notice is added here during peak hours; this shot is off-peak) |
+| `02-help-catalogue.png` | `/help`: the full command catalogue, grouped |
+| `03-tools-and-permissions.png` | `/tools`: every tool with its permission level and a note on what it costs: local tools make no API call, `Agent` and `AnalyzeImage` say when they are not offered |
+| `04-status.png` | `/status`: session, vision, project, context gauge, spend |
+| `05-model.png` | `/model`: limits and prices of the one model (there is nothing to switch to) |
+| `06-thinking-picker.png` | `/thinking`: reasoning-effort picker (low / high / off) |
+| `09-usage-and-cost.png` | `/cost`: call, token and cost breakdown, cache hit/miss split and the price card |
+| `13-vision-status.png` | `/vision status`: on/off, the vision model and the 800 px cap |
+| `14-settings.png` | `/settings`: every setting with its live value, which ones are saved, and the command that changes it |
+| `15-cache.png` | `/cache`: the project's SQLite cache and the machine-wide web cache |
+| `16-signals.png` | `/signals`: prefix-cache hit rate by day, unknown item types, empty responses |
+| `17-surge-pricing.png` | `/surge`: peak and off-peak windows on the local clock (UTC here), countdown, pause window |
+| `19-config-scopes.png` | `/config`: global vs project config files and which scope is active |
 
-Live agent-turn stills (`07` answer, `08` context, `10` permission,
-`11` write) and the video set were **not re-shot this cut**: a
-`deepseek-flash` `/responses` probe timed out (DeepSeek infra overload).
-Panel stills above do not need the API and are current. The capture
-tooling under `tools/` is how to re-shoot them later; it is not part of
-the release archive.
+The numbering keeps gaps where stills of live agent turns (an answer, the
+context gauge mid-task, a permission prompt, a file write) used to sit. Those
+need paid API calls and were not re-shot for 1.5.0, so they are not included
+rather than shipped out of date.
 
-## How these were captured (`tools/`)
+## How they were made
 
-The app is a terminal program, so capture is done by driving it inside a real
-PTY and re-rendering the byte stream, rather than by pointing a camera at a
-window. That keeps output crisp at any size and makes the whole set
-reproducible.
+The capture tooling is a development tool and is **not** in the release
+archive. In outline:
 
-- `rec.py` — forks a PTY, runs `g023.sh`, types scripted keystrokes with human
-  timing, and records `(timestamp, output)` events. It answers cursor-position
-  requests so `prompt_toolkit` renders its bottom status bar normally, and
-  supports `mark` events that name the moments worth screenshotting. The
-  optional `deny_on_prompt` flag answers permission prompts with `n` — armed
-  by an `("arm",)` scene step — so a scene stays read-only no matter what the
-  model tries; a reroll of the model's plan should not reroll the screenshots.
-- `scenes.py` — the scripted sessions (`tour`, `session`, `edit`, `ollama`,
-  `panels`) and their marks.
-- `render.py` — replays a recording through a `pyte` terminal emulator and
-  paints each cell with Pillow. Box-drawing glyphs are drawn geometrically so
-  borders join seamlessly, block glyphs are drawn as blended fills, and emoji
-  come from Noto Color Emoji. `marks` mode writes one cropped still per mark;
-  `frames` mode writes video frames.
-- `frames.py` — renders video frames across all cores.
+- a recorder forks a PTY, runs `g023.sh`, types scripted keystrokes with human
+  timing, answers cursor-position queries so `prompt_toolkit` draws its status
+  bar, and records `(timestamp, output)` events plus named marks;
+- scripted scenes (`tour`, `settings`, `panels`) only use slash commands, so
+  they make no model calls and cost nothing;
+- a renderer replays the recording through the `pyte` terminal emulator and
+  paints each cell with Pillow (box-drawing glyphs drawn geometrically so
+  borders join), writing one cropped still per mark. It refuses to write a still
+  if any character would come out as a missing-glyph box.
 
-Regenerating, from a checkout with `pyte` and `Pillow` installed:
-
-```bash
-python3 tools/scenes.py tour                                  # record
-python3 tools/render.py casts/tour.json shots marks "g023 code" "tour-"
-python3 tools/frames.py casts/tour.json frames/tour "g023 code" 12
-ffmpeg -framerate 12 -i frames/tour/f%05d.png \
-       -c:v libx264 -pix_fmt yuv420p -crf 20 videos/01-command-tour.mp4
-```
-
-`scenes.py` points at `/tmp/g023-shoot/todo-api` and
-`/tmp/g023-shoot/home/g023.sh` — a sanitised demo project and install copied
-away from any real home directory before shooting. Change `PROJ` and `APP` to
-re-shoot against a different project or install.
-
-Recordings that include agent turns make real API calls, so re-shooting costs
-whatever those turns cost. The `/cost` panel visible in `09-usage-and-cost.png`
-is the session's own figure — read it there rather than trusting a number
-quoted here.
+The `/cost` figures in `09-usage-and-cost.png` are the session's own: zero,
+because the scenes made no model calls.

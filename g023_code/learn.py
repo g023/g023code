@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import get_project_root
+from .fsutil import atomic_write_text, file_lock
 
 ID_RE = re.compile(r"^[a-z0-9-]{2,64}$")
 INDEX_HEADER = "# learn index — do not edit the body of guides here"
@@ -256,15 +257,6 @@ def probe_ok(requires: list) -> bool:
     return True
 
 
-def _roots_for(scope: str) -> list[tuple[str, Path]]:
-    out: list[tuple[str, Path]] = []
-    if scope in ("all", "project"):
-        out.append(("project", project_root()))
-    if scope in ("all", "env", "user"):
-        out.append(("home", home_root()))
-    return out
-
-
 def _parse_index_line(line: str) -> Optional[dict]:
     m = INDEX_LINE_RE.match(line.strip())
     if not m:
@@ -428,8 +420,13 @@ def _duplicate_when(scope_root: Path, scope: str, when: str, gid: str) -> Option
 
 
 def _upsert_index(scope_root: Path, scope: str, gid: str, title: str, when: str) -> None:
-    line = f"- [{scope}] {gid} — {title}. When: {when}"
     path = index_path(scope_root)
+    with file_lock(path):  # read-modify-write: no lost update between processes
+        _upsert_index_locked(path, scope, gid, title, when)
+
+
+def _upsert_index_locked(path: Path, scope: str, gid: str, title: str, when: str) -> None:
+    line = f"- [{scope}] {gid} — {title}. When: {when}"
     lines = _catalog_lines(path)
     if not lines:
         lines = [INDEX_HEADER, ""]
@@ -443,26 +440,23 @@ def _upsert_index(scope_root: Path, scope: str, gid: str, title: str, when: str)
         else:
             out.append(ln)
     if not replaced:
-        if out and out[-1].strip():
-            out.append(line)
-        else:
-            out.append(line)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+        out.append(line)
+    atomic_write_text(path, "\n".join(out).rstrip() + "\n")
 
 
 def _remove_index_id(scope_root: Path, gid: str) -> None:
     path = index_path(scope_root)
-    lines = _catalog_lines(path)
-    if not lines:
-        return
-    out = []
-    for ln in lines:
-        parsed = _parse_index_line(ln)
-        if parsed and parsed["id"] == gid:
-            continue
-        out.append(ln)
-    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    with file_lock(path):
+        lines = _catalog_lines(path)
+        if not lines:
+            return
+        out = []
+        for ln in lines:
+            parsed = _parse_index_line(ln)
+            if parsed and parsed["id"] == gid:
+                continue
+            out.append(ln)
+        atomic_write_text(path, "\n".join(out).rstrip() + "\n")
 
 
 def _guide_count(scope_root: Path) -> int:
@@ -590,8 +584,7 @@ def put(
     }
     text = render_guide(stored, body_text)
     dest = guide_path(scope_root, gid)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text, encoding="utf-8")
+    atomic_write_text(dest, text)
     _upsert_index(scope_root, scope, gid, title, when)
     _append_ledger(
         scope_root,
@@ -613,7 +606,8 @@ def forget(id: str) -> dict:
         meta = {k: v for k, v in guide.items() if k not in ("body", "path", "root")}
         meta["status"] = "tombstone"
         dest = guide_path(root, gid)
-        dest.write_text(render_guide(meta, "# forgotten\n"), encoding="utf-8")
+        with file_lock(dest):
+            atomic_write_text(dest, render_guide(meta, "# forgotten\n"))
         _remove_index_id(root, gid)
         _append_ledger(root, {"op": "forget", "id": gid, "scope": meta.get("scope")})
         return {"ok": True, "id": gid, "status": "tombstone"}
@@ -628,39 +622,45 @@ def outcome(id: str, kind: str) -> dict:
     if not ID_RE.match(gid):
         return {"ok": False, "error": "invalid_id"}
     for root in (project_root(), home_root()):
-        guide = _load_guide(root, gid)
-        if not guide:
+        if not _load_guide(root, gid):
             continue
-        if str(guide.get("status") or "") == "tombstone":
-            return {"ok": False, "error": "forgotten", "id": gid}
-        helpful = int(guide.get("helpful") or 0)
-        harmful = int(guide.get("harmful") or 0)
-        if flag == "helped":
-            helpful += 1
-        else:
-            harmful += 1
-        status = str(guide.get("status") or "active")
-        if harmful >= 2 and harmful > helpful:
-            status = "stale"
-        meta = {k: v for k, v in guide.items() if k not in ("body", "path", "root")}
-        meta["helpful"] = helpful
-        meta["harmful"] = harmful
-        meta["status"] = status
-        dest = guide_path(root, gid)
-        dest.write_text(render_guide(meta, guide.get("body") or ""), encoding="utf-8")
-        if status == "stale":
-            _remove_index_id(root, gid)
-        _append_ledger(
-            root, {"op": "outcome", "id": gid, "kind": flag, "status": status}
-        )
-        return {
-            "ok": True,
-            "id": gid,
-            "helpful": helpful,
-            "harmful": harmful,
-            "status": status,
-        }
+        # Counters are read-modify-write: re-read under the guide's lock so two
+        # concurrent votes (two REPLs, or parallel tool calls) both count.
+        with file_lock(guide_path(root, gid)):
+            guide = _load_guide(root, gid)
+            if not guide:
+                continue
+            return _apply_outcome(root, gid, flag, guide)
     return {"ok": False, "error": "not_found", "id": gid}
+
+
+def _apply_outcome(root: Path, gid: str, flag: str, guide: dict) -> dict:
+    if str(guide.get("status") or "") == "tombstone":
+        return {"ok": False, "error": "forgotten", "id": gid}
+    helpful = int(guide.get("helpful") or 0)
+    harmful = int(guide.get("harmful") or 0)
+    if flag == "helped":
+        helpful += 1
+    else:
+        harmful += 1
+    status = str(guide.get("status") or "active")
+    if harmful >= 2 and harmful > helpful:
+        status = "stale"
+    meta = {k: v for k, v in guide.items() if k not in ("body", "path", "root")}
+    meta["helpful"] = helpful
+    meta["harmful"] = harmful
+    meta["status"] = status
+    atomic_write_text(guide_path(root, gid), render_guide(meta, guide.get("body") or ""))
+    if status == "stale":
+        _remove_index_id(root, gid)
+    _append_ledger(root, {"op": "outcome", "id": gid, "kind": flag, "status": status})
+    return {
+        "ok": True,
+        "id": gid,
+        "helpful": helpful,
+        "harmful": harmful,
+        "status": status,
+    }
 
 
 def catalog_nudge(tool_name: str, error_text: str = "") -> Optional[str]:

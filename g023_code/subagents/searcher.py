@@ -20,8 +20,9 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
+from .. import docindex, near_miss
 from ..config import get_project_root
-from ..paths import confine_or_error, rel_to_root
+from ..paths import confine_or_error
 
 
 IGNORE_DIRS = {
@@ -37,6 +38,7 @@ IGNORE_EXTS = {
 
 _BRACE = re.compile(r"\{([^{}]+)\}")
 DEFAULT_MAX_SAMPLES = 12
+MAX_SAMPLES_CAP = 60
 COUNT_CEILING = 50_000
 
 
@@ -104,14 +106,19 @@ def _glob_patterns(file_glob: str) -> List[str]:
     return patterns
 
 
-def _under_g023_memory(rel: Path) -> bool:
+# Readable islands inside otherwise-ignored `.g023/`. Posts and notebook
+# bodies stay out of the standing prompt; SearchContent still has to find them.
+OVERLAY_G023_DIRS = frozenset({"memory", "bbs"})
+
+
+def _under_g023_overlay(rel: Path) -> bool:
     parts = rel.parts
-    return len(parts) >= 2 and parts[0] == ".g023" and parts[1] == "memory"
+    return len(parts) >= 2 and parts[0] == ".g023" and parts[1] in OVERLAY_G023_DIRS
 
 
 def _parents_blocked(rel: Path) -> bool:
     parent = rel.parts[:-1]
-    if len(parent) >= 2 and parent[0] == ".g023" and parent[1] == "memory":
+    if len(parent) >= 2 and parent[0] == ".g023" and parent[1] in OVERLAY_G023_DIRS:
         return False
     if parent[:1] == (".g023",):
         return True
@@ -144,9 +151,11 @@ def _walk_files(root: Path):
         if rel_s in (".", ""):
             keep = [d for d in dirnames if d not in IGNORE_DIRS or d == ".g023"]
         elif rel_s == ".g023":
-            keep = [d for d in dirnames if d == "memory"]
-        elif rel_s == ".g023/memory" or rel_s.startswith(".g023/memory/"):
+            keep = [d for d in dirnames if d in OVERLAY_G023_DIRS]
+        elif rel_s.startswith(".g023/") and rel_s.split("/")[1] in OVERLAY_G023_DIRS:
             keep = [d for d in dirnames if d not in IGNORE_DIRS]
+            if rel_s == ".g023/bbs":
+                keep = [d for d in keep if d != "bbs_tools"]
         else:
             keep = [d for d in dirnames if d not in IGNORE_DIRS]
         dirnames[:] = sorted(keep)
@@ -172,8 +181,14 @@ def _git_match(rel: str, pat: str) -> bool:
     return fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, f"**/{pat}")
 
 
-def build_ignorer(root: Path) -> Callable[[Path], bool]:
-    """True when the path should be omitted (IGNORE_DIRS / .gitignore)."""
+def build_ignorer(
+    root: Path, *, allow_dirs: frozenset = frozenset(), allow_exts: frozenset = frozenset()
+) -> Callable[[Path], bool]:
+    """True when the path should be omitted (IGNORE_DIRS / .gitignore).
+
+    ``allow_dirs`` / ``allow_exts`` lift the defaults for names a caller asked
+    for literally (Glob ``vendor/**/*.png`` wants vendor/ and .png files).
+    """
     rules: list[tuple[str, bool]] = []
     gi = root / ".gitignore"
     if gi.is_file():
@@ -190,18 +205,28 @@ def build_ignorer(root: Path) -> Callable[[Path], bool]:
                 raw = raw[1:]
             rules.append((raw, negate))
 
+    root_s = os.path.realpath(root)
+    root_prefix = root_s.rstrip(os.sep) + os.sep
+
     def ignored(path: Path) -> bool:
-        try:
-            rel = path.resolve().relative_to(root.resolve())
-        except ValueError:
+        # os.path string ops: Path.resolve()/relative_to() cost ~0.5 ms per call
+        # on Python 3.12, which made Glob over 4,000 hits take seconds.
+        real = os.path.realpath(path)
+        if real == root_s:
+            rel = Path(".")
+        elif real.startswith(root_prefix):
+            rel = Path(real[len(root_prefix):])
+        else:
             return True
-        if _under_g023_memory(rel):
-            if path.is_file() and path.suffix.lower() in IGNORE_EXTS:
+        if _under_g023_overlay(rel):
+            if "bbs_tools" in rel.parts:
+                return True
+            if path.is_file() and path.suffix.lower() in IGNORE_EXTS - allow_exts:
                 return True
             return False
-        if set(rel.parts) & IGNORE_DIRS:
+        if (set(rel.parts) & IGNORE_DIRS) - allow_dirs:
             return True
-        if path.is_file() and path.suffix.lower() in IGNORE_EXTS:
+        if path.is_file() and path.suffix.lower() in IGNORE_EXTS - allow_exts:
             return True
         rel_s = rel.as_posix()
         prefixes = [rel_s]
@@ -210,6 +235,8 @@ def build_ignorer(root: Path) -> Callable[[Path], bool]:
             prefixes.append("/".join(parts[: i + 1]))
         matched = False
         for prefix in prefixes:
+            if prefix.rsplit("/", 1)[-1] in allow_dirs:
+                continue
             for pat, negate in rules:
                 if _git_match(prefix, pat):
                     matched = not negate
@@ -246,6 +273,52 @@ def _compile_query(query: str) -> re.Pattern:
         return re.compile(re.escape(query), re.IGNORECASE)
 
 
+# (path, mtime_ns) -> (outline or None, symbols) for the files samples came from.
+_WHERE_CACHE: dict[tuple[str, int], tuple] = {}
+WHERE_MAX_BYTES = 2_000_000  # code: regex symbol scan
+WHERE_TEXT_MAX_BYTES = 32_000_000  # text: heading induction is ~0.1 s per 5 MB
+
+
+def _where_index(path: Path, lines: Optional[list]) -> tuple:
+    """Outline (text) or symbol spans (code) of ``path``, cached by mtime. Local, no API."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None, {}
+    key = (str(path), st.st_mtime_ns)
+    hit = _WHERE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out: tuple = (None, {})
+    from .file_reader import TEXT_LANGUAGES, _detect_language, _local_metadata
+
+    lang = _detect_language(path)
+    cap = WHERE_TEXT_MAX_BYTES if lang in TEXT_LANGUAGES else WHERE_MAX_BYTES
+    if lines is not None and st.st_size <= cap:
+        content = "\n".join(lines)
+        if lang in TEXT_LANGUAGES:
+            outline = docindex.doc_for(path, content, lang).outline
+            out = (outline if outline else None, {})
+        else:
+            out = (None, _local_metadata(path, content).get("symbols") or {})
+    if len(_WHERE_CACHE) > 64:
+        _WHERE_CACHE.clear()
+    _WHERE_CACHE[key] = out
+    return out
+
+
+def _where(path: Path, lines: Optional[list], line_no: int, text: str) -> str:
+    """Breadcrumb of a hit: its section path (text) or enclosing function (code)."""
+    outline, symbols = _where_index(path, lines)
+    if outline is not None:
+        return outline.address(line_no)
+    name = docindex.enclosing_symbol(symbols, line_no)
+    # A definition's own first line needs no "in itself".
+    if name and int(symbols[name][0]) != line_no:
+        return name
+    return ""
+
+
 def _sample_from_line(path: Path, root: Path, line_no: int, line: str, lines: Optional[list] = None) -> dict:
     try:
         rel = str(path.resolve().relative_to(root.resolve()))
@@ -254,39 +327,310 @@ def _sample_from_line(path: Path, root: Path, line_no: int, line: str, lines: Op
     before: list[str] = []
     after: list[str] = []
     if lines is not None:
-        before = [l.strip()[:120] for l in lines[max(0, line_no - 3) : line_no - 1]]
+        before = [l.strip()[:120] for l in lines[max(0, line_no - 2) : line_no - 1]]
         after = [l.strip()[:120] for l in lines[line_no : line_no + 2]]
-    return {
+    sample = {
         "file": rel,
         "line": line_no,
         "match": line.strip()[:200],
         "context_before": before,
         "context_after": after,
     }
+    where = _where(path, lines, line_no, line) if lines is not None else ""
+    if where:
+        sample["in"] = where
+    return sample
 
 
-def _search_file_count_and_sample(
-    path: Path,
+# Candidates kept per search for ranking; the total keeps counting past it.
+CANDIDATE_CAP = 2_000
+UNSHOWN_FILES_MAX = 20
+_DEF_LINE = re.compile(
+    r"^\s*(?:export\s+(?:default\s+)?)?(?:pub\s+)?"
+    r"(?:async\s+def|def|class|function|func|fn|interface|struct|enum|trait|type|impl"
+    r"|const|let|var)\b"
+)
+_ASSIGN_LINE = re.compile(r"^\s*[A-Za-z_][\w.]*\s*(?::[^=]+)?=[^=]")
+# C/C++ at column 0: ``void do_goto( CHAR_DATA *ch, ... )`` (not ``;``-terminated),
+# and ``#define NAME``. A call or prototype never starts a definition line like that.
+_C_DEF_LINE = re.compile(
+    r"^(?:[A-Za-z_][\w*&:<>, \t]*?[ \t*&])(~?[A-Za-z_]\w*(?:::~?\w+)*)[ \t]*\("
+)
+_C_DEFINE = re.compile(r"^\s*#\s*define\s+\w")
+_C_NOT_NAMES = frozenset("if while for switch return sizeof else do case".split())
+# A statement, not a definition head: ``return True, f(x)``, ``await g(y)``.
+_C_NOT_LEADS = frozenset("return else case new delete throw await yield raise assert print not".split())
+_HEAD_END = re.compile(r"[(=:{<]")
+_DOC_EXTS = {".md", ".txt", ".rst", ".adoc", ".log", ".csv"}
+# Copies of the tree (release snapshots, backups) rank after the live source.
+_ARCHIVE_DIRS = {"releases", "release", "backup", "backups", "archive", "old", "dist"}
+
+
+def _is_definition(text: str, pattern: Optional[re.Pattern]) -> bool:
+    """The match names what the line defines: ``def q(``, ``class Q``, ``Q = ...``."""
+    c_def = _C_DEFINE.match(text) or (
+        (m := _C_DEF_LINE.match(text)) is not None
+        and m.group(1) not in _C_NOT_NAMES
+        and text.split(None, 1)[0] not in _C_NOT_LEADS
+        and not text.rstrip().endswith(";")
+        # A C definition head ends in ``)``, ``{`` or ``,`` (args wrap); prose
+        # like "DeepSeek surge (peak/off-peak) pricing windows." does not.
+        and text.rstrip()[-1:] in (")", "{", ",", "(")
+    )
+    if not (c_def or _DEF_LINE.match(text) or _ASSIGN_LINE.match(text)):
+        return False
+    if pattern is None:
+        return True
+    cut = _HEAD_END.search(text)
+    head = text[: cut.start()] if cut else text
+    return bool(pattern.search(head))
+
+
+_KEYWORD_DEF = re.compile(
+    r"^(?:export\s+(?:default\s+)?)?(?:pub\s+)?"
+    r"(?:async\s+def|def|class|function|func|fn|interface|struct|enum|trait|type|impl)\b"
+)
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def _definition_tier(text: str, pattern: Optional[re.Pattern]) -> tuple[int, int]:
+    """(tier, exact): what the matched line defines, lower is stronger.
+
+    0 a def/class/function (or a C function body) named by the query; 1 a
+    module-level name (``NAME = ...``, ``const``, ``#define``); 2 an indented
+    local assignment; 3 a plain use. ``exact`` is 0 when a defined name equals
+    the query instead of merely containing it (``surge`` vs ``surge_badge``).
+    """
+    if not _is_definition(text, pattern):
+        return 3, 1
+    body = text.lstrip()
+    indented = len(body) < len(text)
+    if _KEYWORD_DEF.match(body):
+        tier = 0
+    elif _C_DEFINE.match(text):
+        tier = 1
+    elif not indented and _C_DEF_LINE.match(text) and not _ASSIGN_LINE.match(text):
+        tier = 0
+    else:
+        tier = 2 if indented else 1
+    exact = 1
+    if pattern is not None:
+        cut = _HEAD_END.search(text)
+        head = text[: cut.start()] if cut else text
+        if any(pattern.fullmatch(name) for name in _IDENT.findall(head)):
+            exact = 0
+    return tier, exact
+
+
+def search_tiers_enabled() -> bool:
+    from ..config import settings
+
+    return bool(getattr(settings, "search_tiers", False))
+
+
+def _candidate_rank(
+    rel: str, text: str, pattern: Optional[re.Pattern] = None, tiers: bool = False
+) -> tuple[int, ...]:
+    """Lower is better: live tree, then code over prose, then definitions.
+
+    With ``tiers`` the definition flag becomes :func:`_definition_tier`, so a
+    ``def`` named by the query outranks a local ``name = ...`` that merely
+    mentions it (before, both tied and file order decided).
+    """
+    parts = set(Path(rel).parts[:-1])
+    archive = 1 if parts & _ARCHIVE_DIRS else 0
+    doc = 1 if Path(rel).suffix.lower() in _DOC_EXTS else 0
+    if tiers:
+        return (archive, doc) + _definition_tier(text, pattern)
+    kind = 0 if _is_definition(text, pattern) else 1
+    return archive, doc, kind
+
+
+# Definition peek: the body of the one definition a search plainly points at.
+PEEK_MAX_LINES = 30
+PEEK_MAX_CHARS = 2_400
+
+
+def def_peek_enabled() -> bool:
+    from ..config import settings
+
+    return bool(getattr(settings, "def_peek", False))
+
+
+def _body_span(lines: list[str], start: int) -> tuple[int, int]:
+    """1-based inclusive span of the block headed at ``start`` (indentation scope).
+
+    The block ends before the first non-blank line indented no deeper than the
+    head; a closing ``}``/``)``/``]`` at the head's depth is kept (C, JS, Rust).
+    """
+    head = lines[start - 1]
+    base = len(head) - len(head.lstrip())
+    end = start
+    j = start
+    while j < len(lines):
+        line = lines[j]
+        j += 1
+        body = line.lstrip()
+        if not body:
+            continue
+        if len(line) - len(body) <= base:
+            if body[0] in ")}]":
+                end = j
+            break
+        end = j
+    return start, end
+
+
+def definition_peek(samples: list, pattern: Optional[re.Pattern], root: Path) -> Optional[dict]:
+    """Body of the definition a search names unambiguously, or None.
+
+    Fires when exactly one shown definition's name *equals* a query term, or
+    when only one shown line is a definition at all. Any other shape (two
+    exact names, several partial ones) is a guess, and a wrong guess costs
+    the tokens without saving the follow-up read.
+    """
+    defs: list[tuple[int, dict]] = []
+    for smp in samples:
+        if not isinstance(smp, dict):
+            continue
+        rel = str(smp.get("file") or "")
+        rank = _candidate_rank(rel, str(smp.get("match") or ""), pattern, True)
+        if rank[0] or rank[1] or rank[2] != 0:
+            continue
+        defs.append((rank[3], smp))
+    exact = [smp for e, smp in defs if e == 0]
+    if len(exact) == 1:
+        pick = exact[0]
+    elif not exact and len(defs) == 1:
+        pick = defs[0][1]
+    else:
+        return None
+    path = root / str(pick["file"])
+    lines = _file_lines(path)
+    try:
+        start = int(pick.get("line") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not lines or not 1 <= start <= len(lines):
+        return None
+    a, b = _body_span(lines, start)
+    if b <= start + 1:
+        return None  # the sample's context line already shows the whole body
+    indent = len(lines[start - 1]) - len(lines[start - 1].lstrip())
+    while a > 1 and lines[a - 2].lstrip().startswith("@") and (
+        len(lines[a - 2]) - len(lines[a - 2].lstrip()) == indent
+    ):
+        a -= 1  # decorators belong to the definition
+    shown = min(b, a + PEEK_MAX_LINES - 1)
+    body: list[str] = []
+    used = 0
+    for n in range(a, shown + 1):
+        text = lines[n - 1].rstrip()[:200]
+        if used + len(text) > PEEK_MAX_CHARS and body:
+            shown = n - 1
+            break
+        body.append(text)
+        used += len(text) + 1
+    out = {"file": pick["file"], "start": a, "end": shown, "lines": body}
+    if shown < b:
+        out["more_lines"] = b - shown
+    return out
+
+
+def _rel(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _pick_samples(
+    candidates: list[tuple[Path, int, str]],
     root: Path,
+    max_matches: int,
+    pattern: Optional[re.Pattern] = None,
+) -> tuple[list[dict], dict[str, int]]:
+    """Definition-first, file-diverse choice of ``max_matches`` candidates.
+
+    Round-robin over files ordered by their best candidate, so a cap of 12
+    covers up to 12 files instead of the first file's 12 hits. Returns the
+    samples (with ±2 context lines) and ``{file: count}`` for matching files
+    that got no sample.
+    """
+    per_file: dict[str, list[tuple[tuple, Path, int, str]]] = {}
+    counts: dict[str, int] = {}
+    tiers = search_tiers_enabled()
+    for path, line_no, text in candidates:
+        rel = _rel(path, root)
+        counts[rel] = counts.get(rel, 0) + 1
+        per_file.setdefault(rel, []).append(
+            (_candidate_rank(rel, text, pattern, tiers), path, line_no, text)
+        )
+    for rows in per_file.values():
+        rows.sort(key=lambda r: (r[0], r[2]))
+
+    def _file_key(f: str) -> tuple:
+        if not tiers:
+            return per_file[f][0][0], f
+        # Same best tier: a file named by the query (surge.py for "surge") first.
+        stem = 0 if pattern is not None and pattern.search(Path(f).stem) else 1
+        return per_file[f][0][0], stem, f
+
+    order = sorted(per_file, key=_file_key)
+    chosen: dict[str, list] = {f: [] for f in order}
+    taken = 0
+    depth = 0
+    while taken < max_matches:
+        progressed = False
+        for f in order:
+            rows = per_file[f]
+            if depth < len(rows) and taken < max_matches:
+                chosen[f].append(rows[depth])
+                taken += 1
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    samples: list[dict] = []
+    for f in order:
+        if not chosen[f]:
+            continue
+        lines = _file_lines(chosen[f][0][1])
+        for _, path, line_no, text in sorted(chosen[f], key=lambda r: r[2]):
+            samples.append(_sample_from_line(path, root, line_no, text, lines))
+    unshown = {f: counts[f] for f in order if not chosen[f]}
+    if len(unshown) > UNSHOWN_FILES_MAX:
+        unshown = dict(list(unshown.items())[:UNSHOWN_FILES_MAX])
+    return samples, unshown
+
+
+def _file_lines(path: Path) -> Optional[list[str]]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+
+def _search_file_candidates(
+    path: Path,
     pattern: re.Pattern,
-    remaining_samples: int,
-) -> tuple[int, list[dict]]:
+    room: int,
+) -> tuple[int, list[tuple[Path, int, str]]]:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return 0, []
-    lines = text.splitlines()
     total = 0
-    samples: list[dict] = []
-    for i, line in enumerate(lines, 1):
+    found: list[tuple[Path, int, str]] = []
+    for i, line in enumerate(text.splitlines(), 1):
         if not pattern.search(line):
             continue
         total += 1
-        if len(samples) < remaining_samples:
-            samples.append(_sample_from_line(path, root, i, line, lines))
+        if len(found) < room:
+            found.append((path, i, line))
         if total >= COUNT_CEILING:
             break
-    return total, samples
+    return total, found
 
 
 def _payload(
@@ -296,9 +640,13 @@ def _payload(
     max_matches: int,
     backend: str,
     total: int,
-    samples: list[dict],
+    candidates: list[tuple[Path, int, str]],
     files_scanned: int = 0,
+    project_root: Optional[Path] = None,
 ) -> str:
+    samples, unshown = _pick_samples(
+        candidates, project_root or search_root, max_matches, _compile_query(query)
+    )
     files = sorted({m["file"] for m in samples})
     truncated = total > len(samples)
     summary = f"Found {total} matches"
@@ -307,6 +655,8 @@ def _payload(
     summary += f" via {backend}."
     if files:
         summary += f" Occurrences in: {', '.join(files[:8])}" + ("…" if len(files) > 8 else "")
+    if unshown:
+        summary += f" {len(unshown)} more file(s) without samples."
     if truncated:
         summary += f" Sample cap {max_matches}; total is {total}."
     return json.dumps(
@@ -319,7 +669,7 @@ def _payload(
             "total": total,
             "files": files,
             "samples": samples,
-            "matches": samples,
+            "unshown_files": unshown,
             "truncated": truncated,
             "files_scanned": files_scanned,
             "metadata_summary": summary,
@@ -387,8 +737,7 @@ def _rg_search(
         else:
             return None
     total = 0
-    samples: list[dict] = []
-    files: set[str] = set()
+    candidates: list[tuple[Path, int, str]] = []
     for line in (proc.stdout or "").splitlines():
         try:
             ev = json.loads(line)
@@ -409,12 +758,12 @@ def _rg_search(
         total += 1
         line_no = int(data.get("line_number") or 0)
         text = ((data.get("lines") or {}).get("text") or "").rstrip("\n")
-        if p is not None and len(samples) < max_matches:
-            samples.append(_sample_from_line(p, project_root, line_no, text))
-            files.add(samples[-1]["file"])
+        if p is not None and len(candidates) < CANDIDATE_CAP:
+            candidates.append((p, line_no, text))
         if total >= COUNT_CEILING:
             break
-    return _payload(query, search_root, None if not patterns else ",".join(patterns), max_matches, "rg", total, samples)
+    return _payload(query, search_root, None if not patterns else ",".join(patterns),
+                    max_matches, "rg", total, candidates, project_root=project_root)
 
 
 def _grep_search(
@@ -479,7 +828,7 @@ def _grep_search(
         if proc.returncode not in (0, 1):
             return None
     total = 0
-    samples: list[dict] = []
+    candidates: list[tuple[Path, int, str]] = []
     line_re = re.compile(r"^(.*?):(\d+):(.*)$")
     for raw in (proc.stdout or "").splitlines():
         m = line_re.match(raw)
@@ -496,19 +845,12 @@ def _grep_search(
         if ignored(p):
             continue
         total += 1
-        if len(samples) < max_matches:
-            samples.append(_sample_from_line(p, project_root, int(line_s), text))
+        if len(candidates) < CANDIDATE_CAP:
+            candidates.append((p, int(line_s), text))
         if total >= COUNT_CEILING:
             break
-    return _payload(
-        query,
-        search_root,
-        None if not patterns else ",".join(patterns),
-        max_matches,
-        "grep",
-        total,
-        samples,
-    )
+    return _payload(query, search_root, None if not patterns else ",".join(patterns),
+                    max_matches, "grep", total, candidates, project_root=project_root)
 
 
 def _walk_search(
@@ -521,7 +863,7 @@ def _walk_search(
 ) -> str:
     pattern = _compile_query(query)
     total = 0
-    samples: list[dict] = []
+    cands: list[tuple[Path, int, str]] = []
     files_scanned = 0
     if search_root.is_file():
         candidates: Iterable[Path] = [search_root]
@@ -533,14 +875,16 @@ def _walk_search(
         if patterns and not _matches_glob(item, search_root, patterns):
             continue
         files_scanned += 1
-        n, found = _search_file_count_and_sample(
-            item, project_root, pattern, max(0, max_matches - len(samples))
+        n, found = _search_file_candidates(
+            item, pattern, max(0, CANDIDATE_CAP - len(cands))
         )
         total += n
-        samples.extend(found)
+        cands.extend(found)
         if total >= COUNT_CEILING:
             break
-    return _payload(query, search_root, None if not patterns else ",".join(patterns), max_matches, "walk", total, samples, files_scanned)
+    return _payload(query, search_root, None if not patterns else ",".join(patterns),
+                    max_matches, "walk", total, cands, files_scanned,
+                    project_root=project_root)
 
 
 def search_sync(
@@ -550,6 +894,10 @@ def search_sync(
     file_glob: Optional[str] = None,
     backend: Optional[str] = None,
 ) -> str:
+    if not query:
+        # An empty pattern matches every line: a context bill, never an answer.
+        return json.dumps({"error": "query is empty; pass a word, symbol or phrase "
+                                    "(Glob or ListDir lists files)"})
     project_root = get_project_root()
     search_root, err = confine_or_error(path, root=project_root)
     if err:
@@ -558,7 +906,8 @@ def search_sync(
     if not search_root.exists():
         return json.dumps({"error": f"Path does not exist: {search_root}"})
 
-    max_matches = max(1, int(max_matches or DEFAULT_MAX_SAMPLES))
+    # Bounded: search results are never vaulted, so the cap is the size limit.
+    max_matches = min(MAX_SAMPLES_CAP, max(1, int(max_matches or DEFAULT_MAX_SAMPLES)))
     patterns = _glob_patterns(file_glob) if file_glob else []
     ignored = build_ignorer(project_root)
     chosen = backend or search_backend_name()
@@ -566,13 +915,34 @@ def search_sync(
     def _finish(raw: str, used: str) -> str:
         data = json.loads(raw)
         data["file_glob"] = file_glob
+        if not data.get("error"):
+            _add_elsewhere(data, query, search_root, project_root, patterns, ignored, used)
         if used != "walk":
-            mem = project_root / ".g023" / "memory"
-            overlay = _overlay_memory_search(
-                query, search_root, project_root, mem, max_matches, patterns, ignored, used
-            )
-            if overlay:
-                data = _merge_search_payloads(data, overlay, max_matches)
+            for name in sorted(OVERLAY_G023_DIRS):
+                extra_root = project_root / ".g023" / name
+                overlay = _overlay_dir_search(
+                    query,
+                    search_root,
+                    project_root,
+                    extra_root,
+                    max_matches,
+                    patterns,
+                    ignored,
+                    used,
+                )
+                if overlay:
+                    data = _merge_search_payloads(data, overlay, max_matches)
+        if not data.get("error") and int(data.get("total") or 0) == 0:
+            _add_near_misses(data, query, search_root, project_root, ignored)
+        if not data.get("error") and data.get("samples") and def_peek_enabled():
+            peek = definition_peek(data["samples"], _compile_query(query), project_root)
+            if peek:
+                data["definition"] = peek
+                for smp in data["samples"]:
+                    # The peek shows these lines; the hit row keeps its "@ where".
+                    if smp.get("file") == peek["file"] and peek["start"] <= smp.get("line", 0) <= peek["end"]:
+                        smp["context_before"] = []
+                        smp["context_after"] = []
         return json.dumps(data, ensure_ascii=False)
 
     if chosen == "rg":
@@ -588,33 +958,115 @@ def search_sync(
     return _finish(walk, "walk")
 
 
-def _overlay_memory_search(
+def scope_count_enabled() -> bool:
+    from ..config import settings
+
+    return bool(getattr(settings, "scope_count", False))
+
+
+def _add_elsewhere(
+    data: dict,
     query: str,
     search_root: Path,
     project_root: Path,
-    mem: Path,
+    patterns: List[str],
+    ignored: Callable[[Path], bool],
+    used: str,
+) -> None:
+    """Scoped search: how many hits the rest of the project holds.
+
+    A search scoped to a subdirectory leaves "is it used anywhere else?"
+    open, and the usual answer is a second, project-wide search. One count
+    over the project (same backend, one sample) closes it:
+    ``elsewhere_in_project: 0`` means the scoped result is the whole story.
+    """
+    if not scope_count_enabled():
+        return
+    try:
+        if search_root.resolve() == project_root.resolve():
+            return
+    except OSError:
+        return
+    try:
+        if used == "rg":
+            raw = _rg_search(query, project_root, project_root, 1, patterns, ignored)
+        elif used == "grep":
+            raw = _grep_search(query, project_root, project_root, 1, patterns, ignored)
+        else:
+            raw = _walk_search(query, project_root, project_root, 1, patterns, ignored)
+        whole = json.loads(raw) if raw else {}
+    except Exception:  # a hint must never break a search
+        return
+    if whole.get("error") or "total" not in whole:
+        return
+    try:
+        outside = int(whole["total"]) - int(data.get("total") or 0)
+    except (TypeError, ValueError):
+        return
+    if outside >= 0:
+        data["elsewhere_in_project"] = outside
+
+
+def _add_near_misses(
+    data: dict, query: str, search_root: Path, project_root: Path, ignored: Callable[[Path], bool]
+) -> None:
+    """Zero hits: suggest defined names spelled like the query's (``near_miss``).
+
+    The model searched for the name it expected; one hop to the real
+    spelling replaces a ListDir/ReadFile/re-grep chain. Bounded by
+    ``near_miss`` time and byte budgets; off with G023_NEAR_MISS=0.
+    """
+    if not near_miss.enabled():
+        return
+    root = search_root if search_root.is_dir() else search_root.parent
+    if search_root.is_file():
+        files = iter([search_root])
+    else:
+        files = (
+            f for f in _walk_files(root)
+            if f.is_file() and not _should_skip(f, root) and not ignored(f)
+        )
+    try:
+        found = near_miss.suggest(query, files, project_root)
+    except Exception:  # a hint must never break a search
+        return
+    hits = found.get("did_you_mean") or []
+    if hits:
+        data["did_you_mean"] = hits
+        names = ", ".join(h["name"] for h in hits[:3])
+        data["metadata_summary"] = (
+            str(data.get("metadata_summary") or "Found 0 matches")
+            + f" Similar defined names: {names}."
+        )
+
+
+def _overlay_dir_search(
+    query: str,
+    search_root: Path,
+    project_root: Path,
+    extra: Path,
     max_matches: int,
     patterns: List[str],
     ignored: Callable[[Path], bool],
     backend: str,
 ) -> Optional[dict]:
-    if not mem.is_dir():
+    if not extra.is_dir():
         return None
     try:
-        mem.resolve().relative_to(search_root.resolve())
+        extra.resolve().relative_to(search_root.resolve())
     except ValueError:
         return None
     try:
-        search_root.resolve().relative_to(mem.resolve())
+        search_root.resolve().relative_to(extra.resolve())
         return None
     except ValueError:
         pass
     if backend == "rg":
-        raw = _rg_search(query, mem, project_root, max_matches, patterns, ignored)
+        raw = _rg_search(query, extra, project_root, max_matches, patterns, ignored)
     elif backend == "grep":
-        raw = _grep_search(query, mem, project_root, max_matches, patterns, ignored)
+        raw = _grep_search(query, extra, project_root, max_matches, patterns, ignored)
     else:
-        raw = _walk_search(query, mem, project_root, max_matches, patterns, ignored)
+        raw = _walk_search(query, extra, project_root, max_matches, patterns, ignored)
     if not raw:
         return None
     try:
@@ -624,9 +1076,9 @@ def _overlay_memory_search(
 
 
 def _merge_search_payloads(primary: dict, extra: dict, max_matches: int) -> dict:
-    samples = list(primary.get("samples") or primary.get("matches") or [])
+    samples = list(primary.get("samples") or [])
     seen = {(s.get("file"), s.get("line")) for s in samples if isinstance(s, dict)}
-    for item in extra.get("samples") or extra.get("matches") or []:
+    for item in extra.get("samples") or []:
         if not isinstance(item, dict):
             continue
         key = (item.get("file"), item.get("line"))
@@ -643,7 +1095,11 @@ def _merge_search_payloads(primary: dict, extra: dict, max_matches: int) -> dict
         total = int(primary.get("total") or 0) + int(extra.get("total") or 0)
     files = sorted({m.get("file") for m in samples if isinstance(m, dict) and m.get("file")})
     primary["samples"] = samples
-    primary["matches"] = samples
+    unshown = dict(primary.get("unshown_files") or {})
+    for f, n in (extra.get("unshown_files") or {}).items():
+        if f not in files and len(unshown) < UNSHOWN_FILES_MAX:
+            unshown[f] = n
+    primary["unshown_files"] = unshown
     primary["total"] = total
     primary["files"] = files
     primary["truncated"] = total > len(samples)
@@ -665,6 +1121,71 @@ def _normalize_find_pattern(pat: str) -> str:
     return pat
 
 
+_WILD = re.compile(r"[*?\[\]{}]")
+
+
+def literal_allowances(pattern: str, search_rel: str = "") -> tuple[frozenset, frozenset]:
+    """Directory names and extensions a glob names literally.
+
+    ``frames/*.png`` names ``.png``; ``vendor/**/*.js`` names ``vendor``. The
+    default ignore lists exist to keep noise out of broad searches, not to
+    contradict an explicit request — that turned ``Glob frames/*.png`` into
+    "0 files" for a directory of 4,000 PNGs.
+    """
+    dirs: set[str] = set()
+    exts: set[str] = set()
+    for alt in expand_braces(pattern or ""):
+        segs = alt.replace("\\", "/").split("/")
+        for seg in segs[:-1]:
+            if seg and not _WILD.search(seg):
+                dirs.add(seg)
+        m = re.search(r"(\.[A-Za-z0-9]+)$", segs[-1])
+        if m:
+            exts.add(m.group(1).lower())
+    for seg in (search_rel or "").split("/"):
+        if seg and seg != ".":
+            dirs.add(seg)
+    return frozenset(dirs & IGNORE_DIRS), frozenset(exts & IGNORE_EXTS)
+
+
+def _collect_glob_hits(
+    glob_pat: str,
+    from_root: Path,
+    project_root: Path,
+    ignored: Callable[[Path], bool],
+    seen: set[str],
+    files: list[str],
+    allow_dirs: frozenset = frozenset(),
+    allow_exts: frozenset = frozenset(),
+) -> None:
+    try:
+        hits = globmod.glob(glob_pat, root_dir=str(from_root), recursive=True)
+    except (OSError, ValueError):
+        hits = []
+    from_s = os.path.realpath(from_root)
+    root_s = os.path.realpath(project_root)
+    root_prefix = root_s.rstrip(os.sep) + os.sep
+    for hit in hits:
+        real = os.path.realpath(os.path.join(from_s, hit))
+        if not real.startswith(root_prefix) or not os.path.isfile(real):
+            continue
+        fp = Path(real)
+        if ignored(fp):
+            continue
+        if not (allow_dirs or allow_exts):
+            if _should_skip(fp, from_root):
+                continue
+        else:
+            rel_parts = Path(os.path.relpath(real, from_s)).parts
+            blocked = set(rel_parts[:-1]) & (IGNORE_DIRS | {".g023"})
+            if blocked - allow_dirs or fp.suffix.lower() in IGNORE_EXTS - allow_exts:
+                continue
+        rel = real[len(root_prefix):].replace(os.sep, "/")
+        if rel not in seen:
+            seen.add(rel)
+            files.append(rel)
+
+
 def glob_sync(pattern: str, path: Optional[str] = None) -> str:
     project_root = get_project_root()
     search_root, err = confine_or_error(path, root=project_root)
@@ -673,41 +1194,58 @@ def glob_sync(pattern: str, path: Optional[str] = None) -> str:
     assert search_root is not None
     if not search_root.exists():
         return json.dumps({"error": f"Path does not exist: {search_root}"})
-    ignored = build_ignorer(project_root)
+    try:
+        search_rel = search_root.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        search_rel = ""
+    allow_dirs, allow_exts = literal_allowances(pattern, search_rel)
+    allow_dirs -= {".g023"}  # .g023 stays private apart from its overlay islands
+    ignored = build_ignorer(project_root, allow_dirs=allow_dirs, allow_exts=allow_exts)
     files: list[str] = []
     seen: set[str] = set()
     for raw in _glob_patterns(pattern) or expand_braces(pattern):
         glob_pat = _normalize_find_pattern(raw)
-        try:
-            hits = globmod.glob(glob_pat, root_dir=str(search_root), recursive=True)
-        except (OSError, ValueError):
-            hits = []
-        for hit in hits:
-            fp = (search_root / hit).resolve()
-            if not fp.is_file():
-                continue
-            if ignored(fp) or _should_skip(fp, search_root):
+        _collect_glob_hits(glob_pat, search_root, project_root, ignored, seen, files, allow_dirs, allow_exts)
+        # Python glob skips hidden names (`.g023`). Overlay the readable islands.
+        for name in sorted(OVERLAY_G023_DIRS):
+            extra = project_root / ".g023" / name
+            if not extra.is_dir():
                 continue
             try:
-                fp.relative_to(project_root.resolve())
+                extra.resolve().relative_to(search_root.resolve())
             except ValueError:
                 continue
-            rel = rel_to_root(fp, root=project_root)
-            if rel not in seen:
-                seen.add(rel)
-                files.append(rel)
+            try:
+                search_root.resolve().relative_to(extra.resolve())
+                continue
+            except ValueError:
+                pass
+            _collect_glob_hits(glob_pat, extra, project_root, ignored, seen, files)
     files.sort()
-    cap = 200
-    return json.dumps(
-        {
-            "pattern": pattern,
-            "path": str(search_root),
-            "total": len(files),
-            "files": files[:cap],
-            "truncated": len(files) > cap,
-        },
-        ensure_ascii=False,
-    )
+    cap = GLOB_FILES_CAP
+    payload = {
+        "pattern": pattern,
+        "path": str(search_root),
+        "total": len(files),
+        "files": files[:cap],
+        "truncated": len(files) > cap,
+    }
+    if len(files) > cap:
+        # Every hit accounted for: numbered names collapse into templates per
+        # directory, so "how many / which range" needs no paging.
+        from ..shapes import listing_lines
+
+        payload["files"] = files[:GLOB_FILES_WHEN_DIGEST]
+        payload["digest"] = listing_lines(files, budget=40)
+        payload["note"] = (f"{len(files):,} matches: digest covers all of them; files lists the first "
+                           f"{GLOB_FILES_WHEN_DIGEST}. Narrow the pattern for exact names.")
+    if allow_dirs or allow_exts:
+        payload["included_ignored"] = sorted(allow_dirs | allow_exts)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+GLOB_FILES_CAP = 200
+GLOB_FILES_WHEN_DIGEST = 20
 
 
 async def run_glob(pattern: str, path: Optional[str] = None) -> str:

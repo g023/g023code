@@ -19,9 +19,7 @@ from typing import Any, Optional
 
 from .config import (
     ITERATION_NOTICE_EVERY,
-    MAX_COMPACT_THRESHOLD,
     MAX_CONTEXT_TOKENS,
-    MIN_COMPACT_THRESHOLD,
     MIN_CONTEXT_TOKENS,
     MIN_ITERATIONS,
     MIN_OUTPUT_TOKENS,
@@ -32,7 +30,6 @@ from .config import (
 # drift apart.
 DEFAULT_MAX_ITERATIONS = Settings.max_iterations
 DEFAULT_CONTEXT_WINDOW = Settings.max_context_tokens
-DEFAULT_COMPACT_THRESHOLD = Settings.compact_threshold
 
 
 @dataclass(frozen=True)
@@ -75,15 +72,13 @@ class Command:
 
 
 LEVEL_CHOICES = ("low", "mid", "high")
-EFFORT_CHOICES = ("low", "high", "max", "off")
-MODEL_CHOICES = ("flash",)
+EFFORT_CHOICES = ("low", "high", "max", "on", "off")
 PERMISSION_CHOICES = ("allow", "ask", "block")
-BACKEND_CHOICES = ("none", "ollama", "deepseek", "openrouter")
-ENDPOINT_CHOICES = ("responses", "chat_completions")
-OR_TIER_CHOICES = ("free", "credits")
-OR_SUB_CHOICES = ("status", "on", "off", "primary", "add", "remove", "models", "priority", "reasoning", "test")
+VISION_CHOICES = ("on", "off", "status")
+LOCAL_CHOICES = ("status", "auto", "on", "off", "tune", "unload", "models", "model", "vision", "scout")
 SURGE_SUB_CHOICES = ("status", "on", "off", "buffer", "notify", "now")
 LEARN_SUB_CHOICES = ("search", "get", "save", "forget", "outcome")
+BBS_SUB_CHOICES = ("list", "search", "read", "post", "index")
 
 
 COMMANDS: tuple[Command, ...] = (
@@ -99,7 +94,7 @@ COMMANDS: tuple[Command, ...] = (
             "With no argument, prints every command grouped by topic.\n"
             "With one, prints that command's usage, options, and examples."
         ),
-        examples=("/help", "/help ollama", "/help compact"),
+        examples=("/help", "/help vision", "/help compact"),
     ),
     Command(
         name="/status",
@@ -178,6 +173,37 @@ COMMANDS: tuple[Command, ...] = (
         ),
     ),
     Command(
+        name="/bbs",
+        summary="Project bulletin board at .g023/bbs/ (not in the system prompt)",
+        handler="cmd_bbs",
+        group="Session",
+        args=(
+            Argument(
+                "action",
+                BBS_SUB_CHOICES,
+                "list, search, read, post, index; bare prints status",
+            ),
+        ),
+        detail=(
+            "The bulletin board is a forum for this session and later ones.\n"
+            "Topic slugs are subdirectories of .g023/bbs/; conversations are\n"
+            ".txt files. Posts are searched on demand, never prepended to the\n"
+            "system prompt. /bbs with no argument prints topic and post counts.\n\n"
+            "/bbs list [topic]          topics, or posts in one topic\n"
+            "/bbs search <query>        SearchContent over .g023/bbs/\n"
+            "/bbs read <topic/slug>     one thread body\n"
+            "/bbs post <topic> <slug>   remaining text is the body (appends)\n"
+            "/bbs index                 rebuild INDEX.md from the tree"
+        ),
+        examples=(
+            "/bbs",
+            "/bbs list cost-efficiency",
+            "/bbs search prefix cache",
+            "/bbs read cost-efficiency/cache-vs-history",
+            "/bbs post open-issues compact-leak Keep Layer-1 off a hot prefix.",
+        ),
+    ),
+    Command(
         name="/undo",
         aliases=("/restore",),
         summary="Restore a file from its newest .g023/backups/ copy",
@@ -185,8 +211,10 @@ COMMANDS: tuple[Command, ...] = (
         group="Session",
         args=(Argument("path", description="File to restore; defaults to the last written path"),),
         detail=(
-            "Copies the newest timestamped backup under .g023/backups/ back onto the\n"
-            "file. WriteFile and Edit take those backups before overwriting."
+            "Restores the newest timestamped backup under .g023/backups/ onto the\n"
+            "file (atomic, mode kept). The backup is consumed, so /undo again steps\n"
+            "one version further back; the replaced version is kept as *.undone.\n"
+            "WriteFile and Edit take those backups before overwriting."
         ),
         examples=("/undo", "/undo src/app.py"),
     ),
@@ -200,20 +228,15 @@ COMMANDS: tuple[Command, ...] = (
     # -- Model ------------------------------------------------------------
     Command(
         name="/model",
-        summary="Choose the orchestrator model",
+        summary="Show the model, its limits and prices",
         handler="cmd_model",
         group="Model",
-        interactive=True,
-        args=(Argument("model", MODEL_CHOICES, "flash is the only model available today"),),
         detail=(
-            "flash — deepseek-flash. The default, and currently the only choice.\n\n"
-            "Everything runs on DeepSeek's Responses API, which is where the built-in\n"
-            "web_search tool lives. Orchestrator and DeepSeek vision both send\n"
-            "deepseek-flash. deepseek-v4-pro is not enabled on that endpoint yet\n"
-            "(DeepSeek reports availability from early August 2026), so it is withheld\n"
-            "rather than offered as a model every call would fail on."
+            "g023 Code runs one model: DeepSeek V4.1 Flash (API id deepseek-flash)\n"
+            "on DeepSeek's Anthropic-format endpoint; web search and fetch use\n"
+            "DeepSeek's Search and Fetch APIs. There is nothing to switch — this prints what is in use, its\n"
+            "context and output limits, and what it costs."
         ),
-        examples=("/model", "/model flash"),
     ),
     Command(
         name="/thinking",
@@ -222,13 +245,13 @@ COMMANDS: tuple[Command, ...] = (
         handler="cmd_thinking",
         group="Model",
         interactive=True,
-        args=(Argument("effort", EFFORT_CHOICES, "1-100 or low/high/max/off; 75 is default and ceiling"),),
+        args=(Argument("effort", EFFORT_CHOICES, "1-100 or low/high/max/on/off; 75 is default and ceiling"),),
         detail=(
             "Reasoning tokens are billed as output, so effort is a cost dial as much as\n"
             "a quality one. The scale is 1-100 but 75 is both the default sweetspot and\n"
             "the ceiling — 76-100, max, and xhigh all store and send as 75 (wire high).\n"
-            "low/high/max map to 50/75/75. The API accepts named aliases, not integers,\n"
-            "so those numbers are mapped onto none/minimal/low/medium/high on the wire.\n"
+            "low/high/max map to 50/75/75. The API accepts named levels, not integers,\n"
+            "so 0 is sent as thinking off, 1-50 as low and 51-75 as high (never max).\n"
             "/goal temporarily forces the ceiling (75) regardless of this setting, and\n"
             "also runs its turn with no step cap. The model may also set the next *user\n"
             "request's* effort by attaching [next_effort: N] at the end of a final answer\n"
@@ -237,7 +260,7 @@ COMMANDS: tuple[Command, ...] = (
             "remaining steps. N should match the next request (25-50 routine, 75 when the\n"
             "remaining work is still hard), not copy 75 by habit. Values above 75 cap."
         ),
-        examples=("/thinking", "/thinking 75", "/thinking max", "/thinking off"),
+        examples=("/thinking", "/thinking 75", "/thinking max", "/thinking off", "/thinking on"),
     ),
     Command(
         name="/verbose",
@@ -376,25 +399,71 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         name="/compact-threshold",
         aliases=("/compact-at",),
-        summary="Set when auto-compact fires, as a fraction of the window",
+        summary="Set when auto-compact fires: a token count (200k) or a window fraction",
         handler="cmd_compact_threshold",
         group="Context",
-        args=(Argument("fraction", (), "0.01–1.0 (or 1%–100%), or 'default'"),),
+        args=(Argument("tokens|fraction|policy", ("economic", "fixed", "floor"), "e.g. 200k, 0 (fraction only), 0.85, 90%, 'default', economic|fixed, floor 64k"),),
         detail=(
-            "Auto-compact summarises the history once the context passes this\n"
-            "fraction of the window — 0.85 means 85% full. Raise it to let a session\n"
-            "grow longer before the cheap model steps in; lower it to compact\n"
-            "earlier, keeping the window lighter at the cost of more summaries.\n\n"
-            "Anything in 0.01–1.0 is accepted (a trailing % is fine: '90%' = 0.9);\n"
-            "0 would compact every turn and >1 never fires. With no argument,\n"
-            "prints the current threshold. Saved to config.json."
+            "Auto-compact summarises the history once the live context reaches\n"
+            "compact_at_tokens (default 200k), or compact_threshold of the window if\n"
+            "that is lower. It is checked at turn start AND between every tool step,\n"
+            "so one long agentic turn cannot run away toward the 1M ceiling.\n\n"
+            "A token count (200k, 1m, 150000) sets compact_at_tokens; 0 means use\n"
+            "the fraction only. A fraction (0.01–1.0, or 90%) sets the ceiling.\n"
+            "Every summary ends with a pointer to the on-disk transcript\n"
+            "(.g023/sessions/*.jsonl) so details can be recalled with SessionSearch.\n\n"
+            "Policy 'economic' (default) also compacts earlier, once the cache-hit\n"
+            "rent of re-reading the history since the last compaction exceeds the\n"
+            "price of compacting (x3 for summary fidelity), never below the floor\n"
+            "(default 64k). 'fixed' uses the token trigger only. /cost shows the meter.\n"
+            "Saved to config.json."
         ),
         examples=(
-            "/compact-threshold",
+            "/compact-at",
+            "/compact-at 200k",
             "/compact-threshold 0.9",
-            "/compact-threshold 90%",
             "/compact-threshold default",
+            "/compact-at fixed",
+            "/compact-at floor 96k",
         ),
+    ),
+    Command(
+        name="/subagents",
+        aliases=("/subagent",),
+        summary="Allow or forbid subagents (Agent tool, LLM ReadFile focus) — off by default",
+        handler="cmd_subagents",
+        group="Context",
+        args=(Argument("on|off", ("on", "off"), "with no argument, prints the state"),),
+        detail=(
+            "Off (the default): the orchestrator works alone. The Agent tool is not\n"
+            "offered, and ReadFile's focus is answered by local ranking, not a\n"
+            "model call. On: Agent (research/plan/todos) is offered and ReadFile\n"
+            "focus may ask the cheap model. Saved to config.json; takes effect on\n"
+            "the next request (the tool list is part of the cached prefix)."
+        ),
+        examples=("/subagents", "/subagents on", "/subagents off"),
+    ),
+    Command(
+        name="/ownership",
+        summary="Whose code the model may tidy while it works: auto | user | agent",
+        handler="cmd_ownership",
+        group="Context",
+        args=(
+            Argument(
+                "mode", ("auto", "user", "agent", "forget"),
+                "with no argument, prints the state; forget <path> hands a file back to you",
+            ),
+        ),
+        detail=(
+            "auto (default): in files g023 created itself (WriteFile on a new path,\n"
+            "listed in .g023/provenance.json) the model merges repeated logic it\n"
+            "touches and fixes defects it notices, naming each change. Your files\n"
+            "stay minimal-change. user: minimal-change everywhere (the prompt is\n"
+            "exactly the pre-ownership one). agent: the tidy-up rule covers the whole\n"
+            "project. Measured on deepseek-flash: the rule merged a duplicated loop\n"
+            "6/6 vs 0/6 without it, about +28% cost on that task. Saved to config.json."
+        ),
+        examples=("/ownership", "/ownership user", "/ownership agent", "/ownership forget src/x.py"),
     ),
     Command(
         name="/context",
@@ -437,14 +506,15 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command(
         name="/settings",
-        summary="Show every setting; save or reset the persisted ones",
+        summary="Show every setting; set, save or reset the persisted ones",
         handler="cmd_settings",
         group="Context",
-        args=(Argument("save|reset", ("save", "reset"), "persist or restore defaults"),),
+        args=(Argument("save|reset|set", ("save", "reset", "set"), "persist, restore defaults, or set one key"),),
         detail=(
-            "/settings        show everything, marking which keys persist\n"
-            "/settings save   write the persisted keys to config.json\n"
-            "/settings reset  restore the built-in defaults and save"
+            "/settings                 show everything, marking which keys persist\n"
+            "/settings set KEY VALUE   change one persisted key (typed + validated) and save\n"
+            "/settings save            write the persisted keys to config.json\n"
+            "/settings reset           restore the built-in defaults and save"
         ),
     ),
     # -- Tools ------------------------------------------------------------
@@ -466,116 +536,114 @@ COMMANDS: tuple[Command, ...] = (
             "        leaves the machine). At the prompt, 'a' promotes the tool to\n"
             "        allow for the rest of the session.\n"
             "block — refused, and the model is told so\n\n"
-            "FetchUrl always asks, whatever the level says: a fetch touches a third\n"
-            "party's server, and the prompt is also where you choose cache vs network."
+            "WebSearch is allowed by default (a query to DeepSeek, cached machine-wide).\n"
+            "FetchUrl follows permission_default; when it asks, the prompt is also where\n"
+            "you choose the cached copy or the network."
         ),
         examples=("/tools", "/tools Bash allow", "/tools WriteFile block"),
     ),
     Command(
         name="/fetch",
-        summary="Fetch a URL yourself, with the cache/fresh prompt",
+        summary="Fetch a URL yourself (DeepSeek Fetch API, machine-wide cache)",
         handler="cmd_fetch",
         group="Tools",
-        args=(Argument("url|status|cookies clear", (), "a URL, or a subcommand"),),
+        args=(Argument("url", (), "the page to read"),),
         detail=(
-            "/fetch <url>           fetch and display a page as readable text\n"
-            "/fetch status          report how closely requests imitate a real browser\n"
-            "/fetch cookies clear   forget stored cookies\n\n"
-            "Install curl_cffi to match Chrome's TLS fingerprint; /fetch status says\n"
-            "which engine you are actually on."
+            "/fetch <url>     fetch a page and display it as Markdown\n\n"
+            "Pages come from DeepSeek's Fetch API ($0.75 per 1,000 successful\n"
+            "fetches; refusals are free) and are kept in the machine-wide cache\n"
+            "(<install>/global_cache/web.db) that every project and running instance\n"
+            "shares. Pages of WebSearch hits are usually there already: each search\n"
+            "files its hits' content at no extra cost."
         ),
-        examples=("/fetch https://example.com", "/fetch status"),
+        examples=("/fetch https://example.com",),
+    ),
+    Command(
+        name="/search",
+        summary="Search the web yourself (DeepSeek Search API, machine-wide cache)",
+        handler="cmd_search",
+        group="Tools",
+        args=(Argument("query", (), "1-128 characters; site:, \"phrase\", -term work"),),
+        detail=(
+            "/search <query>        show the hits the model would see\n"
+            "/search fresh <query>  bypass the cache\n\n"
+            "Same cache and rules as the WebSearch tool: term order and case do not\n"
+            "matter; time-sensitive queries stay fresh 6 h, others 7 days."
+        ),
+        examples=("/search httpx latest release", "/search site:docs.python.org asyncio TaskGroup"),
     ),
     Command(
         name="/cache",
-        summary="Inspect and purge the local SQLite caches",
+        summary="Inspect and purge the caches (project + machine-wide web)",
         handler="cmd_cache",
         group="Tools",
-        args=(Argument("stats|clear|web|web clear", ("stats", "clear", "web"), "default: stats"),),
+        args=(Argument("stats|clear|web|web clear|web prune", ("stats", "clear", "web"), "default: stats"),),
         detail=(
-            "/cache             what is cached, and how much space it uses\n"
-            "/cache web         list cached URL fetches\n"
-            "/cache web clear   purge only the URL cache\n"
-            "/cache clear       purge everything (file summaries, vision answers, URLs)"
+            "/cache             what is cached, the web savings ledger, and space used\n"
+            "/cache web         list cached web searches and pages (machine-wide)\n"
+            "/cache web clear   purge the machine-wide web cache (all projects)\n"
+            "/cache web prune   drop web entries unused for 90 days\n"
+            "/cache clear       purge this project's caches (file summaries, vision\n"
+            "                   answers, tool vault); the web cache is left alone"
         ),
     ),
     # -- Vision -----------------------------------------------------------
     Command(
-        name="/ollama",
-        summary="Point vision at any Ollama daemon — local or remote",
-        handler="cmd_ollama",
-        group="Vision",
-        args=(
-            Argument("status|host|models|test|ps", ("status", "host", "models", "test", "ps")),
-            Argument("value", (), "for 'host': an address, or 'default'"),
-        ),
-        detail=(
-            "The daemon does not have to run on this machine.\n\n"
-            "/ollama                    status: host, version, latency, models\n"
-            "/ollama host <addr>        point at another machine and test it\n"
-            "/ollama host default       fall back to OLLAMA_HOST, then localhost\n"
-            "/ollama models             list installed models and their capabilities\n"
-            "/ollama test [model]       run a real inference against the daemon\n"
-            "/ollama ps                 what the daemon currently holds in VRAM\n\n"
-            "Addresses are forgiving: a bare host or IP gets :11434 appended, and a\n"
-            "missing scheme becomes http://. The host is saved to config.json.\n\n"
-            "For a remote daemon to accept connections it must be bound to the network\n"
-            "on that machine — OLLAMA_HOST=0.0.0.0:11434 ollama serve — and the port\n"
-            "must be open. Ollama has no authentication, so keep it on a trusted\n"
-            "network or in front of an SSH tunnel or authenticating proxy."
-        ),
-        examples=(
-            "/ollama",
-            "/ollama host 192.168.1.50",
-            "/ollama host gpu-box:11434",
-            "/ollama host default",
-            "/ollama test",
-        ),
-    ),
-    Command(
         name="/vision",
         aliases=("/config_vision",),
-        summary="Enable, disable, or configure image analysis",
+        summary="Turn image analysis on or off",
         handler="cmd_vision",
         group="Vision",
         interactive=True,
-        args=(
-            Argument(
-                "model|off|status|backend|endpoint",
-                ("off", "status", "backend", "endpoint"),
-                "a model name, or a subcommand",
-            ),
-            Argument("value", BACKEND_CHOICES, "for 'backend'"),
-        ),
+        args=(Argument("on|off|status", VISION_CHOICES, "bare shows status and offers a toggle"),),
         detail=(
-            "Images go to a vision backend — DeepSeek's own multimodal model,\n"
-            "an OpenRouter model, or a local Ollama daemon. Vision is off by\n"
-            "default, and while it is off the AnalyzeImage tool is not even\n"
-            "offered to the orchestrator.\n\n"
-            "/vision                  pick a model for the active backend\n"
-            "/vision <model>          enable a specific model directly\n"
-            "/vision off              disable\n"
-            "/vision status           show the current setting\n"
-            "/vision backend <name>   none | ollama | deepseek | openrouter\n"
-            "/vision endpoint <name>  deepseek only: responses | chat_completions\n\n"
-            "deepseek  — deepseek-flash on the K.dat key (default).\n"
-            "openrouter — OK.dat key; models from ./OR_VISION.json, rotated on\n"
-            "            rate limits. Default model google/gemma-4-26b-a4b-it:free.\n"
-            "ollama    — a local/remote daemon; /ollama host points at it."
+            "AnalyzeImage sends one isolated request to deepseek-flash: the image\n"
+            "(capped at 800 px on its longest side; jpeg, png, gif or webp) plus\n"
+            "the question, with thinking off. Only the short text answer comes\n"
+            "back into the conversation, and answers are cached per image and\n"
+            "question. Local images must be inside the project folder.\n\n"
+            "/vision on       offer AnalyzeImage to the model (default)\n"
+            "/vision off      hide it; images are never sent\n"
+            "/vision status   show the current setting"
         ),
-        examples=(
-            "/vision",
-            "/vision backend deepseek",
-            "/vision backend openrouter",
-            "/vision endpoint chat_completions",
-            "/vision off",
+        examples=("/vision", "/vision on", "/vision off"),
+    ),
+    Command(
+        name="/local",
+        summary="Local llama.cpp helper model — status, auto/on/off, tune, unload, model, vision",
+        handler="cmd_local",
+        group="Model",
+        args=(Argument("status|auto|on|off|tune|unload|models|model NAME|vision NAME|scout MODE", LOCAL_CHOICES, "bare shows status"),),
+        detail=(
+            "A small model served by llama.cpp's llama-server on this machine does free\n"
+            "side jobs: it reranks which lines of a long command output DeepSeek sees,\n"
+            "answers LocalAsk reading requests (files, or the whole project; verbatim cited\n"
+            "lines), pre-reads each request into a short [scout] card of the lines that\n"
+            "locate it, and, with a vision model set, answers AnalyzeImage first.\n"
+            "DeepSeek still makes every decision. One server is shared by all sessions; it\n"
+            "sleeps when idle and is released when another process needs the GPU or a\n"
+            "command looks like GPU work.\n\n"
+            "/local status         mode, model, server state (default)\n"
+            "/local auto           default: on when llama-server, a model and a GPU it\n"
+            "                      fits are found; picks the best measured model (saved)\n"
+            "/local on | off       force on / never (saved)\n"
+            "/local tune           re-run the machine probe and show what auto picks\n"
+            "/local unload         stop the server now (frees VRAM)\n"
+            "/local models         .gguf files in local_models_dir\n"
+            "/local model NAME     pin the model file (local_model_file); 'auto' unpins\n"
+            "/local vision NAME    pin a vision model (mmproj found next to it); 'off' =\n"
+            "                      DeepSeek vision only; 'auto' = vision when the model has one\n"
+            "/local scout MODE     scout card: local (default; only with the local model),\n"
+            "                      always (keyword-matched code units without it), off\n\n"
+            "Paths: /settings set local_llama_dir PATH, local_models_dir PATH."
         ),
+        examples=("/local", "/local tune", "/local auto", "/local model LFM3-1.7B-Q8_0.gguf", "/local vision off"),
     ),
     Command(
         name="/surge",
         summary="DeepSeek surge pricing — status, notify, auto-pause around peak",
         handler="cmd_surge",
-        group="Vision",
+        group="Model",
         args=(
             Argument("status|on|off|buffer|notify|now", SURGE_SUB_CHOICES, "see /help surge"),
             Argument("value", (), "minutes for 'buffer', on|off for 'notify'"),
@@ -596,73 +664,6 @@ COMMANDS: tuple[Command, ...] = (
             "\nso no requests are sent at double price. Ctrl-C always works."
         ),
         examples=("/surge", "/surge now", "/surge on", "/surge buffer 10", "/surge notify off"),
-    ),
-    Command(
-        name="/or",
-        summary="OpenRouter vision — key, models, rate-limit tier, usage",
-        handler="cmd_or",
-        group="Vision",
-        interactive=True,
-        args=(
-            Argument("status|model|models|tier|usage", ("status", "model", "models", "tier", "usage"), "subcommand"),
-            Argument("value", OR_TIER_CHOICES, "for 'tier': free | credits"),
-        ),
-        detail=(
-            "OpenRouter vision uses the OK.dat key. Models come from\n"
-            "./OR_VISION.json (project folder) in priority order; on a rate\n"
-            "limit the next model on the list is tried. Without the file the\n"
-            "default google/gemma-4-26b-a4b-it:free is used.\n\n"
-            "/or status             key, tier, models, today's usage\n"
-            "/or model <name>       set the vision model (or 'default')\n"
-            "/or models             reload the list from OR_VISION.json\n"
-            "/or tier free|credits  rate-limit ceiling: free = 50/24h,\n"
-            "                       credits ($10+ bought) = 1000/24h\n"
-            "/or usage              show today's request count vs the ceiling\n\n"
-            "Free :free models are capped per account; buying $10+ credits\n"
-            "lifetime raises the daily ceiling from 50 to 1000 requests."
-        ),
-        examples=("/or", "/or status", "/or model google/gemma-4-26b-a4b-it:free", "/or tier credits"),
-    ),
-    Command(
-        name="/orsub",
-        aliases=("/ors", "/or-sub"),
-        summary="OpenRouter subagent offload — models, primary, failover, reasoning",
-        handler="cmd_orsub",
-        group="Vision",
-        interactive=True,
-        args=(
-            Argument("status|on|off|primary|add|remove|models|priority|reasoning|test", OR_SUB_CHOICES, "subcommand"),
-            Argument("value", (), "model id, 'on|off', or a priority number"),
-            Argument("extra", (), "for 'priority': the new rank; for 'reasoning': a level"),
-        ),
-        detail=(
-            "Offloads the Agent tool's Explore/Plan turns to an OpenRouter model\n"
-            "when enabled — the orchestrator keeps DeepSeek for itself and hands\n"
-            "subagent work to the OK.dat key. Models and their priorities live in\n"
-            "./OR_SUB_MODELS.json (main copy next to OK.dat, shared by all\n"
-            "projects; the project file overrides it). On a rate limit the next\n"
-            "priority model is tried automatically.\n\n"
-            "/orsub                   status: backend, primary, model list\n"
-            "/orsub on|off            enable or disable the offload\n"
-            "/orsub primary <model>   which model the offload starts with\n"
-            "/orsub add <model>       add a model (context limits auto-fetched)\n"
-            "/orsub remove <model>    drop a model\n"
-            "/orsub models            list models, priorities, context, reasoning\n"
-            "/orsub priority <model> <n>   set fallback rank\n"
-            "/orsub reasoning <model> <level>  set default reasoning for a model\n"
-            "/orsub test [model]      run a real offload to check it works\n\n"
-            "Each model records its context window and the reasoning levels it\n"
-            "accepts; the orchestrator may override reasoning per Agent call and\n"
-            "the level is clamped to what the chosen model supports."
-        ),
-        examples=(
-            "/orsub",
-            "/orsub on",
-            "/orsub primary stealth/ox-alpha",
-            "/orsub add openai/gpt-5.2",
-            "/orsub priority z-ai/glm-5.2:free 1",
-            "/orsub test",
-        ),
     ),
     Command(
         name="/config",
@@ -698,13 +699,21 @@ COMMANDS: tuple[Command, ...] = (
         group="Work",
         args=(Argument("objective", (), "what you want achieved", required=True),),
         detail=(
-            "Runs one turn with reasoning effort forced to the harness ceiling (75 /\n"
-            "high — not the API's max, which burns the output budget on thinking), the\n"
+            "Runs with reasoning effort forced to the harness ceiling (75 / high —\n"
+            "not the API's max, which burns the output budget on thinking), the\n"
             "per-turn step cap lifted, and a prompt that asks the model to break the\n"
             "objective into steps and use tools freely. A goal runs until the model\n"
             "answers rather than stopping at /steps; progress prints as it goes and\n"
-            "Ctrl-C ends it. A [next_effort: N] on the final answer is kept for the next\n"
-            "user request; otherwise your usual /thinking and /steps settings are restored."
+            "Ctrl-C ends it. If the working-set judge still says not completed, up\n"
+            "to two short continuation turns name the open leaves. A continuation\n"
+            "that does not change the working set stops, so the same unfinished\n"
+            "answer is not bought again. Identical tool calls in one turn are\n"
+            "skipped after the second. A [next_effort: N] on the final answer is\n"
+            "remembered. It is sent once this transcript is replaced, or you\n"
+            "/thinking or /clear. Until then the wire stays at the effort the\n"
+            "goal already warmed, so that prefix still hits. If the model omits\n"
+            "the trailer, the previous /thinking dial is restored the same way.\n"
+            "/steps is always restored."
         ),
         examples=("/goal add retry-with-backoff to every outbound HTTP call",),
     ),
@@ -757,7 +766,7 @@ def completions(text: str) -> list[str]:
     Completion candidates for the current input line.
 
     Completes the command itself, then that command's first-argument choices —
-    so ``/th`` offers ``/thinking`` and ``/thinking `` offers low/high/max/off.
+    so ``/th`` offers ``/thinking`` and ``/thinking `` offers low/high/max/on/off.
     """
     text = text.lstrip()
     if not text.startswith("/"):

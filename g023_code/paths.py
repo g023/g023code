@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Union
 
-from .config import get_project_root
+from .config import get_global_cache_dir, get_project_root
 
 PathLike = Union[str, Path]
 
@@ -62,3 +62,19 @@ def rel_to_root(path: PathLike, *, root: Optional[Path] = None) -> str:
         return p.relative_to(root_p).as_posix()
     except ValueError:
         return str(p)
+
+
+def harness_subdir(root: Optional[Path]) -> Optional[str]:
+    """``global_cache/`` (POSIX, trailing slash) when g023's machine-wide cache sits inside ``root``.
+
+    Running g023 on its own checkout puts the Bash shims and the web store
+    under the project root. Those are the harness's own writes, never a
+    command's effect, so every stat fingerprint, shadow copy and change view
+    excludes this subtree. ``None`` when the cache lives elsewhere.
+    """
+    if root is None:
+        return None
+    try:
+        return get_global_cache_dir().resolve().relative_to(Path(root).resolve()).as_posix() + "/"
+    except (ValueError, OSError):
+        return None

@@ -11,7 +11,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .config import get_cache_db
 from .cost_policy import VAULT_LEADIN, VAULT_MIN_CHARS
@@ -29,9 +29,20 @@ def _vault_excerpt(text: str, head: int = 400, tail: int = 800) -> str:
         return text
     return (
         text[:head].rstrip()
-        + "\n\n… [middle elided; full body in tool_vault, re-run the tool to hydrate] …\n\n"
+        + "\n\n… [middle elided; a re-run returns the same body, so narrow the command, scope or range to see this part] …\n\n"
         + text[-tail:].lstrip()
     )
+
+
+def _json_header(line: str) -> dict:
+    """The one-line JSON header tool_codec puts on Bash results ({} if none)."""
+    if not line.startswith("{"):
+        return {}
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def is_vault_pointer(text: str) -> bool:
@@ -77,19 +88,6 @@ class Cache:
                     PRIMARY KEY (image_hash, question_hash, backend)
                 );
 
-                CREATE TABLE IF NOT EXISTS web_cache (
-                    url_hash    TEXT PRIMARY KEY,
-                    url         TEXT NOT NULL,
-                    final_url   TEXT,
-                    status      INTEGER,
-                    headers     TEXT,
-                    body        TEXT NOT NULL,
-                    engine      TEXT,
-                    profile     TEXT,
-                    fetched_at  REAL NOT NULL,
-                    accessed_at REAL NOT NULL,
-                    hit_count   INTEGER NOT NULL DEFAULT 0
-                );
 
                 CREATE TABLE IF NOT EXISTS tool_vault (
                     body_hash   TEXT PRIMARY KEY,
@@ -117,10 +115,11 @@ class Cache:
 
                 CREATE INDEX IF NOT EXISTS idx_file_path ON file_cache(file_path);
                 CREATE INDEX IF NOT EXISTS idx_file_accessed ON file_cache(accessed_at);
-                CREATE INDEX IF NOT EXISTS idx_web_url ON web_cache(url);
-                CREATE INDEX IF NOT EXISTS idx_web_fetched ON web_cache(fetched_at);
                 """
             )
+            # 1.5.0: file bodies were stored but never read. Drop any left over
+            # (a no-op once done; the freed pages are reused, so no VACUUM is needed).
+            conn.execute("UPDATE file_cache SET raw_content = NULL WHERE raw_content IS NOT NULL")
 
     # ------------------------------------------------------------------
     # File cache
@@ -177,7 +176,9 @@ class Cache:
                     path,
                     summary,
                     json.dumps(metadata or {}, ensure_ascii=False),
-                    raw_content,
+                    # Bodies are never served from here (reads re-read the file and
+                    # hash it), so the column stays NULL: it only grew the DB.
+                    None,
                     now,
                     now,
                 ),
@@ -190,11 +191,6 @@ class Cache:
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM file_cache WHERE file_path = ?", (path,))
             return cur.rowcount or 0
-
-    def purge_old_files(self, max_age_days: int = 7):
-        cutoff = time.time() - (max_age_days * 86400)
-        with self._conn() as conn:
-            conn.execute("DELETE FROM file_cache WHERE accessed_at < ?", (cutoff,))
 
     # ------------------------------------------------------------------
     # Vision cache
@@ -220,105 +216,6 @@ class Cache:
                 """,
                 (image_hash, q_hash, backend, response, time.time()),
             )
-
-    # ------------------------------------------------------------------
-    # Web cache (URL fetches)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def web_key(url: str) -> str:
-        return _sha256(url.strip())
-
-    def get_web(self, url: str, touch: bool = True) -> Optional[dict]:
-        """Return the cached response for a URL, regardless of age.
-
-        Age is deliberately the caller's business — freshness policy belongs
-        with the user's choice, not with storage.
-        """
-        key = self.web_key(url)
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM web_cache WHERE url_hash = ?", (key,)).fetchone()
-            if not row:
-                return None
-            if touch:
-                conn.execute(
-                    "UPDATE web_cache SET accessed_at = ?, hit_count = hit_count + 1 WHERE url_hash = ?",
-                    (time.time(), key),
-                )
-            return {
-                "url": row["url"],
-                "final_url": row["final_url"],
-                "status": row["status"],
-                "headers": json.loads(row["headers"] or "{}"),
-                "body": row["body"],
-                "engine": row["engine"],
-                "profile": row["profile"],
-                "fetched_at": row["fetched_at"],
-                "age_seconds": time.time() - row["fetched_at"],
-                "hit_count": row["hit_count"],
-            }
-
-    def touch_web(self, url: str):
-        """Record that a cached copy was actually served."""
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE web_cache SET accessed_at = ?, hit_count = hit_count + 1 WHERE url_hash = ?",
-                (time.time(), self.web_key(url)),
-            )
-
-    def put_web(
-        self,
-        url: str,
-        body: str,
-        status: int,
-        headers: Optional[dict] = None,
-        final_url: Optional[str] = None,
-        engine: Optional[str] = None,
-        profile: Optional[str] = None,
-    ) -> str:
-        key = self.web_key(url)
-        now = time.time()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO web_cache
-                (url_hash, url, final_url, status, headers, body, engine, profile,
-                 fetched_at, accessed_at, hit_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        COALESCE((SELECT hit_count FROM web_cache WHERE url_hash = ?), 0))
-                """,
-                (
-                    key,
-                    url,
-                    final_url or url,
-                    status,
-                    json.dumps(headers or {}, ensure_ascii=False),
-                    body,
-                    engine,
-                    profile,
-                    now,
-                    now,
-                    key,
-                ),
-            )
-        return key
-
-    def list_web(self, limit: int = 30) -> list[dict]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT url, status, engine, fetched_at, hit_count, LENGTH(body) AS size "
-                "FROM web_cache ORDER BY fetched_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def clear_web(self, url: Optional[str] = None) -> int:
-        with self._conn() as conn:
-            if url:
-                cur = conn.execute("DELETE FROM web_cache WHERE url_hash = ?", (self.web_key(url),))
-            else:
-                cur = conn.execute("DELETE FROM web_cache")
-            return cur.rowcount
 
     # ------------------------------------------------------------------
     # Prefix-cache hit rate, bucketed by day
@@ -412,20 +309,47 @@ class Cache:
             return row["body"]
 
     def offload_tool_output(
-        self, text: str, *, min_chars: int = VAULT_MIN_CHARS
+        self,
+        text: str,
+        *,
+        min_chars: int = VAULT_MIN_CHARS,
+        intent: str = "",
+        extra: Iterable[int] = (),
+        salient: bool = True,
     ) -> str:
         """Replace a bulky tool result with a pointer + excerpt.
 
         Short strings and existing pointers pass through unchanged so a
-        second pass cannot rewrite history bytes.
+        second pass cannot rewrite history bytes. With ``salient`` the excerpt
+        holds the lines that match the step's ``intent`` (salience.py) and the
+        full body is a readable file under .g023/vault/; without it the old
+        blind head + tail excerpt is used.
         """
         if not text or len(text) < min_chars or is_vault_pointer(text):
             return text
         body_hash = self.put_tool_body(text)
-        excerpt = _vault_excerpt(text)
-        return (
-            f"{VAULT_LEADIN}sha256:{body_hash} chars={len(text)}]\n{excerpt}"
-        )
+        if not salient:
+            excerpt = _vault_excerpt(text)
+            return f"{VAULT_LEADIN}sha256:{body_hash} chars={len(text)}]\n{excerpt}"
+        from . import salience
+
+        header, full, rel, lines = "", None, "", 0
+        first, _, rest = text.partition("\n")
+        meta = _json_header(first)
+        if meta.get("full_output"):
+            # Bash dropped text when capping: select from the raw output file.
+            rel = str(meta["full_output"])
+            full = salience.read_vault_file(rel)
+            lines = int(meta.get("full_lines") or 0)
+            header = first
+        if full is None:
+            rel, lines = salience.write_vault_file(text)
+            full = text
+        excerpt = salience.build_excerpt(full, intent, extra=extra)
+        if header and not excerpt.startswith(header):
+            excerpt = header + "\n" + excerpt
+        note = salience.readback_note(rel, lines) if rel else ""
+        return f"{VAULT_LEADIN}sha256:{body_hash} chars={len(full)}]\n{excerpt}" + (f"\n{note}" if note else "")
 
     # ------------------------------------------------------------------
     # Session facts (lightweight memory)
@@ -455,7 +379,6 @@ class Cache:
         tables = {
             "files": "file_cache",
             "vision": "vision_cache",
-            "web": "web_cache",
             "vault": "tool_vault",
         }
         out: dict[str, int] = {}
@@ -466,12 +389,16 @@ class Cache:
         return out
 
     def clear_all(self):
+        """Purge re-derivable caches (summaries, vision answers, vault bodies).
+
+        ``session_facts`` is not a cache: it holds the live working set (goal,
+        todos, verify state). Purging caches used to reset the session too.
+        The prefix-hit history is kept as the drift baseline.
+        """
         with self._conn() as conn:
             conn.execute("DELETE FROM file_cache")
             conn.execute("DELETE FROM vision_cache")
-            conn.execute("DELETE FROM web_cache")
             conn.execute("DELETE FROM tool_vault")
-            conn.execute("DELETE FROM session_facts")
 
 
 # Singleton

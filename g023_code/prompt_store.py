@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import get_project_root
+from .fsutil import create_next_numbered
 
 
 def prompts_dir() -> Path:
@@ -42,9 +43,8 @@ def save_prompt(text: str, directory: Optional[Path] = None) -> Path:
     """Write ``text`` to the next ``{#}.txt`` and return that path."""
     folder = directory if directory is not None else prompts_dir()
     folder.mkdir(parents=True, exist_ok=True)
-    index = next_index(folder)
-    path = folder / f"{index}.txt"
-    path.write_text(text, encoding="utf-8")
+    # Claim the number with O_EXCL: two REPLs in one project never overwrite each other.
+    _, path = create_next_numbered(folder, lambda n: f"{n}.txt", next_index(folder), text=text)
     return path
 
 

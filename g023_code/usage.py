@@ -18,8 +18,9 @@ table below. The peak windows live in ``ds_times.json`` and are consumed by
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 # ---------------------------------------------------------------------------
 # Pricing (USD per 1M tokens) — DeepSeek tidal sheet, effective 2026-09-10.
@@ -38,11 +39,6 @@ class ModelPricing:
     surge_cache_miss: float
     surge_output: float
 
-    @property
-    def surge_multiplier(self) -> float:
-        """Peak is exactly twice off-peak on the current tidal sheet."""
-        return self.surge_output / self.output
-
 
 _FLASH_PRICING = ModelPricing(
     cache_hit=0.003,
@@ -53,20 +49,9 @@ _FLASH_PRICING = ModelPricing(
     surge_output=1.20,
 )
 
-_DEFAULT_PRICING: Dict[str, ModelPricing] = {
-    "deepseek-flash": _FLASH_PRICING,
-    # Aliases for older config/price-sheet names; same rates, same object.
-    "deepseek-v4-flash": _FLASH_PRICING,
-    "deepseek-v4-flash-vision-exp": _FLASH_PRICING,
-    "deepseek-v4-pro": ModelPricing(
-        cache_hit=0.022,
-        cache_miss=0.66,
-        output=1.98,
-        surge_cache_hit=0.044,
-        surge_cache_miss=1.32,
-        surge_output=3.96,
-    ),
-}
+# One model, one price row. Usage recorded under any other name (older session
+# logs, a ds_pricing.json alias) falls through ``pricing_for`` to this row.
+_DEFAULT_PRICING: Dict[str, ModelPricing] = {"deepseek-flash": _FLASH_PRICING}
 
 
 def _load_ds_pricing() -> Dict[str, ModelPricing]:
@@ -105,6 +90,16 @@ def _load_ds_pricing() -> Dict[str, ModelPricing]:
 
 PRICING: Dict[str, ModelPricing] = _load_ds_pricing()
 
+# Search / Fetch are billed per *successful* request, not per token, and have no
+# peak/off-peak split: $0.75 per 1,000 each (api-docs.deepseek.com/guides/search).
+# Server-side web_search inside a model call is billed the same way; DeepSeek
+# reports successful searches as ``usage.server_tool_use.tool_search``.
+SEARCH_REQUEST_USD = 0.75 / 1000
+FETCH_REQUEST_USD = 0.75 / 1000
+# Pseudo-model buckets for Search / Fetch API calls (no tokens, only per-request cost).
+FETCH_BUCKET = "deepseek-fetch-api"
+SEARCH_BUCKET = "deepseek-search-api"
+
 # Anything unknown is priced as Flash so estimates stay in the right ballpark.
 DEFAULT_PRICING = PRICING["deepseek-flash"]
 
@@ -125,6 +120,19 @@ class ModelUsage:
     cache_miss_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int = 0
+    # Billable per-request tools (successful only).
+    web_searches: int = 0
+    fetches: int = 0
+    # The part of the token counts above that was billed during a DeepSeek
+    # peak window (2x). Subsets, not extra tokens: cost() prices these at the
+    # surge rate and the rest at the regular rate.
+    peak_cache_hit_tokens: int = 0
+    peak_cache_miss_tokens: int = 0
+    peak_output_tokens: int = 0
+
+    @property
+    def tool_cost(self) -> float:
+        return self.web_searches * SEARCH_REQUEST_USD + self.fetches * FETCH_REQUEST_USD
 
     @property
     def input_tokens(self) -> int:
@@ -135,23 +143,34 @@ class ModelUsage:
         return self.input_tokens + self.output_tokens
 
     def cost(self, model: str, surge: bool = False) -> float:
-        """USD cost at the model's rates.
+        """USD cost at the rates that were in force when the tokens were billed.
 
-        ``surge=True`` prices the tokens at the peak (surge) rates instead of
-        the regular (off-peak) ones — 2x on the current tidal sheet. Totals
-        default to regular rates because usage is accumulated without
-        timestamps, so a peak/off-peak split cannot be reconstructed; the
-        surge figure is the worst case for the session so far.
+        Every call is tagged at record time: tokens billed inside a DeepSeek
+        peak window are priced at the surge rate (2x), the rest at the regular
+        rate. ``surge=True`` is the worst case: every token at the surge rate.
         """
         p = pricing_for(model)
-        cache_hit = p.surge_cache_hit if surge else p.cache_hit
-        cache_miss = p.surge_cache_miss if surge else p.cache_miss
-        output = p.surge_output if surge else p.output
+        if surge:
+            return (
+                self.cache_hit_tokens * p.surge_cache_hit
+                + self.cache_miss_tokens * p.surge_cache_miss
+                + self.output_tokens * p.surge_output
+            ) / 1_000_000 + self.tool_cost
+        hit_peak = min(self.peak_cache_hit_tokens, self.cache_hit_tokens)
+        miss_peak = min(self.peak_cache_miss_tokens, self.cache_miss_tokens)
+        out_peak = min(self.peak_output_tokens, self.output_tokens)
         return (
-            self.cache_hit_tokens * cache_hit
-            + self.cache_miss_tokens * cache_miss
-            + self.output_tokens * output
-        ) / 1_000_000
+            (self.cache_hit_tokens - hit_peak) * p.cache_hit
+            + hit_peak * p.surge_cache_hit
+            + (self.cache_miss_tokens - miss_peak) * p.cache_miss
+            + miss_peak * p.surge_cache_miss
+            + (self.output_tokens - out_peak) * p.output
+            + out_peak * p.surge_output
+        ) / 1_000_000 + self.tool_cost
+
+    @property
+    def peak_tokens(self) -> int:
+        return self.peak_cache_hit_tokens + self.peak_cache_miss_tokens + self.peak_output_tokens
 
     def hit_rate(self) -> float:
         return (self.cache_hit_tokens / self.input_tokens) if self.input_tokens else 0.0
@@ -163,6 +182,11 @@ class ModelUsage:
             cache_miss_tokens=self.cache_miss_tokens + other.cache_miss_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            web_searches=self.web_searches + other.web_searches,
+            fetches=self.fetches + other.fetches,
+            peak_cache_hit_tokens=self.peak_cache_hit_tokens + other.peak_cache_hit_tokens,
+            peak_cache_miss_tokens=self.peak_cache_miss_tokens + other.peak_cache_miss_tokens,
+            peak_output_tokens=self.peak_output_tokens + other.peak_output_tokens,
         )
 
 
@@ -192,6 +216,11 @@ def _get(obj: Any, name: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
+# Process-wide override of the peak clock (the test suite pins it off-peak so
+# cost assertions do not depend on the hour they run at). None = surge.is_surge.
+PEAK_CLOCK: Optional[Callable[[], bool]] = None
+
+
 @dataclass
 class UsageTracker:
     # model -> usage, split by scope so /settings can show orchestrator vs subagents
@@ -210,15 +239,25 @@ class UsageTracker:
     # Rolling per-turn deltas (reset at the top of each user turn)
     turn: ModelUsage = field(default_factory=ModelUsage)
     turn_cost: float = 0.0
+    # Clock hook: is a DeepSeek peak window in force right now? Tests replace it.
+    peak_clock: Optional[Callable[[], bool]] = None
+
+    def _peak_now(self) -> bool:
+        clock = self.peak_clock or PEAK_CLOCK
+        if clock is None:
+            from .surge import is_surge as clock
+        try:
+            return bool(clock())
+        except Exception:
+            return False
 
     def record(self, model: str, usage: Any, scope: str = "orchestrator") -> ModelUsage:
         """Fold one API response's usage into the totals. Returns the delta.
 
-        The Responses API names these fields differently from chat completions —
-        ``input_tokens`` with a nested ``input_tokens_details.cached_tokens``
-        rather than ``prompt_tokens`` with a flat hit/miss split — and reports
-        only the cached count, leaving the miss to be derived. Both spellings are
-        accepted so the tracker stays honest whichever endpoint a caller used.
+        The codec reports ``input_tokens`` with a nested
+        ``input_tokens_details.cached_tokens`` (only the cached count; the miss
+        is derived). The flat ``prompt_cache_hit/miss_tokens`` spelling is also
+        accepted, so usage stored by older versions still totals correctly.
         """
         if usage is None:
             return ModelUsage()
@@ -248,12 +287,20 @@ class UsageTracker:
             or 0
         )
 
+        server_tools = _details(usage, "server_tool_use")
+        searches = _get(server_tools, "tool_search") if server_tools is not None else None
+
+        peak = self._peak_now()
         delta = ModelUsage(
             calls=1,
             cache_hit_tokens=hit,
             cache_miss_tokens=miss,
             output_tokens=output,
             reasoning_tokens=reasoning,
+            web_searches=searches or 0,
+            peak_cache_hit_tokens=hit if peak else 0,
+            peak_cache_miss_tokens=miss if peak else 0,
+            peak_output_tokens=output if peak else 0,
         )
 
         bucket = self.orchestrator if scope == "orchestrator" else self.subagent
@@ -268,6 +315,24 @@ class UsageTracker:
             self.context_cache_miss_tokens = miss
             self.context_tokens_estimated = False
 
+        return delta
+
+    def record_fetch(self, ok: bool = True) -> ModelUsage:
+        """Count one DeepSeek Fetch API call (billed only when it succeeded)."""
+        delta = ModelUsage(fetches=1 if ok else 0)
+        if ok:
+            self.subagent[FETCH_BUCKET] = self.subagent.get(FETCH_BUCKET, ModelUsage()).merge(delta)
+            self.turn = self.turn.merge(delta)
+            self.turn_cost += delta.tool_cost
+        return delta
+
+    def record_search(self, ok: bool = True) -> ModelUsage:
+        """Count one DeepSeek Search API call (billed only when it returned results)."""
+        delta = ModelUsage(web_searches=1 if ok else 0)
+        if ok:
+            self.subagent[SEARCH_BUCKET] = self.subagent.get(SEARCH_BUCKET, ModelUsage()).merge(delta)
+            self.turn = self.turn.merge(delta)
+            self.turn_cost += delta.tool_cost
         return delta
 
     # -- queries ----------------------------------------------------------
@@ -307,12 +372,17 @@ class UsageTracker:
 
 
 _tracker: Optional[UsageTracker] = None
+# web.py records searches/fetches from worker threads. Two racing first calls
+# must not build two trackers: the counts on the losing one would be dropped.
+_TRACKER_LOCK = threading.Lock()
 
 
 def get_usage() -> UsageTracker:
     global _tracker
     if _tracker is None:
-        _tracker = UsageTracker()
+        with _TRACKER_LOCK:
+            if _tracker is None:
+                _tracker = UsageTracker()
     return _tracker
 
 

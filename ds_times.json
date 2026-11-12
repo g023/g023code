@@ -4,16 +4,36 @@
   "effective": "2026-09-10",
   "timezone_anchor": "Asia/Shanghai (Beijing time)",
   "utc_offset_hours": 8,
-  "peak_weekdays": [0, 1, 2, 3, 4],
+  "peak_weekdays": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
   "note": "Off-peak (regular) prices apply in all other hours and are exactly half of the peak (surge) price. Peak windows are Monday-Friday only (Python weekday(): Monday=0); weekends are off-peak. Windows are anchored to Beijing wall-clock time and reported by the CLI in the machine's local timezone.",
   "peak_windows": {
     "beijing": [
-      ["09:00", "12:00"],
-      ["14:00", "18:00"]
+      [
+        "09:00",
+        "12:00"
+      ],
+      [
+        "14:00",
+        "18:00"
+      ]
     ],
     "utc": [
-      ["01:00", "04:00"],
-      ["06:00", "10:00"]
+      [
+        "01:00",
+        "04:00"
+      ],
+      [
+        "06:00",
+        "10:00"
+      ]
     ]
-  }
+  },
+  "holidays": [],
+  "holidays_note": "Chinese public holidays are off-peak all day (pricing sheet). DeepSeek does not publish the dates; add Beijing dates as YYYY-MM-DD strings, e.g. [\"2026-10-01\"]."
 }

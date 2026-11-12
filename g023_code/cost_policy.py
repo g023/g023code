@@ -1,7 +1,7 @@
 """Cache-aware history policy: when to keep, vault, micro-blank, or compact.
 
 DeepSeek Flash regular rates (ds_pricing.json, 2026-09-10): cache hit $0.003/M,
-miss $0.15/M (~50x), output $0.60/M (~200x a hit). A later /responses call hits
+miss $0.15/M (~50x), output $0.60/M (~200x a hit). A later request hits
 only when it fully matches a persisted cache prefix unit from token 0
 (Example 1: A+B then A+B+C hits; Example 2: A+B then A+C misses).
 
@@ -10,6 +10,12 @@ it is almost free. Rewriting it (micro-blank, Layer 3, post-turn replace)
 turns those hits into misses on the tail from the rewrite point onward.
 Output tokens are the remaining bill once the prefix is hot — retune effort
 only when the prefix is already new (post-turn compact / /thinking / /clear).
+/goal is not in that list. It releases the pin before its own turn so the
+ceiling alias is sent, and the turn re-pins that alias. Releasing again
+when /goal returns would miss the transcript just warmed, from token 0.
+A stored [next_effort] is sent on the next user request only when the pin
+is already clear: compact released it after replacing the input list, or
+the user ran /thinking or /clear.
 
 Worked example, off-peak Flash, chars/4 token guess used elsewhere in this
 client:
@@ -38,18 +44,20 @@ from .usage import pricing_for
 # Same guess the orchestrator uses for char→token status-bar math.
 CHARS_PER_TOKEN = 4
 
-# Live probe (2026-09-14): Flash cache units land on a 128-token grain.
-CACHE_UNIT_TOKENS = 128
-
 # Last-call hit rate at or above this means leftover history is in the cached
 # prefix and is cheap to keep. Below it, leftover will be re-missed.
 HIT_RATE_KEEP = 0.5
 
-# Tools whose results are often huge and already have a cheaper re-run path
-# (Bash again, FetchUrl cache, SearchContent is local). ReadFile summaries and
-# Agent payloads *are* the compact form — do not vault those.
+# Tools whose results are unbounded and have a narrower re-run (a tighter
+# command, a URL section, a sub-directory). SearchContent is bounded by its
+# sample cap and its samples are the answer: vaulting it kept only the JSON
+# envelope and blinded the search (1.5.0 development, bench task "pricing").
+# FetchUrl and WebSearch are bounded too (an 8k default window or focus
+# sections; at most 20 abstracts). Vaulting FetchUrl showed the model 1.2k
+# chars of a page it had paid to fetch (1.5.0).
+# ReadFile summaries and Agent payloads *are* the compact form.
 VAULT_TOOLS = frozenset(
-    {"Bash", "FetchUrl", "ListDir", "SearchContent", "Glob", "AnalyzeImage"}
+    {"Bash", "ListDir", "Glob", "AnalyzeImage"}
 )
 VAULT_MIN_CHARS = 2_500
 VAULT_LEADIN = "[g023_vault "

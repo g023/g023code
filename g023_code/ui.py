@@ -87,25 +87,28 @@ class ToolStyle:
     icon: str
     color: str
     verb: str
-    subagent: bool = False
 
 
 TOOL_STYLES: dict[str, ToolStyle] = {
-    "ReadFile": ToolStyle("📄" if UNICODE else "R", "sub", "read", subagent=True),
-    "SearchContent": ToolStyle("🔎" if UNICODE else "S", "sub", "search", subagent=True),
-    "AnalyzeImage": ToolStyle("👁" if UNICODE else "V", "sub", "look at", subagent=True),
-    "Agent": ToolStyle("🧠" if UNICODE else "A", "sub", "delegate", subagent=True),
+    "ReadFile": ToolStyle("📄" if UNICODE else "R", "sub", "read"),
+    "SearchContent": ToolStyle("🔎" if UNICODE else "S", "sub", "search"),
+    "AnalyzeImage": ToolStyle("👁" if UNICODE else "V", "sub", "look at"),
+    "Agent": ToolStyle("🧠" if UNICODE else "A", "sub", "delegate"),
     "Bash": ToolStyle("⚙" if UNICODE else "$", "tool", "run"),
     "WriteFile": ToolStyle("✎" if UNICODE else "W", "warn", "write"),
     "Edit": ToolStyle("✂" if UNICODE else "E", "warn", "edit"),
+    "Rename": ToolStyle("✎" if UNICODE else "R", "warn", "rename"),
     "ListDir": ToolStyle("📁" if UNICODE else "L", "tool", "list"),
     "Glob": ToolStyle("⊞" if UNICODE else "G", "tool", "find"),
     "TodoWrite": ToolStyle("☑" if UNICODE else "T", "tool", "todo"),
-    "LearnSearch": ToolStyle("☰" if UNICODE else "Ls", "tool", "learn-search"),
-    "LearnGet": ToolStyle("☰" if UNICODE else "Lg", "tool", "learn-get"),
-    "LearnPut": ToolStyle("☰" if UNICODE else "Lp", "tool", "learn-put"),
+    "LearnSearch": ToolStyle("≡" if UNICODE else "Ls", "tool", "learn-search"),
+    "LearnGet": ToolStyle("≡" if UNICODE else "Lg", "tool", "learn-get"),
+    "LearnPut": ToolStyle("≡" if UNICODE else "Lp", "tool", "learn-put"),
     "SessionSearch": ToolStyle("▤" if UNICODE else "Ss", "tool", "session-search"),
+    "LocalAsk": ToolStyle("⌂" if UNICODE else "La", "sub", "ask local"),
     "FetchUrl": ToolStyle("🌐" if UNICODE else "F", "tool", "fetch"),
+    "WebSearch": ToolStyle("🔍" if UNICODE else "?", "tool", "search"),
+    # Server-side searches from sessions recorded before 1.5.0 still replay.
     "web_search": ToolStyle("🔍" if UNICODE else "?", "tool", "web search"),
 }
 
@@ -156,6 +159,27 @@ def shorten_path(path: str, root: Optional[str] = None) -> str:
         except (ValueError, OSError):
             pass
     return path
+
+
+def display_path(path: Any) -> str:
+    """A path for humans: ``~`` stands for the home directory.
+
+    Banners, ``/status`` and ``/config`` are screenshotted and pasted into issues; the
+    absolute home path would publish the local account name with them.
+    """
+    if path is None or str(path) == "":
+        return ""
+    import pathlib
+
+    text = str(path)
+    try:
+        home = pathlib.Path(os.path.expanduser("~"))
+        rel = pathlib.Path(text).relative_to(home)
+    except (ValueError, RuntimeError, OSError):
+        return text
+    if str(home) in ("", "/", "."):
+        return text
+    return "~" if str(rel) == "." else "~" + os.sep + str(rel)
 
 
 def short_url(url: str) -> str:
@@ -241,6 +265,10 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
         return detail
     if name == "AnalyzeImage":
         return f"{shorten_path(s('path_or_url'), root)} [muted]{truncate(s('question'), 40)}[/muted]"
+    if name == "LocalAsk":
+        files = args.get("paths") if isinstance(args.get("paths"), list) else []
+        scope = f"{len(files)} file(s)" if files else "whole project"
+        return f'"{truncate(s("question"), 40)}" [muted]{scope}[/muted]'
     if name == "Bash":
         return truncate(s("command"), 70)
     if name == "WriteFile":
@@ -248,6 +276,9 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
         return f"{shorten_path(s('path'), root)} [muted]({human_bytes(size)})[/muted]"
     if name == "Edit":
         return f"{shorten_path(s('path'), root)} [muted]({len(s('old_string'))} → {len(s('new_string'))} chars)[/muted]"
+    if name == "Rename":
+        where = shorten_path(s("path"), root) if s("path") not in ("", ".") else "project"
+        return f"{truncate(s('old'), 40)} → {truncate(s('new'), 40)} [muted]in {where}[/muted]"
     if name == "Glob":
         detail = f'"{truncate(s("pattern"), 40)}"'
         if s("path"):
@@ -267,7 +298,12 @@ def describe_call(name: str, args: dict, root: Optional[str] = None) -> str:
     if name == "ListDir":
         return shorten_path(s("path") or ".", root) + (" [muted](recursive)[/muted]" if args.get("recursive") else "")
     if name == "FetchUrl":
-        return truncate(s("url"), 60)
+        extra = f" [muted]focus={truncate(s('focus'), 24)}[/muted]" if args.get("focus") else ""
+        if args.get("offset"):
+            extra += f" [muted]@{args.get('offset')}[/muted]"
+        return truncate(s("url"), 60) + extra
+    if name == "WebSearch":
+        return truncate(s("query"), 70)
     if name == "web_search":
         # A server-side search action: either the queries it ran, or the page it
         # went to (optionally with the pattern it looked for there).
@@ -315,9 +351,21 @@ def permission_diff(name: str, args: dict, root: Optional[str] = None) -> Option
     path = str(args.get("path") or "")
     display = shorten_path(path, root) if path else path
     if name == "Edit":
-        return unified_change_diff(
-            display, str(args.get("old_string") or ""), str(args.get("new_string") or "")
-        )
+        from .multi_edit import hunks
+
+        diffs = [unified_change_diff(shorten_path(hp, root) if hp else display, old, new)
+                 for hp, old, new in hunks(args)]
+        return "\n".join(d for d in diffs if d) or None
+    if name == "Rename":
+        from .rename import planned_files
+
+        files = planned_files(str(args.get("old") or ""), str(args.get("new") or ""),
+                              path or ".", str(args.get("include") or ""))
+        if not files:
+            return None
+        shown = "\n".join(f"  {f}" for f in files[:20])
+        more = f"\n  ... and {len(files) - 20} more" if len(files) > 20 else ""
+        return f"Files to change ({len(files)}):\n{shown}{more}"
     if name == "WriteFile":
         new = str(args.get("content") or "")
         old = ""
@@ -335,6 +383,25 @@ def permission_diff(name: str, args: dict, root: Optional[str] = None) -> Option
     return None
 
 
+def _describe_web(name: str, result: str) -> tuple[str, bool]:
+    """WebSearch/FetchUrl results start with a one-line JSON header (web.py)."""
+    first = result.split("\n", 1)[0]
+    try:
+        head = json.loads(first)
+    except (json.JSONDecodeError, ValueError):
+        head = None
+    if not isinstance(head, dict):
+        return f"{len(result):,} chars", True
+    if head.get("error"):
+        return truncate(str(head["error"]), 70), False
+    src = str(head.get("source", "")).split(" ")[0]
+    if name == "WebSearch":
+        return f"{head.get('results', 0)} results {Glyph.DOT} {src}", True
+    shown = str(head.get("shown", ""))
+    shown = "focus" if shown.startswith("focus") else shown
+    return f"{int(head.get('chars') or 0):,} chars {Glyph.DOT} {shown} {Glyph.DOT} {src}", True
+
+
 def describe_result(name: str, result: str) -> tuple[str, bool]:
     """
     Summarise what a tool actually returned: ``(phrase, ok)``.
@@ -343,6 +410,8 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
     expect, so an unrecognised tool still reports *something* useful.
     """
     size = len(result or "")
+    if name in ("WebSearch", "FetchUrl"):
+        return _describe_web(name, result or "")
     try:
         data = json.loads(result)
     except (json.JSONDecodeError, TypeError):
@@ -358,9 +427,23 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         if data.get("mode") == "raw_full":
             body = data.get("content") or ""
             return f"full file, {len(body):,} chars", bool(data.get("verbatim"))
+        if data.get("summary_source") == "local_focus":
+            matches = data.get("matches") or []
+            if not matches:
+                return "focus: no section matched", True
+            best = matches[0]
+            how = "verbatim" if data.get("verbatim") else "ranges"
+            return (
+                f"focus {Glyph.ARROW} {truncate(str(best.get('section')), 40)} "
+                f"(lines {best.get('start_line')}-{best.get('end_line')}, {len(matches)} match(es), {how})"
+            ), True
         if data.get("start_line"):
-            span = data["end_line"] - data["start_line"] + 1
-            return f"lines {data['start_line']}-{data['end_line']} of {data['total_lines']:,} ({span} lines)", True
+            start = data["start_line"]
+            end = data.get("end_line") or start
+            span = end - start + 1
+            total = data.get("total_lines")
+            of = f" of {total:,}" if isinstance(total, int) else ""
+            return f"lines {start}-{end}{of} ({span} lines)", True
         meta = data.get("metadata") or {}
         bits = []
         if meta.get("loc"):
@@ -417,6 +500,13 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
             phrase += f" \u2022 backup \u2192 {data['backup']}"
         return phrase, bool(data.get("ok"))
 
+    if name == "Rename":
+        files = data.get("files") or {}
+        phrase = f"{int(data.get('total') or 0)} ref(s) in {len(files)} file(s)"
+        if data.get("syntax_error"):
+            phrase += " \u2022 syntax error"
+        return phrase, bool(data.get("ok"))
+
     if name == "Glob":
         total = int(data.get("total") or 0)
         shown = len(data.get("files") or [])
@@ -425,6 +515,10 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
     if name == "TodoWrite":
         open_n = len((data.get("working_set") or {}).get("open") or [])
         return f"{open_n} open leaf(s)", bool(data.get("ok"))
+
+    if name == "LocalAsk":
+        n = len(data.get("evidence") or [])
+        return f"{n} cited line(s) {Glyph.DOT} {data.get('backend', 'local')}", bool(data.get("evidence"))
 
     if name in ("LearnSearch", "SessionSearch"):
         n = int(data.get("count") or len(data.get("hits") or []))
@@ -437,16 +531,12 @@ def describe_result(name: str, result: str) -> tuple[str, bool]:
         return str(data.get("id") or data.get("error") or "put"), bool(data.get("ok"))
 
     if name == "ListDir":
+        if data.get("digest"):
+            return f"digest, {len(data.get('lines') or [])} rows", True
         return f"{len(data.get('entries') or [])} entries", True
 
-    if name == "FetchUrl":
-        content = data.get("content") or data.get("text") or ""
-        src = data.get("source", "")
-        return f"HTTP {data.get('status', '?')} {Glyph.DOT} {len(content):,} chars {Glyph.DOT} {src}", True
-
-    # web_search has no branch here: it is DeepSeek's own server-side tool, so it
-    # never produces a tool result for us to summarise. The orchestrator builds
-    # its trace events straight from the web_search_call items instead.
+    # Replayed server-side web_search traces have no tool result: the
+    # orchestrator builds their events straight from the web_search_call items.
 
     if name == "Agent":
         return f"{len(data.get('plan_or_exploration') or '')} chars", True
@@ -608,14 +698,13 @@ def banner(
     effort: str,
     verbose: str,
     vision: str,
-    ollama: str,
 ) -> Panel:
     """The startup card — orientation in one glance, no scrolling."""
     title = Text()
     title.append("g023 Code", style="brand")
     title.append(f"  v{version}", style="dim")
-    title.append("\nDeepSeek V4 ", style="dim")
-    title.append(f"{Glyph.DOT} Subagent-First {Glyph.DOT} Context is Currency", style="dim")
+    title.append("\nDeepSeek V4.1 Flash ", style="dim")
+    title.append(f"{Glyph.DOT} Single-Agent by Default {Glyph.DOT} Context is Currency", style="dim")
 
     info = kv_table(
         [
@@ -623,7 +712,6 @@ def banner(
             ("home", f"[dim]{home}[/dim]"),
             ("model", f"{model}  [dim]{Glyph.DOT} thinking {effort} {Glyph.DOT} verbose {verbose}[/dim]"),
             ("vision", vision),
-            ("ollama", ollama),
         ]
     )
 
@@ -632,8 +720,8 @@ def banner(
     hint.append("/help", style="brand")
     hint.append(" for commands", style="dim")
     hint.append(f"  {Glyph.DOT}  ", style="dim")
-    hint.append("/ollama", style="brand")
-    hint.append(" to point vision at another machine", style="dim")
+    hint.append("/model", style="brand")
+    hint.append(" for limits and prices", style="dim")
     hint.append(f"  {Glyph.DOT}  ", style="dim")
     hint.append("/exit", style="brand")
     hint.append(" to quit", style="dim")

@@ -1,6 +1,6 @@
 # `prompt.py` — user input handling
 
-`g023_code/prompt.py` (~236 lines) centralises every way the program
+`g023_code/prompt.py` centralises every way the program
 asks the human something: the main input line, yes/no questions, and
 option pickers.
 

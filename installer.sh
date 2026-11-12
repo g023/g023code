@@ -71,7 +71,7 @@ g023 Code installer
       --key KEY        write KEY into K.dat instead of prompting
       --venv           always create a virtualenv in ./.venv
       --no-venv        never create one; install into the current interpreter
-      --with-optional  also install the optional extras (vision, browser TLS)
+      --with-optional  also install the optional extras (Pillow, for vision image downscaling)
       --no-optional    skip the optional extras
       --no-path        do not add a launcher to ~/.local/bin or touch shell rc
       --uninstall      remove the launcher shim and the shell rc block
@@ -139,7 +139,10 @@ if [ "$UNINSTALL" = "1" ]; then
     rc="$(shell_rc)"
     if [ -f "$rc" ] && grep -qF "$RC_MARK_BEGIN" "$rc"; then
         tmp="$(mktemp)"
-        sed "/${RC_MARK_BEGIN}/,/${RC_MARK_END}/d" "$rc" > "$tmp" && mv "$tmp" "$rc"
+        # Write back through the existing file: mv would reset its mode to 0600
+        # and replace a symlinked rc (dotfile managers) with a plain file.
+        sed "/${RC_MARK_BEGIN}/,/${RC_MARK_END}/d" "$rc" > "$tmp" && cat "$tmp" > "$rc"
+        rm -f "$tmp"
         ok "removed the g023 block from ${rc}"
     else
         skip "nothing to remove from ${rc}"
@@ -269,7 +272,7 @@ step "Installing dependencies"
 # import name : pip requirement : why the user should care
 REQUIRED=(
     "rich:rich>=13.7.0:the entire terminal UI"
-    "httpx:httpx>=0.27.0:the DeepSeek Responses API client"
+    "httpx:httpx>=0.27.0:the DeepSeek API client (chat, Search, Fetch)"
     "pygments:pygments>=2.17.0:syntax highlighting"
 )
 RECOMMENDED=(
@@ -277,10 +280,6 @@ RECOMMENDED=(
 )
 OPTIONAL=(
     "PIL:pillow>=10.0.0:downscales images before vision calls"
-    "curl_cffi:curl_cffi>=0.7.0:Chrome TLS fingerprint for FetchUrl"
-    "h2:h2>=4.1.0:HTTP/2 for the FetchUrl fallback"
-    "brotli:brotli>=1.1.0:decode brotli responses"
-    "zstandard:zstandard>=0.22.0:decode zstd responses"
 )
 
 has_module() { "$PYTHON" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('$1') else 1)" 2>/dev/null; }
@@ -331,12 +330,12 @@ if [ ${#MISSING_SPECS[@]} -gt 0 ]; then
         no)  want_optional=0 ;;
         auto)
             say "    ${C_DIM}optional extras not installed: ${MISSING_NAMES[*]}${C_RESET}"
-            ask "Install the optional extras (vision + browser-grade fetching)?" y && want_optional=1
+            ask "Install the optional extras (vision image downscaling)?" y && want_optional=1
             ;;
     esac
     if [ "$want_optional" = "1" ]; then
-        # One at a time: curl_cffi needs wheels that do not exist for every
-        # platform, and one unbuildable extra must not sink the other four.
+        # One at a time, so an extra with no wheel for this platform cannot
+        # sink the others.
         for i in "${!MISSING_SPECS[@]}"; do
             install_specs "installed" "${MISSING_SPECS[$i]}" \
                 || warn "${MISSING_NAMES[$i]} could not be installed — g023 runs without it"
@@ -413,42 +412,14 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 if [ ! -f "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" <<'JSON'
-{
-  "verbose": "low",
-  "auto_compact": true,
-  "show_tool_timing": true,
-  "show_context_bar": true,
-  "permission_default": "ask",
-  "max_iterations": 255,
-  "max_tokens": 0,
-  "max_context_tokens": 256000,
-  "compact_threshold": 0.85,
-  "orchestrator_model": "deepseek-flash",
-  "subagent_model": "deepseek-flash",
-  "reasoning_effort": 75,
-  "thinking_enabled": true,
-  "vision_backend": "none",
-  "vision_model": null,
-  "vision_host": null,
-  "vision_max_image_dim": 800,
-  "vision_timeout": 180,
-  "vision_num_ctx": 4096,
-  "vision_keep_alive": "5m",
-  "vision_endpoint": "responses",
-  "deepseek_vision_model": "deepseek-flash",
-  "or_default_model": "google/gemma-4-26b-a4b-it:free",
-  "or_vision_models": null,
-  "or_credits": false,
-  "or_sub_enabled": false,
-  "surge_notify": true,
-  "surge_pause": false,
-  "surge_pause_buffer_minutes": 5,
-  "write_backup": true,
-  "write_backup_keep": 5
-}
-JSON
-    ok "wrote default config.json"
+    # Generated from the program's own Settings defaults (g023_code/config.py),
+    # so the installer can never write a stale copy. Without the file the program
+    # still starts on the same built-in defaults.
+    if "$PYTHON" -c "import sys; sys.path.insert(0, sys.argv[1]); from g023_code.config import write_default_config; write_default_config(sys.argv[2])" "$HERE" "$CONFIG_FILE"; then
+        ok "wrote default config.json"
+    else
+        warn "could not write config.json; the built-in defaults apply until you save settings"
+    fi
 fi
 
 if [ ! -x "${HERE}/g023.sh" ]; then
@@ -457,24 +428,6 @@ else
     skip "g023.sh is already executable"
 fi
 chmod +x "${HERE}/installer.sh" 2>/dev/null
-
-# ---------------------------------------------------------------------------
-step "Vision backend (optional)"
-# ---------------------------------------------------------------------------
-
-# Vision is off by default and stays off — this step only reports what is
-# available so /vision has something to offer when the user wants it.
-if command -v ollama >/dev/null 2>&1; then
-    ok "ollama found at $(command -v ollama)"
-    if curl -fsS --max-time 2 "${OLLAMA_HOST:-http://localhost:11434}/api/tags" >/dev/null 2>&1; then
-        ok "the daemon is answering — enable image analysis in g023 with ${C_BOLD}/vision${C_RESET}"
-    else
-        skip "daemon not responding; start it with 'ollama serve', then use /vision"
-    fi
-else
-    skip "no ollama on this machine — image analysis stays off (everything else works)"
-    skip "install it from https://ollama.com if you want /vision"
-fi
 
 # ---------------------------------------------------------------------------
 step "Making 'g023' runnable from anywhere"
@@ -539,16 +492,17 @@ fi
 step "Verifying the install"
 # ---------------------------------------------------------------------------
 
+import_err="$(mktemp)"   # private (0600), unique name: no fixed path in a shared /tmp
 if PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}" G023_HOME="$HERE" \
-   "$PYTHON" -c "import g023_code, g023_code.cli, g023_code.api, g023_code.orchestrator" 2>/tmp/g023_import_err; then
+   "$PYTHON" -c "import g023_code, g023_code.cli, g023_code.api, g023_code.orchestrator" 2>"$import_err"; then
     ok "the package imports cleanly on ${PYVER}"
 else
     fail "importing g023_code failed:"
-    sed 's/^/      /' /tmp/g023_import_err >&2
-    rm -f /tmp/g023_import_err
+    sed 's/^/      /' "$import_err" >&2
+    rm -f "$import_err"
     die "Setup did not complete."
 fi
-rm -f /tmp/g023_import_err
+rm -f "$import_err"
 
 # ---------------------------------------------------------------------------
 
