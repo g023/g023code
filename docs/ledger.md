@@ -29,5 +29,3 @@ because the smart-read digests make those facts short. With the ledger on, each
 post-compaction request carried about 1.5k extra chars and nothing improved. So
 it stays opt-in for very long sessions where the summary may be squeezed, a
 regime that was not measured.
-
-Tests: `tests/test_ledger.py`.

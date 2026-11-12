@@ -127,7 +127,7 @@ newest `.g023/backups/` snapshot back onto the file.
 ### Backup location
 
 `.g023/backups/` per project — the safety net WriteFile and Edit rely
-on; `tests/test_write_backup.py` pins it. Layout mirrors the file tree
+on. Layout mirrors the file tree
 (one folder per file, timestamped copies inside), newest
 `settings.write_backup_keep` kept (default 5). Skipped for `.g023/`
 paths, new files, unchanged content, and when `G023_WRITE_BACKUP=0`.

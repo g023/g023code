@@ -23,7 +23,7 @@ repairs an incomplete setup.
    `economic` policy, effort 75, verbose `low`, `permission_default: ask`, …)
    and ignores `G023_*` switches in the installing shell. (Until 1.5.0 the
    template was a literal that had drifted to a 256k window and lacked six
-   keys; `tests/test_release.py` now pins the generator.) It names no model
+   keys.) It names no model
    (the model is a constant) and no provider. An existing valid
    `config.json` is left untouched; keys older versions wrote (model,
    `api_format`, Ollama/OpenRouter vision, `or_*`) are ignored on load and

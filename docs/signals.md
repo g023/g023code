@@ -31,7 +31,7 @@ The idea: a persistent collapse in cache-hit ratio is a sign the API's
 prompt-cache behaviour changed — worth knowing even though nothing
 crashed.
 
-## Design constraints (per the test suite)
+## Design constraints
 
 - Signals must fire on shapes that matter **and stay quiet on shapes that
   are merely unusual** — a signal that fires on ordinary turns gets
@@ -45,4 +45,3 @@ crashed.
 - `docs/api.md` — `unknown_item_types`, `silent_degradation`.
 - `docs/cache.md` — `cache.prefix_history` feeds the verdict.
 - `docs/cli.md` — `/signals` command renders the log and verdict.
-- `tests/test_drift_signals.py` — pins the fire/stay-quiet behaviour.

@@ -42,7 +42,7 @@ orchestrator model never ingests raw data — heavy tools are executed by
   into the first user item. `max_output_tokens` is omitted on that path
   — adding it busts the prefix. Execution still refuses any tool not in
   `AGENT_READONLY_TOOLS` / `AGENT_TASK_TOOLS`. Without a published
-  prefix (tests, standalone router) the old isolated schemas are used.
+  prefix (a standalone router) the old isolated schemas are used.
 
   **Branch journal.** Each nested run writes an outline to
   `.g023/scratch/agent/{kind}-{hash}.json` (kind, objective, payload,
@@ -182,5 +182,3 @@ returns to the orchestrator.
 - `docs/cache.md` — summary/vision caches.
 - `docs/paths.md` — root confinement.
 - `docs/tools.md` — the lightweight tools these are paired with.
-- `tests/test_file_reader.py`, `tests/test_search.py`,
-  `tests/test_images.py`, `tests/test_root_confine.py`.

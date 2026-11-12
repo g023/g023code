@@ -49,5 +49,5 @@ symbols shows the outline with prefix-grouped names (`_fold_symbols`) and `symbo
 Each SearchContent sample gets `in` (enclosing function, or section path for text, up to 32 MB). The codec
 prints a `@ where` header when it changes. C definitions rank first (`_is_definition` + `_C_DEF_LINE`).
 
-Tests: `tests/test_docindex.py`. A 6-task long-document live bench was used during development
+A 6-task long-document live bench was used during development
 (see the README's "For researchers" section).

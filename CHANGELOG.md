@@ -97,8 +97,7 @@ project. Techniques, evidence and prior art are summarised in the README's
   restored; failures are labelled new / pre-existing / fixed by edits. Any
   project change Bash made that has no pre-image disables it for the turn
   (`G023_ATTRIBUTION=0` disables).
-- `LICENSE` (MIT), `CHANGELOG.md`, and `tests/test_release.py` (installer
-  config, line endings, version agreement).
+- `LICENSE` (MIT) and `CHANGELOG.md`.
 - **Test oracle** (`testoracle.py`, `probes/g023_pytest_probe.py`,
   `docs/testoracle.md`, on). A pytest run through Bash writes a report
   outside the project; the result adds only what the visible output lacks:
@@ -242,8 +241,7 @@ project. Techniques, evidence and prior art are summarised in the README's
   across projects.
 - Test-command detection recognises venv paths, `timeout`, `uv`/`poetry`/…
   `run`, env prefixes and JS runners.
-- Blocking model calls wake on completion instead of polling (suite 16 s →
-  9 s).
+- Blocking model calls wake on completion instead of polling.
 - `/tools` notes describe what each tool does now: local tools say "no API
   call", `Agent` / `AnalyzeImage` say when they are not offered, and FetchUrl
   no longer claims to prompt when it is set to allow. The launch banner reads
@@ -379,5 +377,4 @@ One model, one wire, one credential: **DeepSeek V4.1 Flash**
 
 Recut of 1.3.3: `deepseek-flash` everywhere on the `/responses` wire, thinking
 as a 0–100 dial (default and ceiling 75), the 2026-09-10 price sheet with
-weekday-only surge, prefix-cache-preserving compaction policy, and 421 offline
-tests.
+weekday-only surge, and a prefix-cache-preserving compaction policy.

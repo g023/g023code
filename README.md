@@ -29,9 +29,10 @@ asks for an exact line range and gets verbatim source — so "summary first,
 raw on request" is the design, not "never raw".
 
 That trade is a real trade, and it is worth being precise about which half of
-it is measured. The call counts below are asserted by the test suite. Whether
-delegation is *cheaper overall* is not: it depends on how many turns the
-file's text would otherwise have sat in context, which no test here can know.
+it is measured. The call counts below are checked offline against a stub
+client that counts every API call. Whether delegation is *cheaper overall* is
+not: it depends on how many turns the file's text would otherwise have sat in
+context, which no offline check can know.
 See [break-even](#what-delegation-costs) for the arithmetic and
 [what we measured](#what-we-measured) for the numbers that *are* pinned.
 
@@ -65,7 +66,6 @@ reaches the web through two client tools on DeepSeek's **Search** and
 - [Fetching web pages](#fetching-web-pages)
 - [For researchers](#for-researchers)
 - [Design principles](#design-principles)
-- [Tests](#tests)
 - [Extending](#extending)
 - [Changelog](#changelog)
 - [License](#license)
@@ -303,9 +303,8 @@ See [`docs/`](docs/README.md) for the per-module specification.
 ## What we measured
 
 A handful of things that look like opinions from the outside and are
-actually pinned by a test, a live probe, or DeepSeek's published sheet.
-Dated 2026-09-10 (price sheet) and 2026-09-14 (the probes). The suite
-that holds this to account is **732 tests**, all offline (about 20 s).
+actually pinned by an offline check, a live probe, or DeepSeek's published
+sheet. Dated 2026-09-10 (price sheet) and 2026-09-14 (the probes).
 
 **The price sheet, off-peak Flash (effective 2026-09-10).** Cache hit
 $0.003/M, cache miss $0.15/M (~50×), output $0.60/M (~200× a hit). Peak
@@ -342,7 +341,7 @@ JS/TS/Go/Rust/JSON/Markdown/…). A focus that is already a symbol in
 that map — or a unique method suffix — is local too: 0 API calls, line
 span returned. A sentence like "what does method_one do" is ranked locally
 by default (0 calls); with `/subagents on` it costs 1 Flash call instead.
-Tests pin both.
+Both counts are checked offline.
 
 **Nested Agent workers reuse the parent's frozen prefix.** Children
 used to miss from token 0 on a different system prompt and a subset
@@ -371,8 +370,8 @@ the honest claim is smaller context, not a cheaper bill.
 Delegating a read is not free — it is a second API call, and sometimes it is the
 wrong trade. Here is what is actually true, separated by how well it is known.
 
-**Measured.** These call counts are asserted in `tests/test_call_accounting.py`,
-so they are checked rather than remembered:
+**Measured.** These call counts are checked offline against a stub client
+that counts every API call, so they are checked rather than remembered:
 
 | Operation | API calls |
 |---|---|
@@ -758,8 +757,8 @@ technique applied as-is; *derived* = known parts combined or adapted in a way
 we did not find stated; *new?* = no prior art found in a non-exhaustive search
 (treat as a lead, not a claim).
 
-**How strong the evidence is.** Every mechanism below is pinned by offline
-tests (`tests/`). The cost numbers are **small live benches** on
+**How strong the evidence is.** Every mechanism below is checked offline
+during development. The cost numbers are **small live benches** on
 `deepseek-flash` (4–10 tasks, a handful of runs per variant, 2026-11-07/08),
 reported as measured; they are not a controlled study, and run-to-run
 variance on the same task was of the same order as some of the effects.
@@ -810,8 +809,6 @@ prefix cache as the cost model, not latency or a context-length budget.
 
 **Reproducing.** Everything above runs from this folder:
 
-- `python3 -m pytest tests -q` — the offline suite (no key, no network) pins
-  every mechanism in the table.
 - `G023_READFILE_RAW=1`, `G023_VERIFY_REPLAY=0`, `G023_ATTRIBUTION=0`,
   `/compact-at fixed` and `/subagents on` switch individual techniques off (or
   delegation on) for an A/B. The meters are `/cost` (tokens split by cache
@@ -842,7 +839,7 @@ variance seen here. That benchmark has not been run.
 5. **Thinking mode is a dial** (0–100, default 75), not always-on max.
 6. **Say what happened, not what was sent** — and always say what it cost.
 7. **Claim only what is checked.** Numbers in this documentation are either
-   asserted by a test, quoted from a published price sheet with attribution, or
+   checked offline, quoted from a published price sheet with attribution, or
    labelled as an estimate. Where something is not measured, it says so.
 8. **Retrieve, don't prepend** — learned procedures live in files and are
    searched on demand, so they cannot bust the prompt-cache prefix.
@@ -850,46 +847,6 @@ variance seen here. That benchmark has not been run.
    finished turn or a compaction summary, and what was interrupted is rolled
    back and said so. Two instances on one project keep each other's settings;
    one session log has one writer (two REPLs resuming the same session interleave).
-
-## Tests
-
-```bash
-pip install pytest && python3 -m pytest tests/ -q
-```
-
-No plugins beyond `pytest` — async tests run through a small hook in
-`tests/conftest.py`, and every test points `G023_PROJECT_ROOT` at a temporary
-directory, so a run never reads your real cache and never touches the network.
-**732 tests**, all passing, none of them on the network.
-
-| File | What it holds to account |
-|---|---|
-| `test_call_accounting.py` | The API-call table above (unfocused ReadFile = 0, semantic focus = 1), counted against a stub client |
-| `test_goal_cost_wins.py` | Exact-symbol focus = 0; no mid-JSON slice of ReadFile/Agent; nested Agent vaults bulky bodies; temperature pinned with the prefix |
-| `test_cost_efficiency.py` | Rewriting a cached prefix does not recoup; post-turn compact keeps a hot prefix; Agent reuses parent instructions+tools+effort |
-| `test_file_reader.py` | Symbol ranges are exact and in-bounds; truncation is declared; local AST facts outrank the model's |
-| `test_drift_signals.py` | Each signal fires on the shape that matters and stays quiet on ordinary turns; hit-rate history survives restarts |
-| `test_history_integrity.py` | Tool-call pairing survives rollback and repair; output items are echoed back byte-identical |
-| `test_usage_accounting.py` | Cost arithmetic, both usage spellings, worst-case assumption when the split is unreported |
-| `test_reasoning.py` | Effort 0–100 ↔ wire levels `none`/`low`/`high`, capped at 75; `[handoff]` / `[next_effort]` stripped from the visible answer |
-| `test_learn.py` | Learn store round-trip, prefix pin, secret reject, cross-project env visibility |
-| `test_session_log.py` | JSONL `/resume` and `.g023/logs/` handoff round-trip |
-| `test_checkpoint.py` | Post-turn fold carries every new turn and stays bounded; signed handoff provenance; `[rehydrate]` on disk drift |
-| `test_goal_judge.py` | Working-set completed vs not-completed from evidence, not from a final message |
-| `test_prefix_stable.py` | Standing instructions + tools stay byte-identical until vision changes |
-| `test_root_confine.py` | ReadFile / ListDir / SearchContent refuse paths outside the project root |
-| `test_tool_codec.py` | ReadFile outline + byte-exact content, grep-style ranked search (`shown:"all"`), the `[handoff due]` forecast and marker |
-| `test_search.py` | Total-vs-sample counts, gitignore, glob/brace, grep fallback, `.g023/memory/` and `.g023/bbs/` overlay |
-| `test_bbs.py` | Bulletin board layout, slugs, retrieve-don't-prepend, search overlay, `/bbs` |
-| `test_images.py` | Vision sends are capped at 800 px with the real media type, paths stay in the project, every request names `deepseek-flash` |
-| `test_write_backup.py` | Every overwrite snapshots `.g023/backups/`; skipped for `.g023/` paths except `.g023/bbs/`, new files, unchanged content |
-| `test_interrupt_and_concurrency.py` | A real SIGINT cancels only the running turn; interrupted turns roll back as a transaction; `/resume` replay equals memory; reads after a write see it; retries are bounded; stores survive concurrent writers |
-| `test_durability_and_commit.py` | Summaries survive `/resume`; a torn log tail is repaired; Ctrl-C after the final answer keeps the turn; `/undo` restores the right version; no silent todo drops; per-key config merge |
-
-The full suite is listed in [`docs/tests.md`](docs/tests.md).
-
-What these do not cover: anything requiring the real API, end-to-end session
-cost, or whether a summary was good enough for the question asked.
 
 ## Extending
 

@@ -41,5 +41,5 @@ guards. The first Edit/WriteFile to a protected file that already existed is
 refused with `{"error": "write_guard", "constraint": "<quote>", "hint": ...}`.
 An identical repeat of the call goes through: the guard turns an accident
 into a decision. New files and shell commands are not guarded. "tests" covers
-`test_*.py`, `*_test.py`, `conftest.py` and anything under `tests/` or
-`test/`.
+`test_*.py`, `*_test.py`, `conftest.py` and anything in a directory named
+`tests` or `test`.

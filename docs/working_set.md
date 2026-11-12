@@ -83,4 +83,3 @@ objective is finished and writes `.g023/logs/`.
 - `docs/session_log.md` — compact boundaries and objective logs carry
   the working set.
 - `docs/tools.md` — `TodoWrite`.
-- `tests/test_goal_judge.py`, `tests/test_history_integrity.py`.

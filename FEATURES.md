@@ -31,7 +31,7 @@ Every feature below is written in five layers on purpose:
 4. **Observations** — what was measured, what was tried and rejected, and what is *not* known.
 5. **Benefits** — why the feature is in the product.
 
-Numbers in this document are one of three things: asserted by the offline test suite (732 tests as of this tree), quoted from DeepSeek's published price sheet (`ds_pricing.json`, effective 2026-09-10), or labelled as an estimate / unmeasured. Where something looks like a cost win but has not been A/B'd end-to-end, this page says so.
+Numbers in this document are one of three things: checked offline during development, quoted from DeepSeek's published price sheet (`ds_pricing.json`, effective 2026-09-10), or labelled as an estimate / unmeasured. Where something looks like a cost win but has not been A/B'd end-to-end, this page says so.
 
 ---
 
@@ -79,22 +79,22 @@ Numbers in this document are one of three things: asserted by the offline test s
    - [4.36 Output-limit auto-continue](#436-output-limit-auto-continue)
    - [4.37 Step cap, max-tokens, context window](#437-step-cap-max-tokens-context-window)
    - [4.38 Verbosity](#438-verbosity)
-   - [4.39 Tests](#439-tests)
-   - [4.40 Release media and capture tooling](#440-release-media-and-capture-tooling)
-   - [4.41 Communication markers (`A_Improve.txt`)](#441-communication-markers-a_improvetxt)
-   - [4.42 Data files and on-disk layout](#442-data-files-and-on-disk-layout)
-   - [4.43 Bulletin board (`.g023/bbs/`)](#443-bulletin-board-g023bbs)
-   - [4.44 Code ownership (`/ownership`)](#444-code-ownership-ownership)
-   - [4.45 Near-miss names on a zero-hit search](#445-near-miss-names-on-a-zero-hit-search)
-   - [4.46 Predicated finish (on by default since 4.53) and `/settings set`](#446-predicated-finish-on-by-default-since-453-and-settings-set)
-   - [4.47 Lean turns: closure receipts, lean codec, lean prompt, orientation card](#447-lean-turns-closure-receipts-lean-codec-lean-prompt-orientation-card)
-   - [4.48 View deltas: what a shell command changed, against what the model last saw](#448-view-deltas-what-a-shell-command-changed-against-what-the-model-last-saw)
-   - [4.49 Test oracle, request obligations, claim check and callee digests](#449-test-oracle-request-obligations-claim-check-and-callee-digests)
-   - [4.50 Salient excerpts, readable vault, and the optional local model](#450-salient-excerpts-readable-vault-and-the-optional-local-model)
-   - [4.51 Scout card: the local model does the first digging hop](#451-scout-card-the-local-model-does-the-first-digging-hop)
-   - [4.52 Local model auto-tune](#452-local-model-auto-tune)
-   - [4.53 Round-trip economics: step budgets on, predicated finish on, two opt-ins](#453-round-trip-economics-step-budgets-on-predicated-finish-on-two-opt-ins)
-   - [4.54 Pre-emptive reads: the harness does the predictable first hop](#454-pre-emptive-reads-the-harness-does-the-predictable-first-hop)
+   - [4.39 Release media and capture tooling](#439-release-media-and-capture-tooling)
+   - [4.40 Communication markers (`A_Improve.txt`)](#440-communication-markers-a_improvetxt)
+   - [4.41 Data files and on-disk layout](#441-data-files-and-on-disk-layout)
+   - [4.42 Bulletin board (`.g023/bbs/`)](#442-bulletin-board-g023bbs)
+   - [4.43 Code ownership (`/ownership`)](#443-code-ownership-ownership)
+   - [4.44 Near-miss names on a zero-hit search](#444-near-miss-names-on-a-zero-hit-search)
+   - [4.45 Predicated finish (on by default since 4.52) and `/settings set`](#445-predicated-finish-on-by-default-since-452-and-settings-set)
+   - [4.46 Lean turns: closure receipts, lean codec, lean prompt, orientation card](#446-lean-turns-closure-receipts-lean-codec-lean-prompt-orientation-card)
+   - [4.47 View deltas: what a shell command changed, against what the model last saw](#447-view-deltas-what-a-shell-command-changed-against-what-the-model-last-saw)
+   - [4.48 Test oracle, request obligations, claim check and callee digests](#448-test-oracle-request-obligations-claim-check-and-callee-digests)
+   - [4.49 Salient excerpts, readable vault, and the optional local model](#449-salient-excerpts-readable-vault-and-the-optional-local-model)
+   - [4.50 Scout card: the local model does the first digging hop](#450-scout-card-the-local-model-does-the-first-digging-hop)
+   - [4.51 Local model auto-tune](#451-local-model-auto-tune)
+   - [4.52 Round-trip economics: step budgets on, predicated finish on, two opt-ins](#452-round-trip-economics-step-budgets-on-predicated-finish-on-two-opt-ins)
+   - [4.53 Pre-emptive reads: the harness does the predictable first hop](#453-pre-emptive-reads-the-harness-does-the-predictable-first-hop)
+   - [4.54 Closing calls: licensed finish, answer escrow, multi-file Edit, Rename](#454-closing-calls-licensed-finish-answer-escrow-multi-file-edit-rename)
 5. [Cross-cutting observations](#5-cross-cutting-observations)
 6. [What is not claimed](#6-what-is-not-claimed)
 7. [Module map](#7-module-map)
@@ -117,7 +117,7 @@ Shipped defaults (what a fresh install writes): thinking on at effort **75** (wi
 
 ## 2. The ideas it is built around
 
-These are not slogans. They are load-bearing constraints that show up as tests.
+These are not slogans. They are load-bearing constraints.
 
 **Context is currency, subagents are the treasury.** The orchestrator never ingests a whole file unless it asked for a line range or `raw=true`. Heavy I/O happens in isolated workers that return compact JSON.
 
@@ -133,7 +133,7 @@ These are not slogans. They are load-bearing constraints that show up as tests.
 
 **Retrieve, don't prepend.** Learned procedures, memory notes, and bulletin-board posts live in files and are searched on demand. Prepending them to the system prompt would bust the prefix cache every time INDEX grew.
 
-**Claim only what is checked.** Call counts are pinned by tests. End-to-end session cost is not. `G023_READFILE_RAW=1` is the A/B flag; `/cost` is the meter.
+**Claim only what is checked.** Call counts are checked offline. End-to-end session cost is not. `G023_READFILE_RAW=1` is the A/B flag; `/cost` is the meter.
 
 ---
 
@@ -320,7 +320,7 @@ This is the product's core design, inspired by Claude Code, taken as a hard rule
 - Nested Agent reuses the parent's frozen instructions + tools + effort. Isolated input still misses from the first user row; that is the point of the branch.
 - Depth-2 (grandchild Agent) was measured and not shipped: another miss on a new input prefix plus another hop of output tokens.
 
-**Observations (measured call counts, `tests/test_call_accounting.py` and `test_goal_cost_wins.py`):**
+**Observations (measured call counts, against a stub client that counts every API call):**
 
 | Operation | API calls |
 |-----------|-----------|
@@ -369,7 +369,7 @@ Modes:
 **Observations:**
 
 - The known weakness of summary-first: a summary can silently drop the one detail that mattered, and nothing detects that. The mitigation is the symbol map plus a cheap range re-read, not an automatic detector. That detector does not exist.
-- Local AST facts outrank the model (`tests/test_file_reader.py`).
+- Local AST facts outrank the model.
 - Live bench, 9 read tasks on huge dirs, binaries and big data files: Bash blocked went from 6/9 solved, 71 calls, $0.1824 to 8/9, 30 calls, $0.0055. Bash allowed went from 9/9, 31 calls, $0.1572 to 9/9, 23 calls, $0.0026. Most of the old cost was a 1.6M-char minified line read as a "range". The last nobash miss (CSV rows) was fixed by correcting the line count and pointing the schema at the digest; on re-run the task solves in one read.
 
 **Benefits:**
@@ -398,7 +398,7 @@ Modes:
 
 **For a mid-level engineer:**
 
-- Presenting a sample cap as a total cap is a lie the tests exist to prevent (`tests/test_search.py`).
+- Presenting a sample cap as a total cap would be a lie; the total is always reported separately from the samples.
 - Search results are vaulted when ≥ 2,500 chars, same as Bash/ListDir.
 - The Python walk is the last resort; prefer having `rg` on PATH for speed, not for correctness.
 
@@ -475,7 +475,7 @@ Modes:
 
 **Observations:**
 
-- 1.3.x labelled every image `image/png` and did not record vision usage; both are pinned by `tests/test_images.py` now.
+- 1.3.x labelled every image `image/png` and did not record vision usage; both are fixed.
 
 **Benefits:**
 
@@ -625,7 +625,7 @@ ReadFile, ListDir, SearchContent, Glob, Edit, WriteFile, and `/undo` all go thro
 
 - Empty / `.` / `None` means the project root.
 - Absolute paths are accepted only when they stay inside the root after resolve.
-- Learn-store writes have their own root confine (`tests/test_learn.py`).
+- Learn-store writes have their own root confine.
 
 **Observations:**
 
@@ -849,7 +849,7 @@ Learn guides and memory notes are files, not rows. `/cache clear` does not touch
 **For a mid-level engineer:**
 
 - Costs shown are `token_counts × ds_pricing.json × surge flag`. They will diverge from the provider invoice if the sheet is stale or if a billed line item is not in the usage object.
-- Tests pin: rates × right token counts, hit/miss derived identically from either endpoint, no invented cache hits (`tests/test_usage_accounting.py`).
+- Checked offline: rates × right token counts, hit/miss derived identically from either endpoint, no invented cache hits.
 
 **Observations:**
 
@@ -883,7 +883,7 @@ Learn guides and memory notes are files, not rows. `/cache clear` does not touch
 
 - Weekends are off-peak even during hours that look like the weekday windows. `peak_weekdays` is `[0,1,2,3,4]` (Python Monday=0).
 - Pause ranges merge overlaps after widening by the buffer.
-- Tests pin the arithmetic, not the literal clock (`tests/test_surge.py`).
+- The guarantees are about the arithmetic, not the literal clock.
 
 **Observations:**
 
@@ -917,7 +917,7 @@ Hit rate is stored per day in `prefix_stats` and compared against a trailing bas
 
 **For a mid-level engineer:**
 
-- Signals must fire on shapes that matter **and stay quiet on shapes that are merely unusual**. A signal that fires on ordinary turns gets ignored and stops being a signal (`tests/test_drift_signals.py`).
+- Signals must fire on shapes that matter **and stay quiet on shapes that are merely unusual**. A signal that fires on ordinary turns gets ignored and stops being a signal.
 - None of these detect a schema change *as such*; they detect "something moved". A model behaviour change, a schema change, and drift in your own prompts all present identically from here.
 
 **Observations:**
@@ -1028,7 +1028,7 @@ That verdict is what post-turn compact uses when it decides an objective is fini
 
 **Observations:**
 
-- A final assistant message is not success. That is the whole point of the judge. Tests pin pending / done-without-evidence / empty / file-evidence / verify-evidence / truncated-hash citations (`tests/test_goal_judge.py`).
+- A final assistant message is not success. That is the whole point of the judge. Checked offline: pending / done-without-evidence / empty / file-evidence / verify-evidence / truncated-hash citations.
 
 **Benefits:**
 
@@ -1124,7 +1124,7 @@ On a tool error, `catalog_nudge` may return a one-line `[learn] LearnSearch quer
 
 **For a mid-level engineer:**
 
-- Put does **not** change `instructions` or tools (`tests/test_learn.py` prefix pin). That is the whole point of retrieve-don't-prepend.
+- Put does **not** change `instructions` or tools. That is the whole point of retrieve-don't-prepend.
 - Env-scope guides are visible across projects on the same machine.
 - `/cache clear` does not delete them (they are not SQLite).
 
@@ -1175,7 +1175,7 @@ This is not the learn store (cross-project procedures), not the working set (thi
 
 **For a mid-level engineer:**
 
-- The REPL binds the key; it does not own numbering or I/O. That split is why tests can pin prompt-store identity without a TTY.
+- The REPL binds the key; it does not own numbering or I/O. That split is why prompt-store identity can be checked without a TTY.
 
 **Benefits:**
 
@@ -1269,7 +1269,7 @@ Toolbar: live effort integer (`think 75`), context fraction, session cost, visio
 
 **Observations:**
 
-- Catalogue-as-data is what makes "a command cannot be completable but undocumented" true. Tests (`test_disconnect.py`) pin that advertised choices are handler branches.
+- Catalogue-as-data is what makes "a command cannot be completable but undocumented" true: every advertised choice is a handler branch.
 
 **Benefits:**
 
@@ -1370,7 +1370,7 @@ Working-set mirroring waits until **every** output in the batch is recorded, the
 **For a mid-level engineer:**
 
 - Parallelism is a latency win, not a cache win. Isolated FileReader work still has its own input prefix.
-- The 400 from splitting a parallel WriteFile batch with a working-set item is pinned by `tests/test_parallel_tools.py` and `test_history_integrity.py`.
+- The 400 from splitting a parallel WriteFile batch with a working-set item is prevented: the first parallel WriteFile batch keeps its outputs contiguous.
 
 **Benefits:**
 
@@ -1410,7 +1410,7 @@ When `incomplete_reason == "max_output_tokens"` and the reply had no tool calls,
 **For a mid-level engineer:**
 
 - Default `max_tokens = 0` means no budget is sent, so the model's own maximum is the only ceiling. The notice names that honestly.
-- This fired on a `/goal` that thought until the ceiling with nothing written (G023 Legends). Tests in `test_output_limit.py`.
+- This fired on a `/goal` that thought until the ceiling with nothing written (G023 Legends).
 
 **Benefits:**
 
@@ -1463,31 +1463,7 @@ When `incomplete_reason == "max_output_tokens"` and the reply had no tool calls,
 
 ---
 
-### 4.39 Tests
-
-**In simple terms:** 732 tests, all offline, none of them on the network. Each file's docstring states, in plain English, the behaviour it exists to protect.
-
-**Architecture / how it works:**
-
-`tests/conftest.py`: async hook (no pytest-asyncio plugin), `isolated_project` fixture that points `G023_HOME` / `G023_PROJECT_ROOT` at a temp dir and resets singletons (cache, usage, signals, settings), `CountingClient` stub that counts `create()` calls.
-
-The suite pins, among other things: the API-call table, exact-symbol focus = 0, no mid-JSON slice, nested Agent vaults, temperature pinned, recoup arithmetic, shared-prefix Agent, FileReader symbol ranges, drift-signal fire/stay-quiet, history pairing and reseating, parallel tools, config scopes, context window bounds, effort ↔ wire aliases and trailer stripping, learn-store guards, session log round-trip, goal judge, prefix byte-identity until vision changes, root confine, search total-vs-sample, `.g023/memory/` and `.g023/bbs/` search overlay, bulletin-board retrieve-don't-prepend, 800px vision resize, write backups, surge weekday arithmetic, usage arithmetic, output-limit auto-continue, step cap, catalogue/handler sync, `--help` / `--continue` parsing.
-
-Run: `python -m pytest tests/ -q` from the project root.
-
-**For a mid-level engineer:**
-
-- If you change compact, micro-compact, tool-result shape, Agent depth, or the system prompt, read `.g023/bbs/cost-efficiency/` first and extend the relevant test file. The 50× hit/miss ratio is the constraint.
-- What these do not cover: anything requiring the real API, end-to-end session cost, or whether a summary was good enough for the question asked.
-
-**Benefits:**
-
-- Design claims that look like opinions from the outside are checkable.
-- A refactor that busts pairing, prefix identity, or call counts fails locally without a key.
-
----
-
-### 4.40 Release media and capture tooling
+### 4.39 Release media and capture tooling
 
 **In simple terms:** screenshots and videos of the TUI are captured by driving a real PTY and re-rendering the byte stream, not by photographing a window.
 
@@ -1507,7 +1483,7 @@ Screenshots in `media/screenshots/` were re-shot on 1.5.0 with `HOME` pointed at
 
 ---
 
-### 4.41 Communication markers (`A_Improve.txt`)
+### 4.40 Communication markers (`A_Improve.txt`)
 
 **In simple terms:** the standing prompt asks the model to flag caveats, admit errors, draw distinctions, and frame key points using a small set of phrases ("One honest caveat:", "Fair pushback:", "Let me be precise:", "The key insight is:").
 
@@ -1526,7 +1502,7 @@ Screenshots in `media/screenshots/` were re-shot on 1.5.0 with `HOME` pointed at
 
 ---
 
-### 4.42 Data files and on-disk layout
+### 4.41 Data files and on-disk layout
 
 **In simple terms:** keys and global defaults live next to the launcher. Everything about *this* project lives in that project's `.g023/` folder.
 
@@ -1563,7 +1539,7 @@ Screenshots in `media/screenshots/` were re-shot on 1.5.0 with `HOME` pointed at
 **For a mid-level engineer:**
 
 - JSON must stay valid and type-correct: `_coerce` drops broken keys silently, which is safe but confusing.
-- `ds_*.json` may be updated when DeepSeek changes the sheet. Code falls back to defaults if missing. Tests assert *relationships* (surge = 2×, windows), not literal numbers — except the published rates are also what `/cost` shows.
+- `ds_*.json` may be updated when DeepSeek changes the sheet. Code falls back to defaults if missing. What must hold are *relationships* (surge = 2×, windows), not literal numbers — except the published rates are also what `/cost` shows.
 - Anything new in `config.json` must be added to `Settings` + `PERSISTED_KEYS` or it will be ignored on load.
 
 **Benefits:**
@@ -1574,7 +1550,7 @@ Screenshots in `media/screenshots/` were re-shot on 1.5.0 with `HOME` pointed at
 
 ---
 
-### 4.43 Bulletin board (`.g023/bbs/`)
+### 4.42 Bulletin board (`.g023/bbs/`)
 
 **In simple terms:** a forum at `.g023/bbs/` for this session and later ones. Topic slugs are folders; conversations are `.txt` files. Subagents and the orchestrator write there. Posts are never copied into the system prompt.
 
@@ -1604,7 +1580,7 @@ This is not the learn store, not memory notes, and not the working set.
 
 ---
 
-### 4.44 Code ownership (`/ownership`)
+### 4.43 Code ownership (`/ownership`)
 
 **In simple terms:** the model tidies code it wrote itself (merges repeated logic it touches, fixes defects it notices, and names each change). In your files it changes only what the request needs and reports anything else.
 
@@ -1620,7 +1596,7 @@ This is not the learn store, not memory notes, and not the working set.
 
 **Benefits:** less duplicated code in files the agent owns, with no change in what it does to yours.
 
-### 4.45 Near-miss names on a zero-hit search
+### 4.44 Near-miss names on a zero-hit search
 
 **In simple terms:** when a search finds nothing because the model guessed a name's spelling (`count_words`), the result names the project's real spelling (`word_count`) and where it is defined.
 
@@ -1630,7 +1606,7 @@ This is not the learn store, not memory notes, and not the working set.
 
 **Benefits:** one hop instead of a ListDir/ReadFile/re-grep chain, at no cost to searches that hit.
 
-### 4.46 Predicated finish (on by default since 4.53) and `/settings set`
+### 4.45 Predicated finish (on by default since 4.52) and `/settings set`
 
 **In simple terms:** with `finish_on_success` on, the model may attach its final answer to the step that should finish the job (usually the test run). If that step succeeds, the turn ends there with the answer and a line quoting the real result; if it fails, the answer is thrown away and work continues.
 
@@ -1640,7 +1616,7 @@ This is not the learn store, not memory notes, and not the working set.
 
 **Benefits:** fewer round trips when on; every saved key is now visible and changeable in `/settings`.
 
-### 4.47 Lean turns: closure receipts, lean codec, lean prompt, orientation card
+### 4.46 Lean turns: closure receipts, lean codec, lean prompt, orientation card
 
 **In simple terms:** four small changes that make a turn cheaper. An Edit result says whether the old name or value it removed still appears anywhere in the project. Command output is stored raw instead of JSON-escaped. Final answers no longer repeat what the trace already shows. The model is told up front where the functions and files the request names are.
 
@@ -1650,7 +1626,7 @@ This is not the learn store, not memory notes, and not the working set.
 
 **Benefits:** about a quarter off a typical edit task, with the same success rate.
 
-### 4.48 View deltas: what a shell command changed, against what the model last saw
+### 4.47 View deltas: what a shell command changed, against what the model last saw
 
 **In simple terms:** when a command such as a formatter, `sed -i` or a code generator changes a file the model has already read or edited, the command's result shows the file's new text (or a diff, for big files). The model does not have to read the file again before its next edit. If a file the model has seen changes between turns (the user's editor, a checkout, `/undo`), the next message says so and shows the change.
 
@@ -1664,7 +1640,7 @@ Two opt-in search features ship with it: `search_tiers` ranks a def/class named 
 
 ---
 
-### 4.49 Test oracle, request obligations, claim check and callee digests
+### 4.48 Test oracle, request obligations, claim check and callee digests
 
 **In simple terms:** five checks that watch what the model does with tests and with the request. When the model filters its test output (`pytest | tail -3`), the result still names the failing test and the line where it failed. When the request names a function ("add average_entry(ledger, account)") and the model wrote something else (a method), it is told once before it finishes. "Do not change the tests" makes the first edit of a test file stop and ask for a deliberate repeat. A final answer that says "all tests pass" when the last run failed gets a note under it. Reading a Python file also lists the signatures of the project functions it imports.
 
@@ -1682,7 +1658,7 @@ Settings `test_oracle`, `vacuity_check`, `obligations`, `write_guards`, `claim_c
 
 ---
 
-### 4.50 Salient excerpts, readable vault, and the optional local model
+### 4.49 Salient excerpts, readable vault, and the optional local model
 
 **In simple terms:** when a long output is cut, the lines the model was looking for are kept (it already said what it was looking for in its reasoning), and the full output stays in a file it can read. Optionally a small model on your own GPU (llama.cpp) reads big files for free (`LocalAsk`), reranks those lines, and answers screenshot questions first. It steps aside whenever the task is GPU work.
 
@@ -1700,7 +1676,7 @@ Settings `salience_excerpt` (on), `local_model` (`auto`), `local_llama_dir`, `lo
 
 ---
 
-### 4.51 Scout card: the local model does the first digging hop
+### 4.50 Scout card: the local model does the first digging hop
 
 **In simple terms:** before DeepSeek sees your request, the small model on your GPU reads the parts of the project that best match it (~1 s) and the request carries the lines it picked, copied word for word from the files and marked as a lead. DeepSeek can start from them instead of listing and searching first. If DeepSeek keeps ignoring the cards, they switch themselves off. `LocalAsk` can now also search the whole project when no files are given.
 
@@ -1718,7 +1694,7 @@ Setting `scout_card` (`local` default | `always` | `off`, `G023_SCOUT`); `/local
 
 ---
 
-### 4.52 Local model auto-tune
+### 4.51 Local model auto-tune
 
 **What it does:** `local_model` defaults to `auto`. A machine probe finds `llama-server`, a models folder and the GPU, and turns the local helper on in every project when the model fits; it picks the model the scout eval measured best.
 
@@ -1730,7 +1706,7 @@ Setting `scout_card` (`local` default | `always` | `off`, `G023_SCOUT`); `/local
 
 **Benefits:** the measured −22 % $/task of the scout card without any setup, in every project on the machine; free local-first vision from the same server; nothing runs on machines without a GPU.
 
-### 4.53 Round-trip economics: step budgets on, predicated finish on, two opt-ins
+### 4.52 Round-trip economics: step budgets on, predicated finish on, two opt-ins
 
 **In simple terms:** every model call ("hop") costs mostly the model's new thinking, not the re-read context. So g023 now asks the model to say how many calls each step should take, shows it a running `[hop N · step k of L-H · request $X]` line, and lets it put the final answer on the last step. Together: cheaper, fewer calls, faster, same quality.
 
@@ -1740,7 +1716,7 @@ Setting `scout_card` (`local` default | `always` | `off`, `G023_SCOUT`); `/local
 
 **Benefits:** cheaper and faster turns by default; the opt-ins are there for further experiments.
 
-### 4.54 Pre-emptive reads: the harness does the predictable first hop
+### 4.53 Pre-emptive reads: the harness does the predictable first hop
 
 **In simple terms:** most coding requests start the same way: the model reads the files the request names. g023 now does those reads itself before the first model call and puts them into the conversation as if the model had asked. The model starts at the edit or the answer, one paid round trip earlier.
 
@@ -1750,7 +1726,7 @@ Setting `scout_card` (`local` default | `always` | `off`, `G023_SCOUT`); `/local
 
 **Benefits:** cheaper, faster turns; questions about named code are answered in one call.
 
-### 4.55 Closing calls: licensed finish, answer escrow, multi-file Edit, Rename
+### 4.54 Closing calls: licensed finish, answer escrow, multi-file Edit, Rename
 
 **In simple terms:** the last calls of a turn were often spent re-writing an answer the model had already given (because a test that was already broken before the turn failed again), or making one edit per call, or renaming a name with grep and sed one step at a time. g023 now delivers an answer whose only failures pre-date the turn (and says so), keeps a held answer so the model can release it with `[deliver]`, lets one Edit change several spots and files at once, and offers a `Rename` tool. A guard holds any answer that claims a file change that never happened.
 
@@ -1795,7 +1771,7 @@ These are the facts that show up in more than one feature. They are the ones tha
 Worth stating plainly, because the rest of this page is detailed enough to sound more certain than the measurements.
 
 - **End-to-end session cost of summary-first vs raw-file inlining** has not been A/B'd on a controlled corpus. Smaller context is measured. Cheaper bill is arithmetic under assumptions.
-- **Summary quality** is not tested. Tests pin structure, line ranges, call counts, and truncation flags — not whether the summary answered the question.
+- **Summary quality** is not checked. Offline checks cover structure, line ranges, call counts, and truncation flags — not whether the summary answered the question.
 - **FetchUrl** sees what DeepSeek's fetcher sees: no JavaScript, no login. A refused page is remembered for 1 h.
 - **Costs in `/cost`** are a local estimate from returned token counts and `ds_pricing.json`, not a reading of the invoice.
 - **Bash confinement** is cwd + a dangerous-string filter, not a sandbox. The model can still run a command that leaves the project.

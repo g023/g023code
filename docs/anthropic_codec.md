@@ -65,10 +65,6 @@ cached.
   `from_message` of the assembled message. `error` events raise
   `StreamError`.
 
-## Tests
-
-`tests/test_wire_web_and_compaction.py` (codec section).
-
 ## Related
 
 - `docs/api.md` — the client that calls this module.

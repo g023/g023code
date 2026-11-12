@@ -71,7 +71,7 @@ copy 75; values above 75 cap);
 - `by_group()` → commands bucketed in reading order for `/help`.
 - `check_handlers(obj)` → names of commands whose `handler` method is
   missing from `obj` — a sanity check that the catalogue and the CLI stay
-  in sync (used at CLI startup and by the test suite).
+  in sync (used at CLI startup).
 
 ## Related
 
@@ -80,4 +80,3 @@ copy 75; values above 75 cap);
 - `docs/project_instructions.md` — `/g023-compact` and the `g023.md` load order.
 - `docs/learn.md` — `/learn`.
 - `docs/bbs.md` — `/bbs`.
-- `tests/test_config_scopes.py`, `tests/test_disconnect.py` — catalogue-driven behaviour.

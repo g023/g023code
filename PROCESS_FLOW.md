@@ -411,4 +411,3 @@ CLI.loop  ───────────────────────�
 - `docs/working_set.md` — remaining-work object and the completion judge
 - `docs/effort.md` — 0–75 scale, `[handoff]` / `[next_effort]` trailers
 - `docs/cost_policy.md` — keep vs compact vs vault
-- `tests/test_goal_judge.py`, `tests/test_step_limit.py`, `tests/test_reasoning.py`

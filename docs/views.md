@@ -82,4 +82,3 @@ fire (one miss off, two on). The first version showed only diffs and was
 - `ViewStore.drift()`: changes not made by the agent's tool calls.
 - `changed_and_removed(before, after, root)`: diff two stat fingerprints,
   skipping the harness's own cache directory.
-- Tests: `tests/test_views_and_tiers.py`.

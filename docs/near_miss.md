@@ -43,5 +43,3 @@ gains "Similar defined names: …". `tool_codec.encode_search` renders one line:
 |---|---|---|---|
 | off | 6/6 | 3.67 | 0.000334 |
 | on  | 6/6 | 2.83 | 0.000247 |
-
-Tests: `tests/test_near_miss.py`.

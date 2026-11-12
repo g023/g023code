@@ -49,4 +49,3 @@ for the process).
 - `docs/orchestrator.md` — `_system` appends the addendum.
 - `docs/commands.md` — `/g023-compact` catalogue entry.
 - `docs/cli.md` — the handler and the `/status` line.
-- `tests/test_project_instructions.py` — load order and the compact request.

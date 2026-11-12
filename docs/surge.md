@@ -38,7 +38,7 @@ the windows itself.
 - `describe()` — a human summary of today's windows (the `/surge`
   panel).
 
-## Guarantees (per `tests/test_surge.py`)
+## Guarantees
 
 Three facts come from DeepSeek: the Beijing peak windows, that they apply
 Monday–Friday, and that off-peak = half of peak. Everything here is
